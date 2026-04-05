@@ -15,12 +15,18 @@
 // city guard factions to 35 (neutral to all).
 //
 // Gossip action layout:
-//   1        = open class list for 2nd slot
-//   2        = open class list for 3rd slot
-//   3        = open zone list
-//   100-111  = class name clicked (class = action - 100)
-//   200-211  = class confirmed   (class = action - 200, sender = SENDER_CLASS_CONFIRM)
-//   300-307  = zone selected     (zone index = action - 300)
+//   sender=1 (GOSSIP_SENDER_MAIN):
+//     action 1        = open class list for 2nd slot
+//     action 2        = open class list for 3rd slot
+//     action 3        = open zone list
+//     action 100-111  = class name clicked (class = action - 100)
+//     action 300-307  = zone selected (zone index = action - 300)
+//   sender=2 (SENDER_CLASS_CONFIRM):
+//     action 200-211  = class choice confirmed (class = action - 200)
+//   sender=10/11/12 (SENDER_TRAIN_C1/C2/C3):
+//     action = page number — show that page of available spells for class slot 1/2/3
+//   sender=20/21/22 (SENDER_LEARN_C1/C2/C3):
+//     action = spell ID — learn that spell and charge gold
 
 #include "ScriptMgr.h"
 #include "Player.h"
@@ -30,6 +36,8 @@
 #include "DatabaseEnv.h"
 #include "Chat.h"
 #include "Log.h"
+#include "SpellMgr.h"
+#include "SpellInfo.h"
 
 // ============================================================
 // Constants
@@ -43,9 +51,23 @@ static const uint32 NPC_TEXT_WARDEN_CLASS3  = 700202;
 static const uint32 NPC_TEXT_WARDEN_ZONE    = 700203;
 static const uint32 NPC_TEXT_WARDEN_CONFIRM = 700204;
 static const uint32 NPC_TEXT_WARDEN_DONE    = 700205;
+static const uint32 NPC_TEXT_WARDEN_TRAIN   = 700206;
 
 // Sender value for class confirmation items (avoids collision with GOSSIP_SENDER_MAIN = 1).
 static const uint32 SENDER_CLASS_CONFIRM = 2;
+
+// Sender values for spell training pages (one set per class slot).
+// SENDER_TRAIN_CX: action = page number — shows that page of available spells.
+// SENDER_LEARN_CX: action = spell ID   — learns that specific spell and charges gold.
+static const uint32 SENDER_TRAIN_C1 = 10;
+static const uint32 SENDER_TRAIN_C2 = 11;
+static const uint32 SENDER_TRAIN_C3 = 12;
+static const uint32 SENDER_LEARN_C1 = 20;
+static const uint32 SENDER_LEARN_C2 = 21;
+static const uint32 SENDER_LEARN_C3 = 22;
+
+// How many spells to show per gossip page.
+static const uint32 SPELLS_PER_PAGE = 20;
 
 // ============================================================
 // WoW Class IDs (3.3.5a)
@@ -239,16 +261,16 @@ public:
             return true;
         }
 
-        // All done — show summary
+        // All done — offer per-class spell training menus
         if (data.step == 2 && data.zoneChosen == 1)
         {
-            std::string summary = "Your path is set: " +
-                GetClassName(data.class1) + ", " +
-                GetClassName(data.class2) + ", and " +
-                GetClassName(data.class3) + ". Safe travels, " +
-                std::string(player->GetName()) + ".";
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, summary.c_str(), GOSSIP_SENDER_MAIN, 0);
-            SendGossipMenuFor(player, NPC_TEXT_WARDEN_DONE, creature->GetGUID());
+            std::string label1 = "Train " + GetClassName(data.class1) + " spells.";
+            std::string label2 = "Train " + GetClassName(data.class2) + " spells.";
+            std::string label3 = "Train " + GetClassName(data.class3) + " spells.";
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, label1.c_str(), SENDER_TRAIN_C1, 0);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, label2.c_str(), SENDER_TRAIN_C2, 0);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, label3.c_str(), SENDER_TRAIN_C3, 0);
+            SendGossipMenuFor(player, NPC_TEXT_WARDEN_TRAIN, creature->GetGUID());
             return true;
         }
 
@@ -274,18 +296,6 @@ public:
         // Step 2: Classes chosen, need zone
         if (data.step == 2 && data.zoneChosen == 0)
         {
-            // DKs stay in Dalaran — auto-complete zone selection
-            if (player->getClass() == WOW_CLASS_DEATH_KNIGHT)
-            {
-                CharacterDatabase.Execute(
-                    "UPDATE character_multiclass SET zone_chosen = 1 WHERE guid = {}",
-                    guid
-                );
-                Notify(player, "|cffC41F3B[Sanctum]|r Death Knights begin their journey here in Dalaran. You are home.");
-                CloseGossipMenuFor(player);
-                return true;
-            }
-
             AddGossipItemFor(player, GOSSIP_ICON_TALK,
                 "I am ready to choose my starting zone.", GOSSIP_SENDER_MAIN, 3);
             SendGossipMenuFor(player, NPC_TEXT_WARDEN_ZONE, creature->GetGUID());
@@ -390,6 +400,53 @@ public:
             return true;
         }
 
+        // Spell training — show a page of available spells for a class slot
+        if (sender == SENDER_TRAIN_C1 || sender == SENDER_TRAIN_C2 || sender == SENDER_TRAIN_C3)
+        {
+            uint8  classId    = (sender == SENDER_TRAIN_C1) ? data.class1 :
+                                (sender == SENDER_TRAIN_C2) ? data.class2 : data.class3;
+            uint32 senderLearn = sender + 10; // SENDER_LEARN_CX = SENDER_TRAIN_CX + 10
+            uint32 page        = action;
+            ShowSpellPage(player, creature, classId, senderLearn, sender, page);
+            return true;
+        }
+
+        // Spell training — player clicked a specific spell to learn
+        if (sender == SENDER_LEARN_C1 || sender == SENDER_LEARN_C2 || sender == SENDER_LEARN_C3)
+        {
+            uint8  classId = (sender == SENDER_LEARN_C1) ? data.class1 :
+                             (sender == SENDER_LEARN_C2) ? data.class2 : data.class3;
+            uint32 spellId = action;
+
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info || player->HasSpell(spellId))
+            {
+                CloseGossipMenuFor(player);
+                return true;
+            }
+
+            uint32 cost = GetSpellCost(spellId, classId);
+            if (cost > 0 && !player->HasEnoughMoney(cost))
+            {
+                Notify(player, "|cffFF0000[Sanctum]|r You don't have enough gold to learn that spell.");
+                CloseGossipMenuFor(player);
+                return true;
+            }
+
+            if (cost > 0)
+                player->ModifyMoney(-(int32)cost);
+
+            player->learnSpell(spellId, false);
+
+            std::string name = (info->SpellName[0]) ? info->SpellName[0] : "Unknown";
+            Notify(player, "|cff00FF00[Sanctum]|r Learned: " + name + ".");
+
+            // Reopen spell page so they can continue training
+            uint32 senderPage = sender - 10; // SENDER_TRAIN_CX = SENDER_LEARN_CX - 10
+            ShowSpellPage(player, creature, classId, sender, senderPage, 0);
+            return true;
+        }
+
         // Zone selected — teleport player
         if (sender == GOSSIP_SENDER_MAIN && action >= 300 && action < 400)
         {
@@ -421,6 +478,117 @@ public:
     }
 
 private:
+    // --------------------------------------------------------
+    // Formats a copper amount as "Xg Ys Zc" for display in gossip.
+    // --------------------------------------------------------
+    static std::string FormatCost(uint32 copper)
+    {
+        if (copper == 0) return "Free";
+        uint32 gold   = copper / 10000;
+        uint32 silver = (copper % 10000) / 100;
+        uint32 cents  = copper % 100;
+        std::string r;
+        if (gold)   r += std::to_string(gold)   + "g ";
+        if (silver) r += std::to_string(silver) + "s ";
+        if (cents)  r += std::to_string(cents)  + "c";
+        if (!r.empty() && r.back() == ' ') r.pop_back();
+        return r;
+    }
+
+    // --------------------------------------------------------
+    // Looks up how much a trainer charges for a specific spell.
+    // --------------------------------------------------------
+    static uint32 GetSpellCost(uint32 spellId, uint8 classId)
+    {
+        QueryResult result = WorldDatabase.Query(
+            "SELECT ts.MoneyCost FROM trainer_spell ts "
+            "INNER JOIN trainer t ON t.Id = ts.TrainerId "
+            "WHERE ts.SpellId = {} AND t.Requirement = {} AND t.Type = 0 "
+            "LIMIT 1",
+            spellId, classId
+        );
+        if (result)
+            return (*result)[0].Get<uint32>();
+        return 0;
+    }
+
+    // --------------------------------------------------------
+    // Builds a paginated gossip list of available spells for classId.
+    // Only shows spells the player hasn't learned yet and can learn
+    // at their current level.  Each spell item uses senderLearn so
+    // OnGossipSelect knows to execute a purchase.  Prev/Next buttons
+    // use senderPage so OnGossipSelect knows to show another page.
+    // --------------------------------------------------------
+    void ShowSpellPage(Player* player, Creature* creature,
+                       uint8 classId, uint32 senderLearn, uint32 senderPage, uint32 page)
+    {
+        // Collect all learnable spells for this class up to player's level.
+        struct SpellEntry { uint32 spellId; uint32 cost; };
+        std::vector<SpellEntry> available;
+
+        QueryResult result = WorldDatabase.Query(
+            "SELECT DISTINCT ts.SpellId, ts.MoneyCost "
+            "FROM trainer_spell ts "
+            "INNER JOIN trainer t ON t.Id = ts.TrainerId "
+            "WHERE t.Requirement = {} AND t.Type = 0 "
+            "AND ts.SpellId > 0 "
+            "AND (ts.ReqLevel = 0 OR ts.ReqLevel <= {}) "
+            "ORDER BY ts.ReqLevel, ts.SpellId",
+            classId, player->GetLevel()
+        );
+        if (result)
+        {
+            do
+            {
+                uint32 spellId = (*result)[0].Get<uint32>();
+                uint32 cost    = (*result)[1].Get<uint32>();
+                if (player->HasSpell(spellId))
+                    continue;
+                SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+                if (info)
+                    available.push_back({spellId, cost});
+            } while (result->NextRow());
+        }
+
+        if (available.empty())
+        {
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "You have learned all available spells for this class at your level.",
+                GOSSIP_SENDER_MAIN, 0);
+            SendGossipMenuFor(player, NPC_TEXT_WARDEN_TRAIN, creature->GetGUID());
+            return;
+        }
+
+        uint32 total    = static_cast<uint32>(available.size());
+        uint32 maxPages = (total + SPELLS_PER_PAGE - 1) / SPELLS_PER_PAGE;
+        if (page >= maxPages) page = 0;
+
+        uint32 start = page * SPELLS_PER_PAGE;
+        uint32 end   = std::min(start + SPELLS_PER_PAGE, total);
+
+        for (uint32 i = start; i < end; ++i)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(available[i].spellId);
+            std::string name = (info && info->SpellName[0]) ? info->SpellName[0] : "Unknown";
+            std::string label = name + "  (" + FormatCost(available[i].cost) + ")";
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                label.c_str(), senderLearn, available[i].spellId);
+        }
+
+        if (page > 0)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "<-- Previous page", senderPage, page - 1);
+        if (page + 1 < maxPages)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "--> Next page", senderPage, page + 1);
+
+        std::string header = GetClassName(classId) + " spells — page " +
+            std::to_string(page + 1) + " of " + std::to_string(maxPages);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, header.c_str(), GOSSIP_SENDER_MAIN, 0);
+
+        SendGossipMenuFor(player, NPC_TEXT_WARDEN_TRAIN, creature->GetGUID());
+    }
+
     // Build the class selection list.
     // forThirdSlot = true: also exclude class2 from the list.
     void ShowClassList(Player* player, Creature* creature, const WardenData& data, bool forThirdSlot)

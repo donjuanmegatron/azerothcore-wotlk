@@ -21,6 +21,7 @@
 #include "DatabaseEnv.h"
 #include "Chat.h"
 #include "Log.h"
+#include "WorldSession.h"
 
 // ============================================================
 // Constants
@@ -28,16 +29,6 @@
 
 static const uint32 MULTICLASS_NPC_ENTRY = 700100;
 
-// NPC text IDs — these match rows we insert into npc_text in the world SQL.
-static const uint32 NPC_TEXT_WELCOME = 700100;
-static const uint32 NPC_TEXT_CLASS2  = 700101;
-static const uint32 NPC_TEXT_CLASS3  = 700102;
-static const uint32 NPC_TEXT_DONE    = 700103;
-static const uint32 NPC_TEXT_CONFIRM = 700104;
-
-// Second sender value for confirmation gossip items.
-// GOSSIP_SENDER_MAIN (value 1) is used for navigation; we use 2 for confirmations.
-static const uint32 SENDER_CONFIRM = 2;
 
 // Gossip action number layout:
 //   1        = open class list for 2nd class
@@ -214,20 +205,36 @@ public:
 
     // Fires when a brand-new character is first created (before their very first login).
     // Seeds the character_multiclass row with their starting class.
+    // Uses INSERT (not INSERT IGNORE) so any stale row from a previously deleted
+    // character that happened to share this GUID is replaced with a clean slate.
     void OnPlayerCreate(Player* player) override
     {
-        uint32 guid      = static_cast<uint32>(player->GetGUID().GetCounter());
-        uint8 baseClass  = player->getClass();
+        uint32 guid     = static_cast<uint32>(player->GetGUID().GetCounter());
+        uint8 baseClass = player->getClass();
 
         CharacterDatabase.Execute(
-            "INSERT IGNORE INTO character_multiclass "
-            "(guid, class1, class2, class3, selection_step) "
-            "VALUES ({}, {}, 0, 0, 0)",
+            "INSERT INTO character_multiclass "
+            "(guid, class1, class2, class3, selection_step, zone_chosen) "
+            "VALUES ({}, {}, 0, 0, 0, 0) "
+            "ON DUPLICATE KEY UPDATE "
+            "class1=VALUES(class1), class2=0, class3=0, selection_step=0, zone_chosen=0",
             guid, baseClass
         );
 
         LOG_INFO("module", "[mod-multiclass] Character '{}' (GUID {}) initialized with primary class {}.",
             player->GetName(), guid, baseClass);
+    }
+
+    // Fires when a character is permanently deleted.
+    // Removes the character_multiclass row so no data leaks to future characters.
+    void OnPlayerDelete(ObjectGuid guid, uint32 /*accountId*/) override
+    {
+        uint32 lowGuid = guid.GetCounter();
+        CharacterDatabase.Execute(
+            "DELETE FROM character_multiclass WHERE guid = {}",
+            lowGuid
+        );
+        LOG_INFO("module", "[mod-multiclass] Deleted multiclass data for GUID {}.", lowGuid);
     }
 
     // Fires every time the player logs in.
@@ -252,7 +259,7 @@ public:
             return;
         }
 
-        // Grant all spells for any classes already chosen.
+        // Re-grant spells for any classes already chosen.
         if (data.class2)
             GrantClassSpells(player, data.class2);
         if (data.class3)
@@ -266,7 +273,7 @@ public:
     }
 
     // Fires every time the player gains a level.
-    // Grants any newly unlocked trainer spells for secondary/tertiary classes.
+    // Grants any newly unlocked spells for secondary/tertiary classes.
     void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
     {
         uint32 guid = static_cast<uint32>(player->GetGUID().GetCounter());
@@ -279,157 +286,146 @@ public:
     }
 };
 
+// NOTE: The Class Weaver NPC (npc_class_weaver) has been removed.
+// Class selection is now handled entirely by the Sanctum Warden (mod-sanctum-warden).
+
 // ============================================================
-// Creature Script — Class Weaver NPC
-// ScriptName: npc_class_weaver (must match creature_template.ScriptName in the DB)
+// Creature Script — Multiclass Class Trainer
+// ScriptName: npc_multiclass_trainer
+//
+// Assigned via SQL to all class trainer NPCs.
+// Shows the standard trainer window for the player's primary class.
+// For secondary/tertiary classes matching this trainer, offers an
+// instant "Learn all [Class] spells" gossip option instead —
+// the native trainer window can't show spells for non-primary classes
+// because IsSpellFitByClassAndRace filters by primary class only.
 // ============================================================
 
-class MulticlassCreatureScript : public CreatureScript
+class MulticlassTrainerScript : public CreatureScript
 {
 public:
-    MulticlassCreatureScript() : CreatureScript("npc_class_weaver") {}
+    MulticlassTrainerScript() : CreatureScript("npc_multiclass_trainer") {}
 
-    // Called when the player right-clicks the NPC to open the gossip window.
     bool OnGossipHello(Player* player, Creature* creature) override
     {
+        ClearGossipMenuFor(player);
+
+        // Look up what class this trainer teaches.
+        uint8 trainerClass = GetTrainerClass(creature->GetEntry());
+        if (!trainerClass)
+            return false; // not a class trainer — fall through to default gossip
+
         uint32 guid = static_cast<uint32>(player->GetGUID().GetCounter());
         MulticlassData data = LoadMulticlassData(guid);
 
-        ClearGossipMenuFor(player);
+        bool hasThisClass = (data.class1 == trainerClass ||
+                             data.class2 == trainerClass ||
+                             data.class3 == trainerClass);
 
-        if (data.step == 2)
+        if (!hasThisClass)
         {
-            // All three classes chosen — show summary and close.
-            std::string summary = "Your three classes are bound: " +
-                GetClassName(data.class1) + ", " +
-                GetClassName(data.class2) + ", and " +
-                GetClassName(data.class3) + ". This is a permanent choice. Safe travels.";
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, summary.c_str(), GOSSIP_SENDER_MAIN, 0);
-            SendGossipMenuFor(player, NPC_TEXT_DONE, creature->GetGUID());
+            // Player doesn't study this art — show a polite refusal.
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "I do not study this art. Speak with the Sanctum Warden to bind additional classes.",
+                GOSSIP_SENDER_MAIN, 0);
+            SendGossipMenuFor(player, GetTrainerTextId(player, creature), creature->GetGUID());
             return true;
         }
 
-        if (data.step == 0)
+        // Primary class → open the standard trainer window.
+        if (data.class1 == trainerClass)
         {
-            AddGossipItemFor(player, GOSSIP_ICON_TALK,
-                "I am ready to choose my second class.", GOSSIP_SENDER_MAIN, 1);
-            SendGossipMenuFor(player, NPC_TEXT_WELCOME, creature->GetGUID());
-        }
-        else // step == 1
-        {
-            std::string msg = "Your second class is " + GetClassName(data.class2) +
-                ". Now choose your third and final class.";
-            AddGossipItemFor(player, GOSSIP_ICON_TALK, msg.c_str(), GOSSIP_SENDER_MAIN, 2);
-            SendGossipMenuFor(player, NPC_TEXT_CLASS3, creature->GetGUID());
+            std::string label = "Train " + GetClassName(trainerClass) + " skills.";
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                label.c_str(), GOSSIP_SENDER_MAIN, 1);
         }
 
+        // Secondary or tertiary class → instant grant via gossip.
+        if (data.class2 == trainerClass)
+        {
+            std::string label = "Learn all " + GetClassName(trainerClass) + " spells for my level.";
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                label.c_str(), GOSSIP_SENDER_MAIN, 2);
+        }
+        if (data.class3 == trainerClass)
+        {
+            std::string label = "Learn all " + GetClassName(trainerClass) + " spells for my level.";
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                label.c_str(), GOSSIP_SENDER_MAIN, 3);
+        }
+
+        SendGossipMenuFor(player, GetTrainerTextId(player, creature), creature->GetGUID());
         return true;
     }
 
-    // Called when the player clicks any item in the gossip menu.
-    bool OnGossipSelect(Player* player, Creature* creature, uint32 sender, uint32 action) override
+    bool OnGossipSelect(Player* player, Creature* creature, uint32 /*sender*/, uint32 action) override
     {
         ClearGossipMenuFor(player);
 
-        uint32 guid = static_cast<uint32>(player->GetGUID().GetCounter());
-        MulticlassData data = LoadMulticlassData(guid);
+        uint8 trainerClass = GetTrainerClass(creature->GetEntry());
 
-        // --- Navigation: open the class list ---
-        if (sender == GOSSIP_SENDER_MAIN && action == 1)
+        switch (action)
         {
-            ShowClassList(player, creature, data, false);
-            return true;
-        }
-        if (sender == GOSSIP_SENDER_MAIN && action == 2)
-        {
-            ShowClassList(player, creature, data, true);
-            return true;
-        }
-
-        // --- Player clicked a class name: show confirmation prompt ---
-        if (sender == GOSSIP_SENDER_MAIN && action >= 100 && action < 200)
-        {
-            uint8 chosenClass = static_cast<uint8>(action - 100);
-
-            // Guard against invalid or duplicate choices.
-            if (!IsValidClass(chosenClass) || chosenClass == data.class1 || chosenClass == data.class2)
-            {
+            case 0:
+                // "Not my art" informational item — just close.
                 CloseGossipMenuFor(player);
-                return true;
-            }
+                break;
 
-            std::string confirmText = "Bind " + GetClassName(chosenClass) +
-                " to your soul permanently? This cannot be undone.";
-            uint32 backAction = (data.step == 0) ? 1 : 2;
-
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, confirmText.c_str(), SENDER_CONFIRM, 200 + chosenClass);
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Let me reconsider.", GOSSIP_SENDER_MAIN, backAction);
-            SendGossipMenuFor(player, NPC_TEXT_CONFIRM, creature->GetGUID());
-            return true;
-        }
-
-        // --- Player confirmed their choice: save to DB and grant spells ---
-        if (sender == SENDER_CONFIRM && action >= 200 && action < 300)
-        {
-            uint8 chosenClass = static_cast<uint8>(action - 200);
-
-            if (!IsValidClass(chosenClass) || chosenClass == data.class1 || chosenClass == data.class2)
-            {
+            case 1:
+                // Primary class — close gossip, open standard trainer window.
                 CloseGossipMenuFor(player);
-                return true;
-            }
+                player->GetSession()->SendTrainerList(creature);
+                break;
 
-            if (data.step == 0)
-            {
-                CharacterDatabase.Execute(
-                    "UPDATE character_multiclass SET class2 = {}, selection_step = 1 WHERE guid = {}",
-                    chosenClass, guid
-                );
-                GrantClassSpells(player, chosenClass);
-                Notify(player, "|cff00FF00[Sanctum]|r " + GetClassName(chosenClass) + " bound as your second class.");
-                Notify(player, "|cffFF8000[Sanctum]|r Return to the Class Weaver to choose your third class.");
-            }
-            else if (data.step == 1)
-            {
-                CharacterDatabase.Execute(
-                    "UPDATE character_multiclass SET class3 = {}, selection_step = 2 WHERE guid = {}",
-                    chosenClass, guid
-                );
-                GrantClassSpells(player, chosenClass);
+            case 2:
+            case 3:
+                // Secondary or tertiary class — grant all spells instantly.
+                CloseGossipMenuFor(player);
+                if (trainerClass)
+                {
+                    GrantClassSpells(player, trainerClass);
+                    Notify(player, "|cff00FF00[Sanctum]|r " +
+                        GetClassName(trainerClass) + " training complete.");
+                }
+                break;
 
-                // Reload for accurate class names in the final message.
-                data = LoadMulticlassData(guid);
-                Notify(player, "|cff00FF00[Sanctum]|r " + GetClassName(chosenClass) + " bound as your third class.");
-                Notify(player, "|cff00FF00[Sanctum]|r Your identity is complete: " +
-                    GetClassName(data.class1) + " / " +
-                    GetClassName(data.class2) + " / " +
-                    GetClassName(data.class3) + ".");
-            }
-
-            CloseGossipMenuFor(player);
-            return true;
+            default:
+                CloseGossipMenuFor(player);
+                break;
         }
 
-        CloseGossipMenuFor(player);
         return true;
     }
 
 private:
-    // Builds the class selection list gossip page.
-    // forThirdSlot = true means we're picking class3, so class2 is also excluded.
-    void ShowClassList(Player* player, Creature* creature, const MulticlassData& data, bool forThirdSlot)
+    // Returns the NPC text ID to display in the gossip window header.
+    // Some generic trainers (entries 26324-26332) have gossip_menu_id = 0,
+    // causing GetGossipTextId to return DEFAULT_GOSSIP_MESSAGE (0xffffff) —
+    // an invalid sentinel that can prevent the window from rendering.
+    // Fall back to text ID 1 (blank text, always present) so the window opens.
+    static uint32 GetTrainerTextId(Player* player, Creature* creature)
     {
-        for (uint8 classId : ALL_CLASSES)
-        {
-            if (classId == data.class1) continue;
-            if (forThirdSlot && classId == data.class2) continue;
+        uint32 textId = player->GetGossipTextId(creature);
+        if (textId >= 0xffffff)
+            textId = 1;
+        return textId;
+    }
 
-            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
-                GetClassName(classId).c_str(), GOSSIP_SENDER_MAIN, 100 + classId);
-        }
-
-        uint32 textId = forThirdSlot ? NPC_TEXT_CLASS3 : NPC_TEXT_CLASS2;
-        SendGossipMenuFor(player, textId, creature->GetGUID());
+    // Returns the class ID this trainer teaches, or 0 if not a class trainer.
+    // Cached per entry via a simple DB query.
+    static uint8 GetTrainerClass(uint32 creatureEntry)
+    {
+        QueryResult result = WorldDatabase.Query(
+            "SELECT t.Requirement "
+            "FROM creature_default_trainer cdt "
+            "INNER JOIN trainer t ON t.Id = cdt.TrainerId "
+            "WHERE cdt.CreatureId = {} AND t.Type = 0 AND t.Requirement > 0 "
+            "LIMIT 1",
+            creatureEntry
+        );
+        if (result)
+            return (*result)[0].Get<uint8>();
+        return 0;
     }
 };
 
@@ -440,6 +436,6 @@ private:
 void AddSC_mod_multiclass()
 {
     new MulticlassPlayerScript();
-    new MulticlassCreatureScript();
+    new MulticlassTrainerScript();
     LOG_INFO("module", "[mod-multiclass] Module loaded.");
 }

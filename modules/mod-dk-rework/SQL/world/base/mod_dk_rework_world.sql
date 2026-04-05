@@ -62,3 +62,22 @@ WHERE t.`Requirement` = 6
   AND t.`Type` = 0
   AND ts.`SpellId` > 0
   AND ts.`ReqLevel` >= 55;
+
+-- ============================================================
+-- 3. Death Knight class stats for levels 1-54
+--
+-- AzerothCore only defines player_class_stats for DK starting at
+-- level 55 (normal DK starting level).  When DKs level from 1,
+-- the engine falls back to basehp=1 for missing rows.
+--
+-- Fix: copy Warrior (class 1) stats for levels 1-54.  The Warrior
+-- values connect perfectly — Warrior level 54 stats are nearly
+-- identical to DK level 55 stats, giving smooth HP/stat scaling.
+-- ============================================================
+
+DELETE FROM `player_class_stats` WHERE `Class` = 6 AND `Level` < 55;
+
+INSERT INTO `player_class_stats` (`Class`, `Level`, `BaseHP`, `BaseMana`, `Strength`, `Agility`, `Stamina`, `Intellect`, `Spirit`)
+SELECT 6, `Level`, `BaseHP`, `BaseMana`, `Strength`, `Agility`, `Stamina`, `Intellect`, `Spirit`
+FROM `player_class_stats`
+WHERE `Class` = 1 AND `Level` < 55;
