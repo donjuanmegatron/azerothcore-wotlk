@@ -38,6 +38,7 @@
 #include "Log.h"
 #include "SpellMgr.h"
 #include "SpellInfo.h"
+#include "DBCStores.h"
 
 // ============================================================
 // Constants
@@ -65,6 +66,27 @@ static const uint32 SENDER_TRAIN_C3 = 12;
 static const uint32 SENDER_LEARN_C1 = 20;
 static const uint32 SENDER_LEARN_C2 = 21;
 static const uint32 SENDER_LEARN_C3 = 22;
+
+// Sender for the pet supplies shop.
+// action = which item bundle to purchase (1 = Corpse Dust x5, 2 = Soul Shard x5).
+static const uint32 SENDER_PET_SHOP = 30;
+
+// ============================================================
+// Pet reagent item IDs
+// ============================================================
+
+// Corpse Dust: consumed by Raise Dead when no corpse is nearby.
+// Without Master of Ghouls talent, DKs need this to summon their ghoul anywhere.
+static const uint32 ITEM_CORPSE_DUST = 37201;
+
+// Soul Shard: consumed by Warlock demon-summon spells.
+// Normal generation (Drain Soul kills) is disabled in Sanctum, so the Warden
+// sells them directly.
+static const uint32 ITEM_SOUL_SHARD  = 6265;
+
+// Bundle size and cost for each reagent sold at the Warden.
+static const uint32 REAGENT_BUNDLE_SIZE = 5;
+static const uint32 REAGENT_COST_COPPER = 500; // 5 silver per bundle of 5
 
 // How many spells to show per gossip page.
 static const uint32 SPELLS_PER_PAGE = 20;
@@ -188,29 +210,21 @@ static WardenData LoadWardenData(uint32 guid)
 }
 
 // ============================================================
-// GrantClassSpells — grants all spells for classId up to player's level.
+// GrantClassSpells — grants all TRAINER spells for classId up to player's level.
 // Uses the same trainer schema as mod-multiclass and mod-dk-rework.
+//
+// NOTE: playercreateinfo_spell_custom (starting/proficiency spells) is intentionally
+// NOT granted here.  Those spells "teach skills" and AzerothCore's character validation
+// (Player::LoadFromDB) deletes any skill-teaching spell that is invalid for the player's
+// primary race/class combination on every login.  This caused armor/weapon proficiency
+// loss → item auto-unequip → item deletion at load time.  Trainer spells (actual class
+// abilities) are not subject to that validation and are safe to grant cross-class.
 // ============================================================
 
-static void GrantClassSpells(Player* player, uint8 classId)
+// silent = true  → addSpell directly (no notification) — for login/levelup
+// silent = false → learnSpell (shows notification) — for first class selection at Warden
+static void GrantClassSpells(Player* player, uint8 classId, bool silent = false)
 {
-    uint32 classMask = (1u << (classId - 1));
-
-    QueryResult startSpells = WorldDatabase.Query(
-        "SELECT DISTINCT Spell FROM playercreateinfo_spell_custom "
-        "WHERE (classmask & {}) AND classmask != 0",
-        classMask
-    );
-    if (startSpells)
-    {
-        do
-        {
-            uint32 spellId = (*startSpells)[0].Get<uint32>();
-            if (spellId && !player->HasSpell(spellId))
-                player->learnSpell(spellId, false);
-        } while (startSpells->NextRow());
-    }
-
     QueryResult trainerSpells = WorldDatabase.Query(
         "SELECT DISTINCT ts.SpellId "
         "FROM trainer_spell ts "
@@ -225,7 +239,36 @@ static void GrantClassSpells(Player* player, uint8 classId)
         do
         {
             uint32 spellId = (*trainerSpells)[0].Get<uint32>();
-            if (spellId && !player->HasSpell(spellId))
+            if (!spellId)
+                continue;
+
+            // Replicate AzerothCore's CheckSkillLearnedBySpell logic (Player.cpp:3074).
+            // Skip any spell linked to a skill line that is invalid for the player's
+            // primary race/class — AzerothCore deletes those on login, stripping
+            // proficiency → auto-unequip → gear destruction.
+            {
+                uint32 errorSkill = 0;
+                SkillLineAbilityMapBounds skill_bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+                for (auto sla = skill_bounds.first; sla != skill_bounds.second; ++sla)
+                {
+                    SkillLineEntry const* pSkill = sSkillLineStore.LookupEntry(sla->second->SkillLine);
+                    if (!pSkill)
+                        continue;
+                    if (GetSkillRaceClassInfo(pSkill->id, player->getRace(), player->getClass()))
+                    {
+                        errorSkill = 0;
+                        break;
+                    }
+                    else
+                        errorSkill = pSkill->id;
+                }
+                if (errorSkill)
+                    continue;
+            }
+
+            if (silent)
+                player->addSpell(spellId, SPEC_MASK_ALL, false);
+            else if (!player->HasSpell(spellId))
                 player->learnSpell(spellId, false);
         } while (trainerSpells->NextRow());
     }
@@ -261,7 +304,7 @@ public:
             return true;
         }
 
-        // All done — offer per-class spell training menus
+        // All done — offer per-class spell training menus + pet supplies
         if (data.step == 2 && data.zoneChosen == 1)
         {
             std::string label1 = "Train " + GetClassName(data.class1) + " spells.";
@@ -270,6 +313,8 @@ public:
             AddGossipItemFor(player, GOSSIP_ICON_TRAINER, label1.c_str(), SENDER_TRAIN_C1, 0);
             AddGossipItemFor(player, GOSSIP_ICON_TRAINER, label2.c_str(), SENDER_TRAIN_C2, 0);
             AddGossipItemFor(player, GOSSIP_ICON_TRAINER, label3.c_str(), SENDER_TRAIN_C3, 0);
+            AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG,
+                "Purchase pet summoning supplies.", SENDER_PET_SHOP, 0);
             SendGossipMenuFor(player, NPC_TEXT_WARDEN_TRAIN, creature->GetGUID());
             return true;
         }
@@ -447,6 +492,22 @@ public:
             return true;
         }
 
+        // Pet supplies shop — show the menu (action 0) or back button (action 99)
+        if (sender == SENDER_PET_SHOP && (action == 0 || action == 99))
+        {
+            if (action == 99)
+                return OnGossipHello(player, creature); // back to main menu
+            ShowPetShop(player, creature);
+            return true;
+        }
+
+        // Pet supplies shop — player clicked a purchase (action 1 or 2)
+        if (sender == SENDER_PET_SHOP && action >= 1 && action < 99)
+        {
+            BuyPetReagent(player, creature, action);
+            return true;
+        }
+
         // Zone selected — teleport player
         if (sender == GOSSIP_SENDER_MAIN && action >= 300 && action < 400)
         {
@@ -463,6 +524,10 @@ public:
                 "UPDATE character_multiclass SET zone_chosen = 1 WHERE guid = {}",
                 guid
             );
+
+            // Grant starter gear before teleporting — only fires here, and this
+            // handler is only reachable when zone_chosen == 0 (once per character).
+            GrantStarterGear(player, data);
 
             Notify(player, "|cff00FF00[Sanctum]|r Sending you to " +
                 std::string(zone.name) + ". Your journey begins now.");
@@ -510,6 +575,174 @@ private:
         if (result)
             return (*result)[0].Get<uint32>();
         return 0;
+    }
+
+    // --------------------------------------------------------
+    // Places a bag item directly into a specific bag slot (19–22) on the player.
+    // bagSlot: INVENTORY_SLOT_BAG_START (19) through INVENTORY_SLOT_BAG_START+3 (22).
+    // Falls back to AddItem if the slot is already occupied.
+    // --------------------------------------------------------
+    static void EquipBagToSlot(Player* player, uint32 itemEntry, uint8 bagSlot)
+    {
+        // If slot already has a bag, fall back to placing it in inventory.
+        if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot))
+        {
+            player->AddItem(itemEntry, 1);
+            return;
+        }
+
+        // Build an explicit destination: container=INVENTORY_SLOT_BAG_0, slot=bagSlot.
+        ItemPosCountVec dest;
+        dest.push_back(ItemPosCount((INVENTORY_SLOT_BAG_0 << 8) | bagSlot, 1));
+
+        Item* bag = player->StoreNewItem(dest, itemEntry, true, 0);
+        if (bag)
+            player->SendNewItem(bag, 1, true, false);
+        else
+            player->AddItem(itemEntry, 1); // fallback if store fails
+    }
+
+    // --------------------------------------------------------
+    // Grants class-appropriate starter gear when a new character picks their zone.
+    // Called exactly once per character — zone selection only shows when zone_chosen==0.
+    //
+    // Each chosen class contributes its own chest + weapon(s).
+    // Duplicate chest types across classes are only granted once.
+    //   Mail classes:    Warrior Paladin DK Shaman   → 26031 Elekk Rider's Mail
+    //   Leather classes: Hunter Rogue Druid           → 24111 Kurken Hide Jerkin
+    //   Cloth classes:   Priest Mage Warlock          → 26004 Farmhand's Vest
+    //
+    // The Sanctum Pack (700401, 50 slots) is granted first so the player has
+    // plenty of bag room for all gear items.
+    // --------------------------------------------------------
+    static void GrantStarterGear(Player* player, const WardenData& data)
+    {
+        // Grant both starter bags first so the player has room for all gear.
+        //   700401 Sanctum Pack    — 50-slot epic bag (gear/general storage)
+        //   700400 Reagent Pouch   — 50-slot epic bag (consumables/reagents)
+        // Both go into the backpack as items; the player drags them to bag slots to activate.
+        static const uint32 SANCTUM_PACK   = 700401;
+        static const uint32 REAGENT_POUCH  = 700400;
+
+        struct StarterKit
+        {
+            uint8  classId;
+            uint32 chest;    // armor chest for this class
+            uint32 weapon;   // primary weapon (or bow)
+            uint32 weapon2;  // secondary weapon (DK only — gives 2 of this)
+            uint32 weaponQty;
+        };
+
+        // All real WotLK green items (AllowableClass=-1, RequiredLevel=0).
+        static const StarterKit KITS[] =
+        {
+            { WOW_CLASS_WARRIOR,       26031, 27389,     0, 1 }, // Elekk Rider's Mail + Surplus Bastard Sword
+            { WOW_CLASS_PALADIN,       26031,  4948,     0, 1 }, // Elekk Rider's Mail + Stinging Mace
+            { WOW_CLASS_DEATH_KNIGHT,  26031, 27389, 18957, 1 }, // Elekk Rider's Mail + Bastard Sword + Brushwood Blade x2
+            { WOW_CLASS_HUNTER,        24111, 28152,     0, 1 }, // Kurken Hide Jerkin + Quel'Thalas Recurve
+            { WOW_CLASS_ROGUE,         24111,  4947,     0, 2 }, // Kurken Hide Jerkin + Jagged Dagger x2
+            { WOW_CLASS_SHAMAN,        26031, 26051,     0, 1 }, // Elekk Rider's Mail + 2 Stone Sledgehammer
+            { WOW_CLASS_DRUID,         24111,  9603,     0, 1 }, // Kurken Hide Jerkin + Gritroot Staff
+            { WOW_CLASS_PRIEST,        26004,  9603,     0, 1 }, // Farmhand's Vest + Gritroot Staff
+            { WOW_CLASS_MAGE,          26004,  9603,     0, 1 }, // Farmhand's Vest + Gritroot Staff
+            { WOW_CLASS_WARLOCK,       26004,  9603,     0, 1 }, // Farmhand's Vest + Gritroot Staff
+        };
+        static const uint32 KIT_COUNT = 10;
+
+        uint8 classes[3] = { data.class1, data.class2, data.class3 };
+
+        // Equip both bags directly into bag slots 1 and 2 so they are immediately usable.
+        // INVENTORY_SLOT_BAG_START = 19 (slot 1), +1 = 20 (slot 2).
+        EquipBagToSlot(player, SANCTUM_PACK,   INVENTORY_SLOT_BAG_START);
+        EquipBagToSlot(player, REAGENT_POUCH,  INVENTORY_SLOT_BAG_START + 1);
+
+        // Track which chest entries have already been given to avoid duplicates.
+        // (e.g. Warrior + Shaman both get the mail chest — only give one.)
+        uint32 grantedChests[3] = {0, 0, 0};
+        uint8  numGrantedChests = 0;
+
+        for (uint8 slot = 0; slot < 3; ++slot)
+        {
+            uint8 classId = classes[slot];
+            if (classId == 0)
+                continue;
+
+            for (uint32 k = 0; k < KIT_COUNT; ++k)
+            {
+                if (KITS[k].classId != classId)
+                    continue;
+
+                // Chest — give only once per unique entry
+                bool alreadyGiven = false;
+                for (uint8 c = 0; c < numGrantedChests; ++c)
+                    if (grantedChests[c] == KITS[k].chest) { alreadyGiven = true; break; }
+
+                if (!alreadyGiven)
+                {
+                    player->AddItem(KITS[k].chest, 1);
+                    grantedChests[numGrantedChests++] = KITS[k].chest;
+                }
+
+                // Weapon(s) — always grant per class
+                player->AddItem(KITS[k].weapon, KITS[k].weaponQty);
+
+                if (KITS[k].weapon2 != 0)
+                    player->AddItem(KITS[k].weapon2, 2);
+
+                break;
+            }
+        }
+
+        Notify(player, "|cff00FF00[Sanctum]|r Your starter equipment has been placed in your bags. The Sanctum Pack and Reagent Pouch are equipped and ready.");
+    }
+
+    // --------------------------------------------------------
+    // Shows the pet summoning supplies shop.
+    // Lists Corpse Dust (DK) and Soul Shards (Warlock) with prices.
+    // action 1 = Corpse Dust x5, action 2 = Soul Shard x5.
+    // --------------------------------------------------------
+    void ShowPetShop(Player* player, Creature* creature)
+    {
+        std::string dustLabel  = "Corpse Dust x"   + std::to_string(REAGENT_BUNDLE_SIZE)
+                               + "  (" + FormatCost(REAGENT_COST_COPPER) + ")"
+                               + "  [Death Knight: Raise Dead without a corpse]";
+        std::string shardLabel = "Soul Shard x"    + std::to_string(REAGENT_BUNDLE_SIZE)
+                               + "  (" + FormatCost(REAGENT_COST_COPPER) + ")"
+                               + "  [Warlock: demon summons]";
+
+        AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, dustLabel.c_str(),  SENDER_PET_SHOP, 1);
+        AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, shardLabel.c_str(), SENDER_PET_SHOP, 2);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "< Back", SENDER_PET_SHOP, 99);
+        SendGossipMenuFor(player, NPC_TEXT_WARDEN_TRAIN, creature->GetGUID());
+    }
+
+    // --------------------------------------------------------
+    // Handles a pet reagent purchase (action 1 = Corpse Dust, action 2 = Soul Shard).
+    // Deducts gold and adds items to inventory.
+    // --------------------------------------------------------
+    void BuyPetReagent(Player* player, Creature* creature, uint32 action)
+    {
+        uint32 itemEntry = 0;
+        if (action == 1)      itemEntry = ITEM_CORPSE_DUST;
+        else if (action == 2) itemEntry = ITEM_SOUL_SHARD;
+        else { CloseGossipMenuFor(player); return; }
+
+        if (!player->HasEnoughMoney(static_cast<uint32>(REAGENT_COST_COPPER)))
+        {
+            Notify(player, "|cffFF0000[Sanctum]|r You don't have enough gold for that.");
+            ShowPetShop(player, creature);
+            return;
+        }
+
+        if (!player->AddItem(itemEntry, REAGENT_BUNDLE_SIZE))
+        {
+            Notify(player, "|cffFF0000[Sanctum]|r Your inventory is full.");
+            ShowPetShop(player, creature);
+            return;
+        }
+
+        player->ModifyMoney(-static_cast<int32>(REAGENT_COST_COPPER));
+        ShowPetShop(player, creature); // reopen shop so they can buy more
     }
 
     // --------------------------------------------------------

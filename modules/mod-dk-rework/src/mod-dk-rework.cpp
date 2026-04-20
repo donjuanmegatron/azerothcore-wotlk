@@ -110,6 +110,50 @@ static void GrantDKSpells(Player* player)
                 player->learnSpell(spellId, false);
         } while (trainerSpells->NextRow());
     }
+
+    // --- Rank 1 core abilities (Acherus quest rewards, not in trainer table) ---
+    // In live WoW these are taught during the Acherus intro zone at level 55.
+    // Sanctum bypasses Acherus, so the trainer only has ranks 2+. Without rank 1
+    // the higher trainer ranks are unreachable. Staggered to match Sanctum's
+    // 1-80 progression rather than dumping everything at creation.
+    uint8 level = player->GetLevel();
+
+    // Level 1 — disease appliers, core of every DK spec
+    if (level >= 1)
+    {
+        if (!player->HasSpell(45477)) player->learnSpell(45477, false); // Icy Touch R1
+        if (!player->HasSpell(45462)) player->learnSpell(45462, false); // Plague Strike R1
+    }
+    // Level 4 — Blood rune spender, pairs with diseases already active
+    if (level >= 4)
+    {
+        if (!player->HasSpell(45902)) player->learnSpell(45902, false); // Blood Strike R1
+    }
+    // Level 7 — Runic Power dump, arrives with Blood Presence at 7
+    if (level >= 7)
+    {
+        if (!player->HasSpell(47541)) player->learnSpell(47541, false); // Death Coil R1
+    }
+    // Level 10 — Frost spec's RP dump
+    if (level >= 10)
+    {
+        if (!player->HasSpell(49143)) player->learnSpell(49143, false); // Frost Strike R1
+    }
+    // Level 14 — Blood DK's primary dual-strike
+    if (level >= 14)
+    {
+        if (!player->HasSpell(55050)) player->learnSpell(55050, false); // Heart Strike R1
+    }
+    // Level 17 — Unholy spec's physical+shadow primary, same level as Death & Decay
+    if (level >= 17)
+    {
+        if (!player->HasSpell(55090)) player->learnSpell(55090, false); // Scourge Strike R1
+    }
+    // Level 20 — Unholy AoE utility, same level as Path of Frost + Obliterate R1
+    if (level >= 20)
+    {
+        if (!player->HasSpell(49158)) player->learnSpell(49158, false); // Corpse Explosion R1
+    }
 }
 
 // ============================================================

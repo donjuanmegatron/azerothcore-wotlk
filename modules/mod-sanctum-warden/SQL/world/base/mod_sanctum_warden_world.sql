@@ -113,7 +113,9 @@ VALUES
     -- The Exodar — The Crystal Hall
     (700200, 530, -3897.40, -11718.53,   -2.70, 0.00, 300),
     -- Silvermoon City — The Royal Exchange
-    (700200, 530, 10132.40,  -6801.14,    16.51, 1.57, 300);
+    (700200, 530, 10132.40,  -6801.14,    16.51, 1.57, 300),
+    -- Durotar — Valley of Trials (orc/troll starting area)
+    (700200,   1,  -618.52,  -4251.67,    38.72, 0.00, 300);
 
 -- ============================================================
 -- 5. Faction neutrality — city guards AND all starting-zone civilians
