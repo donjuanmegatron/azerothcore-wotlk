@@ -48,7 +48,11 @@
 #include "DBCStores.h"
 
 #include "SpellScript.h"
+#include "CommandScript.h"
 #include <unordered_map>
+#include <sstream>
+
+using namespace Acore::ChatCommands;
 
 // ============================================================
 // Constants
@@ -160,7 +164,7 @@ MulticlassData LoadMulticlassData(uint32 guid)
 
 void Notify(Player* player, const std::string& msg)
 {
-    ChatHandler(player->GetSession()).PSendSysMessage("%s", msg.c_str());
+    ChatHandler(player->GetSession()).SendSysMessage(msg.c_str());
 }
 
 // ============================================================
@@ -229,16 +233,22 @@ void GrantClassSpells(Player* player, uint8 classId, bool skipStartSpells = fals
             if (!spellId)
                 continue;
 
-            // Note: ValidateSkillLearnedBySpells = 0 in worldserver.conf, so AzerothCore
-            // never deletes spells from character_spell regardless of skill line validity.
-            // No skill-line filtering needed here.
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info)
+                continue;
+
+            // Gate on DBC BaseLevel: this is the minimum level at which each spell rank is
+            // designed to be learned. trainer_spell.ReqLevel is 0 for many spells, which
+            // would otherwise cause all ranks to be granted at level 1. BaseLevel=0 means
+            // "passive / always available" — always grant those.
+            if (info->BaseLevel > 0 && info->BaseLevel > player->GetLevel())
+                continue;
 
             // Skip Rogue dagger-only abilities — Sanctum Rogues use any weapon.
             // EquippedItemClass 2 = weapon; subclass mask bit 15 = dagger.
             if (classId == WOW_CLASS_ROGUE)
             {
-                SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-                if (info && info->EquippedItemClass == 2 &&
+                if (info->EquippedItemClass == 2 &&
                     (info->EquippedItemSubClassMask & (1 << 15)) &&        // requires dagger
                     !(info->EquippedItemSubClassMask & ~(1 << 15)))        // ONLY dagger
                     continue;
@@ -279,6 +289,9 @@ void GrantClassSpells(Player* player, uint8 classId, bool skipStartSpells = fals
         uint8 level = player->GetLevel();
         if (level >= 1)
         {
+            if (!player->HasSpell(48263)) player->learnSpell(48263, false); // Blood Presence
+            if (!player->HasSpell(48266)) player->learnSpell(48266, false); // Frost Presence
+            if (!player->HasSpell(48265)) player->learnSpell(48265, false); // Unholy Presence
             if (!player->HasSpell(45477)) player->learnSpell(45477, false); // Icy Touch R1
             if (!player->HasSpell(45462)) player->learnSpell(45462, false); // Plague Strike R1
         }
@@ -296,10 +309,17 @@ void GrantClassSpells(Player* player, uint8 classId, bool skipStartSpells = fals
             if (!player->HasSpell(49158)) player->learnSpell(49158, false); // Corpse Explosion R1
     }
 
-    // --- Hunter: pet system spells (quest rewards, not in trainer table) ---
-    // Tame Beast and the core pet management spells are normally gated behind
-    // a level-10 quest chain. Secondary/tertiary Hunters can never complete
-    // that quest, so we grant them here at level 10+.
+    // --- Hunter: Auto Shot + pet system spells ---
+    // Auto Shot (75) is a level-1 trainer spell that all Hunters learn at creation.
+    // Secondary/tertiary Hunters skip character creation, so grant it explicitly.
+    if (classId == WOW_CLASS_HUNTER)
+    {
+        if (!player->HasSpell(75))
+            player->learnSpell(75, false);
+    }
+
+    // Tame Beast and pet management spells are gated behind a level-10 quest chain
+    // that secondary/tertiary Hunters can never complete, so grant them here.
     if (classId == WOW_CLASS_HUNTER && player->GetLevel() >= 10)
     {
         static const uint32 hunterPetSpells[] = {
@@ -426,6 +446,63 @@ static void RefillSecondaryPower(Player* player)
             player->SetPower(POWER_RAGE, 1000);
         if (data.class1 != WOW_CLASS_ROGUE)
             player->SetPower(POWER_ENERGY, 100);
+    }
+
+    // Secondary / tertiary Death Knight — keep Runic Power at max (1000 = 100 RP).
+    // Runic Power decays outside combat, so a one-time OnLogin set isn't enough.
+    // This 500ms tick prevents RP from draining to 0 between casts.
+    // SetMaxPower is included here in case the pool was reset by a relog.
+    if (data.class1 != WOW_CLASS_DEATH_KNIGHT &&
+        (data.class2 == WOW_CLASS_DEATH_KNIGHT || data.class3 == WOW_CLASS_DEATH_KNIGHT))
+    {
+        player->SetMaxPower(POWER_RUNIC_POWER, 1000);
+        player->SetPower(POWER_RUNIC_POWER, 1000);
+    }
+}
+
+// ============================================================
+// Permanent self-buff system
+//
+// Max-rank self-buffs every character would re-cast before combat.
+// Applied at login and refreshed every 30 seconds via WorldScript tick.
+// Excludes: Bloodlust/Heroism, combat cooldowns, no-duration toggles
+// (Paladin auras, Mage Armor, Lightning Shield charges — always managed
+// by the player or have no expiry). Hunter aspects are permanent toggles.
+// ============================================================
+
+static const std::unordered_map<uint32, std::vector<uint32>> PERMANENT_SELF_BUFFS =
+{
+    { WOW_CLASS_DEATH_KNIGHT, { 57642 }},           // Horn of Winter R2
+    { WOW_CLASS_DRUID,        { 26990 }},           // Mark of the Wild R8
+    { WOW_CLASS_MAGE,         { 27126 }},           // Arcane Intellect R6
+    { WOW_CLASS_PALADIN,      { 27141, 20217 }},    // Blessing of Might R8, Blessing of Kings
+    { WOW_CLASS_PRIEST,       { 25389, 27841, 25431 }}, // PW:Fortitude R7, Divine Spirit R5, Inner Fire R7
+    { WOW_CLASS_WARRIOR,      { 47436, 47440 }},    // Battle Shout R9, Commanding Shout R5
+    { WOW_CLASS_WARLOCK,      { 58094 }},           // Fel Armor R5
+};
+
+// Scans every aura currently on the player. Any spell whose DBC DurationEntry
+// was patched to -1 by MakeSelfBuffsPermanent but still has a ticking timer
+// (e.g. player manually cast it after the initial application) gets corrected.
+// Does NOT auto-apply missing buffs — the player chooses what they cast.
+static void CorrectPermanentBuffDurations(Player* player)
+{
+    if (!player->IsAlive())
+        return;
+
+    for (auto const& pair : player->GetAppliedAuras())
+    {
+        Aura* aura = pair.second ? pair.second->GetBase() : nullptr;
+        if (!aura) continue;
+        SpellInfo const* info = aura->GetSpellInfo();
+        if (!info || !info->DurationEntry) continue;
+        // DurationEntry->Duration[0] == -1 means we patched this spell to permanent.
+        // If the live aura still has a real duration, correct it now.
+        if (info->DurationEntry->Duration[0] == -1 && aura->GetMaxDuration() != -1)
+        {
+            aura->SetMaxDuration(-1);
+            aura->SetDuration(-1);
+        }
     }
 }
 
@@ -642,6 +719,74 @@ static void StripResourceCosts()
         zeroed);
 }
 
+// ============================================================
+// Permanent self-buff DBC duration patch
+//
+// Sets DurationEntry to the permanent (-1) DBC entry for every
+// spell in PERMANENT_SELF_BUFFS and for all Paladin seals.
+// Must run in OnStartup after sSpellMgr is fully loaded.
+// This makes AddAura() create the aura with -1 duration from the
+// start so the client never shows a ticking timer.
+// ============================================================
+
+static void MakeSelfBuffsPermanent()
+{
+    // Find any SpellDurationEntry with Duration == -1 (permanent).
+    // Standard DBC has this at ID 21; we search to be safe.
+    // Duration is int32 Duration[3]: [0]=base, [1]=perLevel, [2]=max. -1 = permanent.
+    SpellDurationEntry const* permEntry = sSpellDurationStore.LookupEntry(21);
+    if (!permEntry || permEntry->Duration[0] != -1)
+    {
+        for (uint32 i = 0; i < sSpellDurationStore.GetNumRows(); ++i)
+        {
+            SpellDurationEntry const* e = sSpellDurationStore.LookupEntry(i);
+            if (e && e->Duration[0] == -1) { permEntry = e; break; }
+        }
+    }
+    if (!permEntry)
+    {
+        LOG_WARN("module", "[mod-multiclass] MakeSelfBuffsPermanent: no permanent DBC duration entry found.");
+        return;
+    }
+
+    uint32 patched = 0;
+
+    auto patch = [&](uint32 spellId)
+    {
+        if (!spellId) return;
+        SpellInfo* info = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(spellId));
+        if (info && info->DurationEntry && info->DurationEntry != permEntry)
+        {
+            info->DurationEntry = permEntry;
+            ++patched;
+        }
+    };
+
+    // Auto-applied class buffs
+    for (auto const& [classId, spells] : PERMANENT_SELF_BUFFS)
+        for (uint32 spellId : spells)
+            patch(spellId);
+
+    // Paladin seals — player casts their chosen seal once, it never expires.
+    // Switching seals removes the old one automatically (WoW mutual-exclusion logic).
+    static const uint32 SEALS[] = {
+        // Seal of Righteousness R1-R9
+        20154, 21084, 21085, 21086, 25742, 25744, 25745, 27156, 27157,
+        // Seal of Wisdom, Seal of Light, Seal of Justice
+        20166, 20165, 20164,
+        // Seal of Vengeance (Alliance), Seal of Corruption (Horde)
+        31801, 53736,
+        // Seal of the Martyr, Seal of Command
+        53720, 20375, 27170,
+        0
+    };
+    for (int i = 0; SEALS[i]; ++i)
+        patch(SEALS[i]);
+
+    LOG_INFO("module",
+        "[mod-multiclass] Patched {} spell duration(s) to permanent (class buffs + seals).", patched);
+}
+
 // Forward declaration — SendToAddon is defined in the "Talent addon helpers" section below.
 static void SendToAddon(Player* player, const std::string& msg);
 
@@ -722,7 +867,7 @@ static void SendSpellbookData(Player* player, const MulticlassData& data)
         }
         else if (classId == WOW_CLASS_HUNTER)
         {
-            uint32 h[][2] = {{1515,10},{883,10},{2641,10},{6991,10},{982,10},{0,0}};
+            uint32 h[][2] = {{75,1},{1515,10},{883,10},{2641,10},{6991,10},{982,10},{0,0}};
             for (int i = 0; h[i][0]; ++i) addSpell(h[i][0], h[i][1]);
         }
         else if (classId == WOW_CLASS_WARLOCK)
@@ -782,6 +927,32 @@ static uint32 GetTalentSpentInClass(uint32 guid, uint8 classId)
     return result ? (*result)[0].Get<uint32>() : 0;
 }
 
+// Returns total talent ranks the player has spent in the primary (class1) tree.
+// Reads directly from HasTalent so it is accurate regardless of what
+// SetFreeTalentPoints was called with — fixing the natFree contamination bug.
+static uint32 ComputeClass1Spent(Player* player, uint8 class1)
+{
+    if (!class1) return 0;
+    uint32 classMask = 1u << (class1 - 1);
+    uint32 spent = 0;
+    for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+    {
+        TalentEntry const* t = sTalentStore.LookupEntry(i);
+        if (!t) continue;
+        TalentTabEntry const* tab = sTalentTabStore.LookupEntry(t->TalentTab);
+        if (!tab || !(tab->ClassMask & classMask)) continue;
+        for (int r = MAX_TALENT_RANK - 1; r >= 0; --r)
+        {
+            if (t->RankID[r] && player->HasTalent(t->RankID[r], player->GetActiveSpec()))
+            {
+                spent += static_cast<uint32>(r + 1);
+                break;
+            }
+        }
+    }
+    return spent;
+}
+
 // ============================================================
 // Grant all weapon and armor equip skills at max value.
 //
@@ -829,92 +1000,44 @@ static void GrantAllEquipSkills(Player* player)
         player->SetSkill(skill, 0, maxSkill, maxSkill);
 }
 
+
 // ============================================================
-// Grant spellbook skill lines for all 3 chosen classes.
-//
-// In WoW 3.3.5a, spellbook tabs are driven by the character's
-// registered skill lines. Each class has 3 talent-tree skill
-// lines (e.g., Arms / Fury / Protection for Warrior). When the
-// character has those skill lines AND knows the spells, the
-// native spellbook auto-organises them into named class tabs.
-//
-// A 3-class character ends up with 9 labelled tabs (3 per class).
-// P opens the native spellbook — drag-to-action-bar works natively.
-// SetSkill step=0, current=1, max=1 — the values don't matter for
-// display tabs; presence of the skill line entry is all the client
-// needs.
+// Ranged ammo auto-stock
+// Any character with a bow, gun, or crossbow in the ranged slot gets ammo.
+// Wands (subclass 19) are excluded — they never need ammo.
+// On login, level-up, and ranged weapon equip: top up to 500,000 of the
+// best arrow/bullet and call SetAmmo so ranged auto-attack recognises the type.
+// Stackable limit on 41165/41164 is raised to 999999 via SQL update.
 // ============================================================
 
-static void GrantClassSpellbookSkills(Player* player, const MulticlassData& data)
+// Returns true if the player has a bow, gun, or crossbow in the ranged slot.
+static bool PlayerHasRangedWeaponEquipped(Player* player)
 {
-    struct SkillSet { uint32 a, b, c; };
-
-    static const std::map<uint8, SkillSet> CLASS_TABS =
-    {
-        { WOW_CLASS_WARRIOR,      { SKILL_ARMS,             SKILL_FURY,             SKILL_PROTECTION    } },
-        { WOW_CLASS_PALADIN,      { SKILL_HOLY2,            SKILL_PROTECTION2,      SKILL_RETRIBUTION   } },
-        { WOW_CLASS_HUNTER,       { SKILL_BEAST_MASTERY,    SKILL_MARKSMANSHIP,     SKILL_SURVIVAL      } },
-        { WOW_CLASS_ROGUE,        { SKILL_ASSASSINATION,    SKILL_COMBAT,           SKILL_SUBTLETY      } },
-        { WOW_CLASS_PRIEST,       { SKILL_DISCIPLINE,       SKILL_HOLY,             SKILL_SHADOW        } },
-        { WOW_CLASS_DEATH_KNIGHT, { SKILL_DK_BLOOD,         SKILL_DK_FROST,         SKILL_DK_UNHOLY     } },
-        { WOW_CLASS_SHAMAN,       { SKILL_ELEMENTAL_COMBAT, SKILL_ENHANCEMENT,      SKILL_RESTORATION   } },
-        { WOW_CLASS_MAGE,         { SKILL_ARCANE,           SKILL_FIRE,             SKILL_FROST         } },
-        { WOW_CLASS_WARLOCK,      { SKILL_AFFLICTION,       SKILL_DEMONOLOGY,       SKILL_DESTRUCTION   } },
-        { WOW_CLASS_DRUID,        { SKILL_BALANCE,          SKILL_FERAL_COMBAT,     SKILL_RESTORATION2  } },
-    };
-
-    for (uint8 classId : { data.class1, data.class2, data.class3 })
-    {
-        if (classId == 0) continue;
-        auto it = CLASS_TABS.find(classId);
-        if (it == CLASS_TABS.end()) continue;
-        const SkillSet& s = it->second;
-        player->SetSkill(s.a, 0, 1, 1);
-        player->SetSkill(s.b, 0, 1, 1);
-        player->SetSkill(s.c, 0, 1, 1);
-    }
+    Item* ranged = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    if (!ranged) return false;
+    uint32 sub = ranged->GetTemplate()->SubClass;
+    return sub == 2 || sub == 3 || sub == 18; // bow=2, gun=3, crossbow=18
 }
 
-// ============================================================
-// Hunter ammo auto-stock
-// Hunters (primary or secondary/tertiary) never run out of ammo.
-// On login and level-up: top up to 500,000 of the best arrow/bullet
-// and call SetAmmo so the ranged attack bar recognises the ammo type.
-// Stackable limit on 52021/52020 is raised to 999999 via SQL update.
-// ============================================================
-
-static bool PlayerHasHunterClass(Player* player)
+static void RefillRangedAmmo(Player* player)
 {
-    if (player->getClass() == WOW_CLASS_HUNTER)
-        return true;
-    auto it = s_multiclassCache.find(player->GetGUID().GetCounter());
-    if (it != s_multiclassCache.end())
-        return it->second.class2 == WOW_CLASS_HUNTER || it->second.class3 == WOW_CLASS_HUNTER;
-    return false;
-}
-
-static void RefillHunterAmmo(Player* player)
-{
-    const uint32 AMMO_ARROW  = 41165; // Saronite Razorheads (ilvl 200, subclass 2, WotLK client)
-    const uint32 AMMO_BULLET = 41164; // Mammoth Cutters     (ilvl 200, subclass 3, WotLK client)
+    // Use level-1 usable ammo (no RequiredLevel) so any character can fire immediately.
+    // Rough Arrow (2512) and Rough Bullet (2519) are vanilla items with no level req.
+    const uint32 AMMO_ARROW  = 2512; // Rough Arrow  — no level requirement
+    const uint32 AMMO_BULLET = 2519; // Rough Bullet — no level requirement
     const uint32 FILL_TO     = 500000;
 
-    // Top up both types so weapon swaps (bow ↔ gun/crossbow) always work.
-    uint32 arrows  = player->GetItemCount(AMMO_ARROW);
-    uint32 bullets = player->GetItemCount(AMMO_BULLET);
-    if (arrows  < FILL_TO) player->AddItem(AMMO_ARROW,  FILL_TO - arrows);
-    if (bullets < FILL_TO) player->AddItem(AMMO_BULLET, FILL_TO - bullets);
-
-    // Set active ammo to match equipped ranged weapon type.
-    // Bow (subclass 2) → arrow; Gun (3) or Crossbow (18) → bullet.
+    // Stock only the ammo type the equipped weapon actually uses.
+    // Bow (subclass 2) and Crossbow (18) use arrows; Gun (3) uses bullets.
     uint32 ammoEntry = AMMO_ARROW;
     Item* ranged = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
-    if (ranged)
-    {
-        uint32 sub = ranged->GetTemplate()->SubClass;
-        if (sub == 3 || sub == 18) // gun or crossbow
-            ammoEntry = AMMO_BULLET;
-    }
+    if (ranged && ranged->GetTemplate()->SubClass == 3)
+        ammoEntry = AMMO_BULLET;
+
+    uint32 have = player->GetItemCount(ammoEntry);
+    if (have < FILL_TO)
+        player->AddItem(ammoEntry, FILL_TO - have);
+
     player->SetAmmo(ammoEntry);
 }
 
@@ -989,22 +1112,10 @@ public:
             return;
         }
 
-        // Re-grant any missing spells. learnSpell checks HasSpell first so no duplicates.
-        // class1 uses skipStartSpells=false so proficiency spells are included (they are
-        // valid for the primary class). class2/class3 use skipStartSpells=true to skip
-        // proficiency grants that AzerothCore would reject for the wrong class.
+        // Grant class1 spells automatically — this is the player's native class.
+        // Class2 and class3 spells are granted by the Class Master NPCs.
         if (data.class1)
             GrantClassSpells(player, data.class1, false);
-        if (data.class2)
-            GrantClassSpells(player, data.class2, true);
-        if (data.class3)
-            GrantClassSpells(player, data.class3, true);
-
-        // After bulk spell learning, recalculate all stats from scratch.
-        // Without this, passive spells that affect Stamina/max health are applied
-        // mid-sequence before other passives are active, leaving max HP stuck at 1.
-        if (data.class2 || data.class3)
-            player->UpdateAllStats();
 
         // Fill secondary power pools immediately so first-cast works at login.
         // NOTE: SetFaction(35) was removed — it made ALL mobs neutral (broke dungeons).
@@ -1025,32 +1136,52 @@ public:
         // SetSkill adds the entry if missing and sets it to max immediately.
         GrantAllEquipSkills(player);
 
-        // Register spellbook skill lines for all 3 classes so the native spellbook
-        // shows named tabs (Arms/Fury/Protection, Arcane/Fire/Frost, etc.).
-        // P opens the native spellbook — drag-to-action-bar works natively.
-        GrantClassSpellbookSkills(player, data);
 
         // Sync talent points: Sanctum grants 3 per level instead of WoW's native 1.
         // Total earned = 3 * (level - 9), capped at 3 * 71 = 213 at level 80.
         // FreeTalentPoints = totalEarned3x - class1Spent - class2Spent - class3Spent.
         {
-            uint32 lvl        = player->GetLevel();
-            uint32 natTotal   = (lvl >= 10) ? std::min(static_cast<uint32>(lvl - 9), 71u) : 0u;
-            uint32 natFree    = player->GetFreeTalentPoints(); // = natTotal - class1Spent
-            uint32 c1Spent    = (natTotal > natFree) ? (natTotal - natFree) : 0u;
-            uint32 spent23    = GetTalentSpentInClass(guid, data.class2)
-                              + GetTalentSpentInClass(guid, data.class3);
+            uint32 lvl         = player->GetLevel();
+            uint32 natTotal    = (lvl >= 10) ? std::min(static_cast<uint32>(lvl - 9), 71u) : 0u;
+            uint32 c1Spent     = ComputeClass1Spent(player, data.class1);
+            uint32 spent23     = GetTalentSpentInClass(guid, data.class2)
+                               + GetTalentSpentInClass(guid, data.class3);
             uint32 totalEarned = natTotal * 3;
             uint32 totalSpent  = c1Spent + spent23;
             player->SetFreeTalentPoints(totalEarned > totalSpent ? totalEarned - totalSpent : 0u);
         }
+        // The initial talent packet fires before OnPlayerLogin — resend so the client
+        // shows the 3x Sanctum count instead of the native 1x value it received earlier.
+        player->SendTalentsInfoData(false);
 
         // Send spell lists to the SanctumSpellbook addon.
         SendSpellbookData(player, data);
 
         // Auto-stock ammo for any character with Hunter as a class.
-        if (PlayerHasHunterClass(player))
-            RefillHunterAmmo(player);
+        if (PlayerHasRangedWeaponEquipped(player))
+            RefillRangedAmmo(player);
+
+        // Grant the 4 totem items to any character that has Shaman as a class.
+        //
+        // Why: Spell::CheckItems() validates totem spells by checking that the player
+        // carries item 5175 (Earth), 5176 (Fire), 5177 (Water), and 5178 (Air) in
+        // their inventory. In a normal Shaman character these items are granted by
+        // playercreateinfo_item at character creation. In Sanctum's multiclass flow,
+        // the player is created as a different class so that creation event never fires.
+        //
+        // Design intent: "Totem items disabled" means players never buy, carry, or
+        // worry about these as a resource — NOT that the items don't exist at all.
+        // Giving them permanently on every login achieves that: they're always there,
+        // they never run out, and the player never has to think about them.
+        if (data.class1 == CLASS_SHAMAN || data.class2 == CLASS_SHAMAN || data.class3 == CLASS_SHAMAN)
+        {
+            static const uint32 TOTEM_ITEMS[] = { 5175, 5176, 5177, 5178 };
+            for (uint32 itemId : TOTEM_ITEMS)
+            {
+                if (!player->HasItemCount(itemId, 1))
+                    player->AddItem(itemId, 1);
+            }
+        }
 
         // Remind player if they haven't finished selecting.
         if (data.step == 0)
@@ -1077,39 +1208,36 @@ public:
         // Refresh cache so power refill logic stays accurate after level-up.
         CacheMulticlassData(guid, data);
 
-        // Level-up: grant newly unlocked spells for all three classes.
+        // Grant any newly unlocked class1 spells for the new level.
         if (data.class1)
             GrantClassSpells(player, data.class1, false);
-        if (data.class2)
-            GrantClassSpells(player, data.class2, true);
-        if (data.class3)
-            GrantClassSpells(player, data.class3, true);
-
-        if (data.class1 || data.class2 || data.class3)
-            player->UpdateAllStats();
 
         // Re-max all weapon/armor skills on every level-up.
         GrantAllEquipSkills(player);
-        GrantClassSpellbookSkills(player, data);
 
         // Refill ammo on level-up so hunters never hit empty mid-session.
-        if (PlayerHasHunterClass(player))
-            RefillHunterAmmo(player);
+        if (PlayerHasRangedWeaponEquipped(player))
+            RefillRangedAmmo(player);
 
-        // Re-sync talent points: AzerothCore just added 1 point natively.
-        // Add 2 more so each level grants 3 total (Sanctum rule).
-        if (player->GetLevel() >= 10)
-            player->SetFreeTalentPoints(player->GetFreeTalentPoints() + 2);
-
-        // Subtract class2/class3 spending from the updated pool.
-        uint32 spent23 = GetTalentSpentInClass(guid, data.class2)
-                       + GetTalentSpentInClass(guid, data.class3);
-        if (spent23 > 0)
+        // Recompute talent points using the same formula as OnPlayerLogin.
+        // InitTalentForLevel (called before this hook) RESETS the free pool to
+        // (level-9) - class1Spent — it does not simply "+1". The old "+2 hack"
+        // was therefore always wrong above level 10. We recompute from scratch.
         {
-            uint32 free = player->GetFreeTalentPoints();
-            player->SetFreeTalentPoints(free > spent23 ? free - spent23 : 0);
+            uint32 lvl         = player->GetLevel();
+            uint32 natTotal    = (lvl >= 10) ? std::min(static_cast<uint32>(lvl - 9), 71u) : 0u;
+            uint32 c1Spent     = ComputeClass1Spent(player, data.class1);
+            uint32 spent23     = GetTalentSpentInClass(guid, data.class2)
+                               + GetTalentSpentInClass(guid, data.class3);
+            uint32 totalEarned = natTotal * 3;
+            uint32 totalSpent  = c1Spent + spent23;
+            player->SetFreeTalentPoints(totalEarned > totalSpent ? totalEarned - totalSpent : 0u);
         }
+        // InitTalentForLevel already pushed the native (1x) count to the client.
+        // Resend so the talent UI shows the correct 3x Sanctum value immediately.
+        player->SendTalentsInfoData(false);
     }
+
 };
 
 // ============================================================
@@ -1120,7 +1248,8 @@ public:
 
 class MulticlassWorldScript : public WorldScript
 {
-    uint32 m_timer = 0;
+    uint32 m_timer     = 0;
+    uint32 m_buffTimer = 0;
 
 public:
     MulticlassWorldScript() : WorldScript("MulticlassWorldScript") {}
@@ -1173,6 +1302,7 @@ public:
         StripWeaponRequirements();
         StripResourceCosts();
         StripDruidForms();
+        MakeSelfBuffsPermanent();
         BuildTalentCache();
     }
 
@@ -1189,6 +1319,19 @@ public:
             Player* player = session->GetPlayer();
             if (player && player->IsInWorld())
                 RefillSecondaryPower(player);
+        }
+
+        m_buffTimer += diff;
+        if (m_buffTimer >= 5000)
+        {
+            m_buffTimer = 0;
+            for (auto const& [accountId, session] : sWorldSessionMgr->GetAllSessions())
+            {
+                if (!session) continue;
+                Player* player = session->GetPlayer();
+                if (player && player->IsInWorld())
+                    CorrectPermanentBuffDurations(player);
+            }
         }
     }
 };
@@ -1410,10 +1553,25 @@ private:
         uint32 guid = static_cast<uint32>(player->GetGUID().GetCounter());
         MulticlassData data = LoadMulticlassData(guid);
 
+        // Recompute free points here so INIT is always accurate regardless of what
+        // happened since login (level-up race, external SetFreeTalentPoints, etc).
+        uint32 lvl         = player->GetLevel();
+        uint32 natTotal    = (lvl >= 10) ? std::min(static_cast<uint32>(lvl - 9), 71u) : 0u;
+        uint32 c1Spent     = ComputeClass1Spent(player, data.class1);
+        uint32 spent23     = GetTalentSpentInClass(guid, data.class2)
+                           + GetTalentSpentInClass(guid, data.class3);
+        uint32 totalEarned = natTotal * 3;
+        uint32 totalSpent  = c1Spent + spent23;
+        uint32 freePts     = totalEarned > totalSpent ? totalEarned - totalSpent : 0u;
+        player->SetFreeTalentPoints(freePts);
+
+        // Protocol: INIT:c1:c2:c3:freePts:totalEarned
+        // totalEarned lets the addon compute spent = totalEarned - freePts.
         std::string resp = "INIT:" + std::to_string(data.class1) + ":" +
                                      std::to_string(data.class2) + ":" +
                                      std::to_string(data.class3) + ":" +
-                                     std::to_string(player->GetFreeTalentPoints());
+                                     std::to_string(freePts) + ":" +
+                                     std::to_string(totalEarned);
         SendToAddon(player, resp);
     }
 
@@ -1529,6 +1687,7 @@ private:
         uint32 freePts = player->GetFreeTalentPoints();
         if (freePts == 0) { SendToAddon(player, "ERR:No talent points available"); return; }
 
+
         // Current rank — primary class reads from HasTalent, others from DB
         uint8 curRank = 0;
         if (isPrimary)
@@ -1632,8 +1791,12 @@ private:
 
         if (isPrimary)
         {
-            // Use native LearnTalent — properly updates m_usedTalentCount and all WoW tracking
+            // Use native LearnTalent — properly updates m_usedTalentCount and all WoW tracking.
+            // command=true skips AC's own FreeTalentPoints decrement, so we do it manually
+            // to keep the shared Sanctum pool in sync and prevent the m_usedTalentCount
+            // cascade that causes AC to auto-wipe class1 talents on the next login/level-up.
             player->LearnTalent(talentId, static_cast<uint32>(curRank), true);
+            player->SetFreeTalentPoints(freePts > 0 ? freePts - 1 : 0);
         }
         else
         {
@@ -1757,6 +1920,64 @@ class spell_druid_essence_form : public SpellScript
 };
 
 // ============================================================
+// .stbl command — server-side totem bar CALL button
+// Client sends:  .stbl id1 id2 id3 id4
+// Server casts each spell (triggered=true, bypasses GCD) in order.
+// Only spells the player actually knows are cast.
+// ============================================================
+
+class SanctumTotemBarCommandScript : public CommandScript
+{
+public:
+    SanctumTotemBarCommandScript() : CommandScript("SanctumTotemBarCommandScript") {}
+
+    ChatCommandTable GetCommands() const override
+    {
+        static ChatCommandTable commandTable = {
+            { "stbl", HandleStblCallCommand, SEC_PLAYER, Console::No },
+        };
+        return commandTable;
+    }
+
+    static bool HandleStblCallCommand(ChatHandler* handler, char const* args)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player)
+            return true;
+
+        std::istringstream ss(args ? args : "");
+        std::string token;
+        int count = 0;
+
+        while (std::getline(ss, token, ' ') && count < 4)
+        {
+            if (token.empty())
+                continue;
+
+            bool valid = true;
+            for (char c : token)
+            {
+                if (!std::isdigit(static_cast<unsigned char>(c)))
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid)
+                continue;
+
+            uint32 spellId = static_cast<uint32>(std::stoul(token));
+            if (spellId)
+                player->CastSpell(player, spellId, true);
+
+            ++count;
+        }
+
+        return true;
+    }
+};
+
+// ============================================================
 // Registration — called by the loader
 // ============================================================
 
@@ -1766,6 +1987,7 @@ void AddSC_mod_multiclass()
     new MulticlassWorldScript();
     new MulticlassTrainerScript();
     new MulticlassTalentScript();
+    new SanctumTotemBarCommandScript();
     RegisterSpellScript(spell_druid_essence_form);
     LOG_INFO("module", "[mod-multiclass] Module loaded.");
 }
