@@ -14,6 +14,10 @@
 !modules/mod-multiclass/
 !modules/mod-dk-rework/
 !modules/mod-sanctum-warden/
+!modules/mod-gear-tiers/
+!modules/mod-aa-system/
+!modules/mod-xp-system/
+!modules/mod-pet-systems/
 /build*/
 /var/*
 !/var/build/.gitkeep

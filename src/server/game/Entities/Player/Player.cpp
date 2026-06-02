@@ -13707,11 +13707,36 @@ void Player::_LoadSkills(PreparedQueryResult result)
             SkillRaceClassInfoEntry const* rcEntry = GetSkillRaceClassInfo(skill, getRace(), getClass());
             if (!rcEntry)
             {
-                LOG_ERROR("entities.player", "Player {} (GUID: {}), has skill ({}) that is invalid for the race/class combination (Race: {}, Class: {}). Will be deleted.",
-                    GetName(), GetGUID().GetCounter(), skill, getRace(), getClass());
+                // Weapon and armor proficiency skills granted by the multiclass module
+                // are not in SkillRaceClassInfo for most class/race combos, but they
+                // must survive _LoadSkills so _LoadInventory can equip gear that needs
+                // them.  Load these skills at level-scaled cap and skip the normal
+                // SkillTierEntry step calculation (which requires rcEntry).
+                static constexpr uint32 equipSkills[] = {
+                    43, 44, 45, 46, 54, 55, 136, 160, 172, 173, 176, 226, 228, 229, 473,
+                    293, 413, 414, 415, 433
+                };
+                bool isEquipSkill = false;
+                for (uint32 s : equipSkills)
+                    if (s == skill) { isEquipSkill = true; break; }
 
-                // Mark skill for deletion in the database
-                mSkillStatus.insert(SkillStatusMap::value_type(skill, SkillStatusData(0, SKILL_DELETED)));
+                if (!isEquipSkill)
+                {
+                    LOG_ERROR("entities.player", "Player {} (GUID: {}), has skill ({}) that is invalid for the race/class combination (Race: {}, Class: {}). Will be deleted.",
+                        GetName(), GetGUID().GetCounter(), skill, getRace(), getClass());
+                    mSkillStatus.insert(SkillStatusMap::value_type(skill, SkillStatusData(0, SKILL_DELETED)));
+                    continue;
+                }
+
+                max = GetMaxSkillValueForLevel();
+                if (value == 0)
+                    value = max;
+                SetUInt32Value(PLAYER_SKILL_INDEX(count), MAKE_PAIR32(skill, 0));
+                SetUInt32Value(PLAYER_SKILL_VALUE_INDEX(count), MAKE_SKILL_VALUE(value, max));
+                SetUInt32Value(PLAYER_SKILL_BONUS_INDEX(count), 0);
+                mSkillStatus.insert(SkillStatusMap::value_type(skill, SkillStatusData(count, SKILL_UNCHANGED)));
+                loadedSkillValues[skill] = value;
+                ++count;
                 continue;
             }
 

@@ -13,25 +13,22 @@
 --   zone = 4395 (Dalaran)
 
 -- ============================================================
--- 1. Spawn ALL new characters in Dalaran
+-- 1. Spawn ALL new characters in The Park, Stormwind City
 --
--- This overwrites the per-race starting positions so every character
--- (regardless of race) appears in Dalaran on first login and meets
--- the Sanctum Warden.  The Warden then teleports them to their
--- chosen starting zone after class selection is complete.
---
--- The mod-dk-rework SQL sets the same Dalaran coords for class 6 only.
--- This sets it for everyone, so no WHERE clause is needed.
+-- The Park is the central Sanctum Hub — all Class Masters and the
+-- Sanctum Warden are located in the circular grove area.
+-- The Warden teleports the player to their chosen starting zone
+-- after they have bound three classes at the Class Masters.
 -- ============================================================
 
 UPDATE `playercreateinfo`
 SET
-    `map`         = 571,
-    `zone`        = 4395,
-    `position_x`  = 5804.15,
-    `position_y`  = 624.77,
-    `position_z`  = 648.09,
-    `orientation` = 1.57;
+    `map`         = 0,
+    `zone`        = 1519,
+    `position_x`  = -8754.0,
+    `position_y`  = 1107.0,
+    `position_z`  = 92.0,
+    `orientation` = 5.0;
 
 -- ============================================================
 -- 2. Sanctum Warden NPC — dialogue text (npc_text)
@@ -40,19 +37,20 @@ SET
 DELETE FROM `npc_text` WHERE `ID` IN (700200, 700201, 700202, 700203, 700204, 700205, 700206);
 
 INSERT INTO `npc_text` (`ID`, `text0_0`) VALUES
-(700200, 'Greetings, $N. I am the Sanctum Warden.\n\nBefore you venture into the world, you must bind two additional classes to your soul. Choose carefully — these choices are permanent.\n\nWhen your classes are bound, I will send you to the starting zone of your choice.'),
+(700200, 'Welcome to The Park, $N. I am the Sanctum Warden.\n\nThe Class Masters stand in the circle around you — one for each WoW class. Seek out two of them and walk their paths. When three classes are bound to your soul, return to me and I will send you to the starting zone of your choice.'),
 (700201, 'Choose your second class. You will gain all of their spells and abilities immediately.'),
 (700202, 'Your second class is bound. Now choose your third and final class.'),
 (700203, 'Your three classes are sealed. Choose the land where your journey begins.\n\nFaction does not bind you — any zone is open to you.'),
 (700204, 'This choice is permanent. Once bound, a class cannot be removed.\n\nAre you certain?'),
-(700205, 'Your path is sealed. Go forth.'),
+(700205, 'Well met, $N. What do you need?'),
 (700206, 'Your three classes are bound. I can train all your class abilities whenever you need.');
 
 -- ============================================================
 -- 3. Sanctum Warden NPC template (creature_template)
 --
 -- entry   700200 = Sanctum Warden
--- npcflag 1      = UNIT_NPC_FLAG_GOSSIP (right-click opens dialogue)
+-- npcflag 67108865 = UNIT_NPC_FLAG_GOSSIP (0x1) | UNIT_NPC_FLAG_MAILBOX (0x04000000)
+--                    Mailbox flag required so CanOpenMailBox() passes when player checks mail via gossip
 -- faction 35     = Friendly to all players
 -- flags_extra 2  = Civilian (will not attack)
 -- ScriptName must match the CreatureScript name in the .cpp file
@@ -66,7 +64,7 @@ INSERT INTO `creature_template`
      `type`, `RegenHealth`, `flags_extra`, `ScriptName`)
 VALUES
     (700200, 'Sanctum Warden', 'New Adventurer Guide', 80, 80, 2, 35,
-     1, 1.0, 1.14286, 1,
+     67108865, 1.0, 1.14286, 1,
      7, 1, 2, 'npc_sanctum_warden');
 
 -- NPC display model: Archmage appearance (same robed caster used for Class Weaver)
@@ -75,20 +73,13 @@ INSERT INTO `creature_template_model` (`CreatureID`, `Idx`, `CreatureDisplayID`,
 VALUES (700200, 0, 1595, 1.0, 1.0);
 
 -- ============================================================
--- 4. Sanctum Warden spawn — Dalaran only
+-- 4. Sanctum Warden spawns — The Park (primary) + all capital cities
 --
--- All characters start in Dalaran, so one centrally placed Warden
--- is enough.  Positioned near the central fountain where new
--- characters will arrive.
--- ============================================================
-
--- ============================================================
--- 4. Sanctum Warden spawns — Dalaran + all capital cities
+-- The Park, Stormwind is the central Sanctum Hub. All new characters
+-- spawn here. One Warden in every other major city so players can
+-- access pet reagents from anywhere without travelling to Stormwind.
 --
--- One Warden in every major city so players can train class
--- spells at any level without hunting for individual class trainers.
---
--- Coordinates are approximate city-center positions.
+-- Coordinates verified against live NPC positions in The Park area.
 -- Use .npc move in-game if any spawn needs adjustment.
 -- ============================================================
 
@@ -96,10 +87,8 @@ DELETE FROM `creature` WHERE `id1` = 700200;
 
 INSERT INTO `creature` (`id1`, `map`, `position_x`, `position_y`, `position_z`, `orientation`, `spawntimesecs`)
 VALUES
-    -- Dalaran (WotLK floating city) — new character starting point
-    (700200, 571,  5804.15,   624.77,   648.09, 4.71, 300),
-    -- Stormwind — Cathedral Square
-    (700200,   0, -8803.45,   617.05,    97.89, 1.57, 300),
+    -- The Park, Stormwind (Sanctum Hub — new character landing zone)
+    (700200,   0, -8754.00,  1107.00,    92.00, 5.00, 300),
     -- Orgrimmar — Valley of Strength
     (700200,   1,  1599.17, -4374.16,    16.05, 5.49, 300),
     -- Ironforge — The Commons
@@ -114,8 +103,8 @@ VALUES
     (700200, 530, -3897.40, -11718.53,   -2.70, 0.00, 300),
     -- Silvermoon City — The Royal Exchange
     (700200, 530, 10132.40,  -6801.14,    16.51, 1.57, 300),
-    -- Durotar — Valley of Trials (orc/troll starting area)
-    (700200,   1,  -618.52,  -4251.67,    38.72, 0.00, 300);
+    -- Dalaran — central fountain (still accessible, just no longer the hub)
+    (700200, 571,  5804.15,   624.77,   648.09, 4.71, 300);
 
 -- ============================================================
 -- 5. Faction neutrality — city guards AND all starting-zone civilians
