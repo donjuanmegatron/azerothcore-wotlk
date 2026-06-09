@@ -96,6 +96,7 @@ enum SanctumAAId : uint32
     AA_P_PACK_TACTICS     = 3003,   // +3%/+6%/+10% pet crit chance
     AA_P_PREDATORS_HOWL   = 3004,   // Pet attacks have chance to apply +3% damage taken debuff
     AA_P_SAVAGE_FLURRY    = 3005,   // Pet auto hits have chance to strike a third time for 50% dmg
+    AA_P_BLOODSCENT       = 3006,   // +10/20/30% pet damage to targets below 35% HP
 
     // ── PET — DEFENSE (3101–3106) ──────────────────────────
     AA_P_HARDENED_HIDE     = 3101,  // +10%/+20%/+30% pet armor
@@ -104,6 +105,7 @@ enum SanctumAAId : uint32
     AA_P_UNCRUSHABLE       = 3104,  // ONE-SHOT: pet cannot be crit or receive crushing blows
     AA_P_STEELED_RESOLVE   = 3105,  // +2%/+4%/+7% pet dodge/parry/block + defense rating
     AA_P_GUARDIANS_RESOLVE = 3106,  // While pet holds threat: -3%/-6%/-10% dmg from that enemy
+    AA_P_MENDING_BOND      = 3107,  // Pet/guardian regens 2/4/6% max HP/s while below 50% HP
 
     // ── PET — UTILITY (3201–3205) ──────────────────────────
     AA_P_ASSIST_ME         = 3201,  // ONE-SHOT: all pets attack your target. No CD.
@@ -235,6 +237,12 @@ enum SanctumAAId : uint32
     AA_HUN_RANGED_MASTERY         = 5246,
     AA_HUN_IMPROVED_TRAPS         = 5247,
     AA_HUN_THRILL_OF_THE_HUNT     = 5248,
+    AA_HUN_STEADY_FOCUS           = 5249,  // +60/120/200 ranged attack power
+    AA_HUN_PIERCING_ROUNDS        = 5250,  // +84 armor pen rating per rank
+    AA_HUN_SURVIVAL_TACTICS       = 5251,  // +45/90/160 dodge rating per rank
+    AA_HUN_BEAST_SYNERGY          = 5252,  // +3/6/10% damage while pet/guardian alive
+    AA_HUN_COORDINATED_ASSAULT    = 5253,  // +5/10/15% damage to target pet is attacking
+    AA_HUN_GO_FOR_THE_THROAT      = 5254,  // 10/20/30% proc: pet bites for 40/60/80% of hit
 
     // ── CLASS — ROGUE (5301–5341) ───────────────────────────
     AA_ROG_AMBIDEXTERITY   = 5301,

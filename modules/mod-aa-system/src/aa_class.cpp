@@ -21,8 +21,12 @@
 //   5205  Triple Arrow         — Hunter: 3/6/10% proc on auto: +40% extra dmg. 200ms ICD.
 //   5206  Explosive Arrow      — Hunter: 5/10/15% proc on auto: AoE 50% dmg within 6 yd of target
 //   5213  Auspice              — Hunter: +3/6/10% all damage done (stacks with Archery Mastery)
+//   5215  Poison Arrow         — Hunter: always-proc nature DoT on auto (AP×5%×rank/5 per 2s tick, 10s). 200ms ICD.
+//   5216  Burning Arrow        — Hunter: 10/20/30% proc fire DoT (AP×5% per 2s tick, 6s). 500ms ICD.
 //   5217  Taste of Blood       — Hunter: +8/15/25% melee dmg when target is bleeding or poisoned
 //   5221  Nature's Melody      — Hunter: +20/50/90 HP per 5s regen
+//   5226  Improved Shots       — Hunter: +3/6/10% damage to activated Hunter shots
+//   5242  Marked for Death     — Hunter: +5/10/15% dmg to targets with Hunter's Mark (melee + spell)
 //   5302  Backstab Focus       — Rogue: +8/15/25% Backstab and Sinister Strike damage
 //   5309  Poison Mastery       — Rogue: +15/30/45% poison DoT damage
 //   5316  Lacerate             — Rogue: 10/20/30% proc on hit: bleed DoT (AP*rank*5%, 4 ticks, 8s)
@@ -41,6 +45,8 @@
 //   5602  Blood Tithe          — Shaman: Flame Shock ticks heal player 15/25/40% of damage
 //   5609  Soul Harvest         — Shaman: on kill, restore 5/10/15% max mana
 //   5807  Spirit Lash          — Warlock: every 3s deal shadow dmg = 15/25/40% SP to nearest enemy in 8 yd
+//   5808  Umbral Leech         — Warlock: Hellfire self-ticks heal player 1/2/3% max HP per tick
+//   5809  Burning Soul         — Warlock: 20/35/50% incoming damage drained from mana instead
 //
 // IN ApplyAAStat (mod-aa-system.cpp):
 //   5003  Tactical Mastery   — +84 armor pen rating per rank
@@ -104,6 +110,19 @@ namespace
     struct NecroticState { uint32 endMs; uint32 lastTickMs; uint32 tickDmg; uint8 stacks; };
     std::unordered_map<uint32, std::unordered_map<uint32, NecroticState>> g_necrotic;
 
+    // Poison Arrow (Hunter) — nature DoT ICD and state
+    std::unordered_map<uint32, uint32> g_poisonArrowIcd;
+    struct PoisonArrowState { uint32 endMs; uint32 lastTickMs; uint32 tickDmg; };
+    std::unordered_map<uint32, std::unordered_map<uint32, PoisonArrowState>> g_poisonArrow; // playerGuid → victimLow → state
+
+    // Burning Arrow (Hunter) — fire DoT ICD and state
+    std::unordered_map<uint32, uint32> g_burningArrowIcd;
+
+    // Go for the Throat (Hunter) — pet bite ICD
+    std::unordered_map<uint32, uint32> g_gftIcd;
+    struct BurningArrowState { uint32 endMs; uint32 lastTickMs; uint32 tickDmg; };
+    std::unordered_map<uint32, std::unordered_map<uint32, BurningArrowState>> g_burningArrow; // playerGuid → victimLow → state
+
     // Frenzy — currently applied attack speed bonus pct (0 = not active)
     std::unordered_map<uint32, float> g_frenzyPct;
 
@@ -139,6 +158,11 @@ namespace
         g_laceIcd.erase(guid);
         g_lacerate.erase(guid);
         g_necrotic.erase(guid);
+        g_poisonArrowIcd.erase(guid);
+        g_poisonArrow.erase(guid);
+        g_burningArrowIcd.erase(guid);
+        g_burningArrow.erase(guid);
+        g_gftIcd.erase(guid);
         g_frenzyPct.erase(guid);
         g_spiritLashTick.erase(guid);
         g_celRegenIcd.erase(guid);
@@ -426,6 +450,128 @@ public:
                     }
                 }
             }
+
+            // Poison Arrow (Hunter) — always-proc nature DoT on auto-attack. 200ms ICD. 5 ticks / 10s.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_POISON_ARROW);
+                if (rank > 0)
+                {
+                    auto& stamp = g_poisonArrowIcd[guid];
+                    if (GetMSTimeDiffToNow(stamp) >= 200u)
+                    {
+                        stamp = getMSTime();
+                        uint32 victLow = target->GetGUID().GetCounter();
+                        uint32 ap = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+                        // tickDmg = AP × 0.05 × rank / 5  (spread over 5 ticks)
+                        uint32 tickDmg = std::max(1u, (uint32)(ap * 0.05f * rank / 5.0f));
+                        g_poisonArrow[guid][victLow] = PoisonArrowState{getMSTime() + 10000u, getMSTime(), tickDmg};
+                    }
+                }
+            }
+
+            // Burning Arrow (Hunter) — 10/20/30% proc on auto-attack: fire DoT. 500ms ICD. 3 ticks / 6s.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_BURNING_ARROW);
+                if (rank > 0)
+                {
+                    auto& stamp = g_burningArrowIcd[guid];
+                    if (GetMSTimeDiffToNow(stamp) >= 500u)
+                    {
+                        static const float chance[] = { 0.0f, 10.0f, 20.0f, 30.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        {
+                            stamp = getMSTime();
+                            uint32 victLow = target->GetGUID().GetCounter();
+                            uint32 ap = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+                            uint32 tickDmg = std::max(1u, (uint32)(ap * 0.05f));
+                            g_burningArrow[guid][victLow] = BurningArrowState{getMSTime() + 6000u, getMSTime(), tickDmg};
+                        }
+                    }
+                }
+            }
+
+            // Marked for Death (Hunter) — +5/10/15% dmg to targets with Hunter's Mark
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_MARKED_FOR_DEATH);
+                if (rank > 0)
+                {
+                    static const std::unordered_set<uint32> s_huntersMark = { 1130, 14323, 14324, 14325, 53338 };
+                    bool marked = false;
+                    for (uint32 id : s_huntersMark)
+                        if (target->HasAura(id)) { marked = true; break; }
+                    if (marked)
+                    {
+                        static const float bonus[] = { 0.0f, 0.05f, 0.10f, 0.15f };
+                        damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                    }
+                }
+            }
+
+            // Beast Synergy (Hunter) — +3/6/10% damage while player has a living pet or guardian.
+            // Checks the real pet slot (GetPet) and the guardian slot (GetGuardianPet/UNIT_FIELD_SUMMON).
+            // mod-pet-systems guardians stored only in m_Controlled (no public API) are not detected
+            // here — the real Hunter beast covers the primary use case.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_BEAST_SYNERGY);
+                if (rank > 0)
+                {
+                    bool hasPetAlive = false;
+                    Pet* mainPet = player->GetPet();
+                    if (mainPet && mainPet->IsAlive())
+                        hasPetAlive = true;
+                    if (!hasPetAlive)
+                    {
+                        Unit* guardian = player->GetGuardianPet();
+                        if (guardian && guardian->IsAlive())
+                            hasPetAlive = true;
+                    }
+                    if (hasPetAlive)
+                    {
+                        static const float bonus[] = { 0.0f, 0.03f, 0.06f, 0.10f };
+                        damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                    }
+                }
+            }
+
+            // Coordinated Assault (Hunter) — +5/10/15% damage to target the pet is currently attacking
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_COORDINATED_ASSAULT);
+                if (rank > 0)
+                {
+                    Pet* pet = player->GetPet();
+                    if (pet && pet->IsAlive() && pet->GetVictim() == target)
+                    {
+                        static const float bonus[] = { 0.0f, 0.05f, 0.10f, 0.15f };
+                        damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                    }
+                }
+            }
+
+            // Go for the Throat (Hunter) — 10/20/30% proc: pet bites for 40/60/80% of the hit. 500ms ICD.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_GO_FOR_THE_THROAT);
+                if (rank > 0)
+                {
+                    Pet* pet = player->GetPet();
+                    if (pet && pet->IsAlive())
+                    {
+                        auto& stamp = g_gftIcd[guid];
+                        if (GetMSTimeDiffToNow(stamp) >= 500u)
+                        {
+                            static const float chance[]  = { 0.0f, 10.0f, 20.0f, 30.0f };
+                            static const float bitePct[] = { 0.0f,  0.40f,  0.60f,  0.80f };
+                            if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                            {
+                                uint32 bite = (uint32)(damage * bitePct[Idx<uint8>(rank)]);
+                                if (bite > 0)
+                                    Unit::DealDamage(pet, target, bite, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
+                                stamp = getMSTime();
+                            }
+                        }
+                    }
+                }
+            }
+
         } // end ATTACKER IS PLAYER
 
         // ── VICTIM IS PLAYER ────────────────────────────────────────────────
@@ -543,6 +689,85 @@ public:
                 }
             }
 
+            // Beast Synergy (Hunter) — +3/6/10% spell/ability damage while pet or guardian is alive.
+            // Same pet detection logic as in ModifyMeleeDamage above (GetPet + GetGuardianPet).
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_BEAST_SYNERGY);
+                if (rank > 0)
+                {
+                    bool hasPetAlive = false;
+                    Pet* mainPet = player->GetPet();
+                    if (mainPet && mainPet->IsAlive())
+                        hasPetAlive = true;
+                    if (!hasPetAlive)
+                    {
+                        Unit* guardian = player->GetGuardianPet();
+                        if (guardian && guardian->IsAlive())
+                            hasPetAlive = true;
+                    }
+                    if (hasPetAlive)
+                    {
+                        static const float bonus[] = { 0.0f, 0.03f, 0.06f, 0.10f };
+                        damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                    }
+                }
+            }
+
+            // Coordinated Assault (Hunter) — +5/10/15% spell/ability damage to target the pet is attacking
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_COORDINATED_ASSAULT);
+                if (rank > 0)
+                {
+                    Pet* pet = player->GetPet();
+                    if (pet && pet->IsAlive() && pet->GetVictim() == target)
+                    {
+                        static const float bonus[] = { 0.0f, 0.05f, 0.10f, 0.15f };
+                        damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                    }
+                }
+            }
+
+            // Improved Shots (Hunter) — +3/6/10% damage to Hunter activated shots
+            {
+                static const std::unordered_set<uint32> s_hunterShots = {
+                    // Arcane Shot
+                    3044,14281,14282,14283,14284,14285,14286,14287,27019,49044,49045,
+                    // Multi-Shot
+                    2643,14288,14289,14290,25294,27021,49047,49048,
+                    // Aimed Shot
+                    19434,20900,20901,20902,20903,20904,27065,49049,49050,
+                    // Steady Shot
+                    34120,49051,49052,
+                    // Explosive Shot
+                    53301,60051,60052,60053,
+                    // Black Arrow
+                    3674,63668,63669,63670,63671
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_IMPROVED_SHOTS);
+                if (rank > 0 && s_hunterShots.count(spellInfo->Id))
+                {
+                    static const float bonus[] = { 0.0f, 0.03f, 0.06f, 0.10f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Marked for Death (Hunter) — +5/10/15% spell dmg to targets with Hunter's Mark
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_HUN_MARKED_FOR_DEATH);
+                if (rank > 0)
+                {
+                    static const std::unordered_set<uint32> s_huntersMark = { 1130, 14323, 14324, 14325, 53338 };
+                    bool marked = false;
+                    for (uint32 id : s_huntersMark)
+                        if (target->HasAura(id)) { marked = true; break; }
+                    if (marked)
+                    {
+                        static const float bonus[] = { 0.0f, 0.05f, 0.10f, 0.15f };
+                        damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                    }
+                }
+            }
+
             // Backstab Focus (Rogue) — +8/15/25% Backstab and Sinister Strike damage
             {
                 uint8 rank = SanctumAA::GetRank(player, AA_ROG_BACKSTAB_FOCUS);
@@ -619,6 +844,40 @@ public:
                     }
                 }
             }
+            // Burning Soul (Warlock, 5809) — 20/35/50% incoming damage drained from mana instead.
+            // Stops working when the player has no mana left.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_WRL_BURNING_SOUL);
+                if (rank > 0)
+                {
+                    uint32 manaAvail = player->GetPower(POWER_MANA);
+                    if (manaAvail > 0)
+                    {
+                        static const float pct[] = { 0.0f, 0.20f, 0.35f, 0.50f };
+                        uint32 absorb = std::min(static_cast<uint32>(damage * pct[Idx<uint8>(rank)]), manaAvail);
+                        damage -= (int32)absorb;
+                        player->ModifyPower(POWER_MANA, -(int32)absorb);
+                    }
+                }
+            }
+
+            // Umbral Leech (Warlock, 5808) — Hellfire self-damage heals player for 1/2/3% HP per tick.
+            // Hellfire ticks deal damage to the caster through the same aura; we detect this by
+            // target == attacker and a Hellfire spell ID.
+            {
+                static const std::unordered_set<uint32> s_hellfire = {
+                    1949, 11682, 11683, 27212, 47897, 47898
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_WRL_UMBRAL_LEECH);
+                if (rank > 0 && attacker == target && spellInfo && s_hellfire.count(spellInfo->Id))
+                {
+                    static const float pct[] = { 0.0f, 0.01f, 0.02f, 0.03f };
+                    int32 healAmt = (int32)(player->GetMaxHealth() * pct[Idx<uint8>(rank)]);
+                    if (healAmt > 0 && !player->IsFullHealth())
+                        player->ModifyHealth(healAmt);
+                }
+            }
+
         } // end VICTIM IS PLAYER
     }
 
@@ -796,6 +1055,58 @@ public:
                     Unit::DealDamage(player, victim, nstate.tickDmg, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_SHADOW, nullptr, false);
                 }
                 for (uint32 v : toErase) necIt->second.erase(v);
+            }
+        }
+
+        // Poison Arrow DoT ticking (Hunter) — nature, 1 tick per 2s, 5 ticks total
+        {
+            auto paIt = g_poisonArrow.find(guid);
+            if (paIt != g_poisonArrow.end() && !paIt->second.empty())
+            {
+                std::vector<uint32> toErase;
+                for (auto& [victLow, pstate] : paIt->second)
+                {
+                    if (now > pstate.endMs) { toErase.push_back(victLow); continue; }
+                    if (GetMSTimeDiffToNow(pstate.lastTickMs) < 2000u) continue;
+                    pstate.lastTickMs = now;
+                    Unit* victim = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                        if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                    if (!victim)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                    }
+                    if (!victim || !victim->IsAlive()) continue;
+                    Unit::DealDamage(player, victim, pstate.tickDmg, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NATURE, nullptr, false);
+                }
+                for (uint32 v : toErase) paIt->second.erase(v);
+            }
+        }
+
+        // Burning Arrow DoT ticking (Hunter) — fire, 1 tick per 2s, 3 ticks total
+        {
+            auto baIt = g_burningArrow.find(guid);
+            if (baIt != g_burningArrow.end() && !baIt->second.empty())
+            {
+                std::vector<uint32> toErase;
+                for (auto& [victLow, bstate] : baIt->second)
+                {
+                    if (now > bstate.endMs) { toErase.push_back(victLow); continue; }
+                    if (GetMSTimeDiffToNow(bstate.lastTickMs) < 2000u) continue;
+                    bstate.lastTickMs = now;
+                    Unit* victim = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                        if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                    if (!victim)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                    }
+                    if (!victim || !victim->IsAlive()) continue;
+                    Unit::DealDamage(player, victim, bstate.tickDmg, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_FIRE, nullptr, false);
+                }
+                for (uint32 v : toErase) baIt->second.erase(v);
             }
         }
 

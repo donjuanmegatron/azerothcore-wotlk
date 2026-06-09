@@ -6,6 +6,7 @@ void AddSC_aa_combat_modifiers();
 void AddSC_aa_archetype();
 void AddSC_aa_pet();
 void AddSC_aa_class();
+void AddSC_aa_actives();
 
 void Addmod_aa_systemScripts()
 {
@@ -14,4 +15,5 @@ void Addmod_aa_systemScripts()
     AddSC_aa_archetype();
     AddSC_aa_pet();
     AddSC_aa_class();
+    AddSC_aa_actives();
 }

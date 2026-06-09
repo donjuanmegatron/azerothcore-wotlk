@@ -11,8 +11,8 @@
 //                 Force of Will, Divine Stun, Invocation, DK Lifeburn,
 //                 Death Pact, DK Leech Touch, Cannibalize, Elemental Fury,
 //                 Harvest of Druzzil, Manaburn, Fearstorm, WRL Lifeburn,
-//                 WRL Leech Touch
-//   STUBBED:      Volley Burst, Scout of the Wild, Assassin's Mark, all
+//                 WRL Leech Touch, Volley Burst, Scout of the Wild
+//   STUBBED:      Assassin's Mark, all
 //                 remaining Priest actives (5403-5409,5418,5420-5421,5424,5426),
 //                 Frenzied Burnout, Mend Companion, Wake the Dead, Dire Charm
 
@@ -22,7 +22,10 @@
 #include "Creature.h"
 #include "Chat.h"
 #include "ObjectAccessor.h"
+#include "ScriptMgr.h"
+#include "WorldSessionMgr.h"
 #include "SharedDefines.h"
+#include "Timer.h"
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
@@ -31,6 +34,21 @@
 
 // [playerGuid][aaId] = getMSTime() at last use
 static std::unordered_map<uint32, std::unordered_map<uint32, uint32>> g_activeCDs;
+
+// ---- Mortal Eradication DoT tracker ---------------------------------------
+// Each activated Mortal Eradication places a 6-tick shadow DoT on a target.
+// Ticked every 3s by aa_actives_worldscript; 18s total duration.
+
+struct EradicationDot
+{
+    ObjectGuid targetGuid;
+    uint32     tickDmg;       // shadow damage per tick (fixed at cast time from player SP)
+    uint8      ticksLeft;
+    uint32     lastTickMs;
+};
+
+// playerGuid → active DoT (one DoT per player at a time; re-cast refreshes)
+static std::unordered_map<uint32, EradicationDot> g_eradDots;
 
 // Returns ms remaining on cooldown; 0 if ready to use.
 static uint32 CDRemaining(uint32 guid, uint32 aaId, uint32 cdMs)
@@ -84,11 +102,56 @@ static std::vector<Unit*> NearbyEnemies(Player* player, float range)
     return out;
 }
 
+// ---- Weapon Fury active windows --------------------------------------------
+// guid -> getMSTime() at which the Weapon Fury buff expires.
+// While active, the player's melee swings deal bonus damage (representing the
+// forced weapon on-hit procs). Read by aa_combat_modifiers.cpp per swing.
+static std::unordered_map<uint32, uint32> g_weaponFuryUntil;
+
+// Exported for aa_combat_modifiers.cpp — true if Weapon Fury is currently active.
+bool SanctumAA_WeaponFuryActive(uint32 guid)
+{
+    auto it = g_weaponFuryUntil.find(guid);
+    if (it == g_weaponFuryUntil.end())
+        return false;
+    if (getMSTime() >= it->second)
+    {
+        g_weaponFuryUntil.erase(it);
+        return false;
+    }
+    return true;
+}
+
+// ---- Cheer active windows (Hunter 5228/5243/5244) --------------------------
+// Each Cheer AA has an always-on passive (handled in aa_pet.cpp) PLUS a stronger
+// timed burst triggered here on .aa use. Pets read these windows for the burst bonus.
+static std::unordered_map<uint32, uint32> g_cheerOffUntil;
+static std::unordered_map<uint32, uint32> g_cheerDefUntil;
+static std::unordered_map<uint32, uint32> g_cheerSwiftUntil;
+
+static bool CheerWindowActive(std::unordered_map<uint32, uint32>& m, uint32 guid)
+{
+    auto it = m.find(guid);
+    if (it == m.end()) return false;
+    if (getMSTime() >= it->second) { m.erase(it); return false; }
+    return true;
+}
+
+// Exported for aa_pet.cpp — true while the Cheer burst window is up.
+bool SanctumAA_CheerOffensiveActive(uint32 guid) { return CheerWindowActive(g_cheerOffUntil,   guid); }
+bool SanctumAA_CheerDefensiveActive(uint32 guid) { return CheerWindowActive(g_cheerDefUntil,   guid); }
+bool SanctumAA_CheerSwiftnessActive(uint32 guid) { return CheerWindowActive(g_cheerSwiftUntil, guid); }
+
 // ---- public API -----------------------------------------------------------
 
 void SanctumAA_ClearActivateState(uint32 guid)
 {
     g_activeCDs.erase(guid);
+    g_eradDots.erase(guid);
+    g_weaponFuryUntil.erase(guid);
+    g_cheerOffUntil.erase(guid);
+    g_cheerDefUntil.erase(guid);
+    g_cheerSwiftUntil.erase(guid);
 }
 
 bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
@@ -588,11 +651,177 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
     }
 
     // =======================================================================
+    // WARLOCK — Mortal Eradication
+    // =======================================================================
+
+    case AA_WRL_MORTAL_ERADICATION:
+    // Activate: apply a stacking shadow curse DoT — 10/15/20% SP shadow every 3s for 18s (6 ticks).
+    // 90s CD. Re-cast refreshes the DoT and resets tick count.
+    {
+        static const uint32 CD_MS = 90000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Mortal Eradication on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        Unit* tgt = GetTarget(player);
+        if (!tgt || !tgt->IsAlive() || !player->IsValidAttackTarget(tgt))
+        {
+            handler->SendSysMessage("|cffff0000[AA]|r No valid target.");
+            return true;
+        }
+        static const float spPct[] = { 0.0f, 0.10f, 0.15f, 0.20f };
+        int32 sp = player->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_SHADOW);
+        uint32 tickDmg = std::max(1u, static_cast<uint32>(sp * spPct[std::min<uint8>(rank, 3)]));
+
+        EradicationDot& dot = g_eradDots[guid];
+        dot.targetGuid = tgt->GetGUID();
+        dot.tickDmg    = tickDmg;
+        dot.ticksLeft  = 6;
+        dot.lastTickMs = getMSTime();
+
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff9482c9[AA]|r Mortal Eradication — {} shadow dmg/3s × 6 ticks.", tickDmg);
+        return true;
+    }
+
+    // =======================================================================
+    // ARCHETYPE — Weapon Fury
+    // =======================================================================
+
+    case AA_D_WEAPON_FURY:
+    // Activate: for 12/18/24s, all melee swings proc weapon on-hit effects.
+    // Implemented as a melee damage amplifier window (see aa_combat_modifiers.cpp).
+    // 2 min cooldown.
+    {
+        static const uint32 CD_MS = 120000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Weapon Fury on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        static const uint32 durMs[] = { 0, 12000, 18000, 24000 };
+        uint32 dur = durMs[std::min<uint8>(rank, 3)];
+        g_weaponFuryUntil[guid] = getMSTime() + dur;
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Weapon Fury — your swings unleash weapon effects for {} sec!", dur / 1000u);
+        return true;
+    }
+
+    // =======================================================================
+    // HUNTER — Volley Burst and Scout of the Wild
+    // =======================================================================
+
+    case AA_HUN_VOLLEY_BURST:
+    // Activate: AoE physical burst to all enemies within 10 yd of current target.
+    // Damage = RANGED_ATTACK AP × 1.5. 60s CD. 1 rank.
+    {
+        if (uint32 rem = CDRemaining(guid, aaId, 60000u))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Volley Burst on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        Unit* tgt = GetTarget(player);
+        if (!tgt || !tgt->IsAlive() || !player->IsValidAttackTarget(tgt))
+        {
+            handler->SendSysMessage("|cffff0000[AA]|r No valid target.");
+            return true;
+        }
+        uint32 dmg = (uint32)(player->GetTotalAttackPowerValue(RANGED_ATTACK) * 1.5f);
+        // Hit the primary target
+        Unit::DealDamage(player, tgt, dmg, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
+        uint8 extraHits = 1; // primary counted
+        // Hit additional enemies within 10 yd of target
+        for (Unit* atk : player->getAttackers())
+        {
+            if (atk == tgt || !atk->IsAlive()) continue;
+            if (tgt->GetDistance(atk) <= 10.0f)
+            {
+                Unit::DealDamage(player, atk, dmg, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
+                ++extraHits;
+            }
+        }
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Volley Burst — {} target(s) hit!", extraHits);
+        return true;
+    }
+
+    case AA_HUN_SCOUT_OF_THE_WILD:
+    // Activate: summon a temporary spirit wolf companion for 60s. 180s CD. 1 rank.
+    {
+        if (uint32 rem = CDRemaining(guid, aaId, 180000u))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Scout of the Wild on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        // Spawn near the player slightly to the right
+        float x = player->GetPositionX() + 2.0f * std::cos(player->GetOrientation() - 1.5f);
+        float y = player->GetPositionY() + 2.0f * std::sin(player->GetOrientation() - 1.5f);
+        float z = player->GetPositionZ();
+        float o = player->GetOrientation();
+        // Spirit wolf creature ID 29264 (Spectral Wolf — exists in 3.3.5a DB)
+        Creature* wolf = player->SummonCreature(29264, x, y, z, o, TEMPSUMMON_TIMED_DESPAWN, 60000);
+        if (wolf)
+        {
+            wolf->SetFaction(player->GetFaction());
+            wolf->SetLevel(player->GetLevel());
+            wolf->SetReactState(REACT_AGGRESSIVE);
+        }
+        SetCD(guid, aaId);
+        handler->SendSysMessage("|cff00ff00[AA]|r Scout of the Wild — a spirit wolf answers your call for 60 seconds!");
+        return true;
+    }
+
+    // =======================================================================
+    // HUNTER — Cheer (active burst; passive bonuses live in aa_pet.cpp)
+    // =======================================================================
+
+    case AA_HUN_CHEER_OFFENSIVE:
+    // Burst: pets +8/15/25% damage for 15s (on top of the passive +3/5/8%). 30s CD.
+    {
+        if (uint32 rem = CDRemaining(guid, aaId, 30000u))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Cheer: Offensive on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        g_cheerOffUntil[guid] = getMSTime() + 15000u;
+        SetCD(guid, aaId);
+        handler->SendSysMessage("|cff00ff00[AA]|r Cheer: Offensive — your pets surge with offense for 15 sec!");
+        return true;
+    }
+
+    case AA_HUN_CHEER_DEFENSIVE:
+    // Burst: pets -8/15/25% damage taken for 15s (on top of the passive -3/5/8%). 30s CD.
+    {
+        if (uint32 rem = CDRemaining(guid, aaId, 30000u))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Cheer: Defensive on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        g_cheerDefUntil[guid] = getMSTime() + 15000u;
+        SetCD(guid, aaId);
+        handler->SendSysMessage("|cff00ff00[AA]|r Cheer: Defensive — your pets brace against harm for 15 sec!");
+        return true;
+    }
+
+    case AA_HUN_CHEER_SWIFTNESS:
+    // Burst: pets +20/35/50% move speed for 15s (on top of the passive +8/15/20%). 30s CD.
+    {
+        if (uint32 rem = CDRemaining(guid, aaId, 30000u))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Cheer: Swiftness on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        g_cheerSwiftUntil[guid] = getMSTime() + 15000u;
+        SetCD(guid, aaId);
+        handler->SendSysMessage("|cff00ff00[AA]|r Cheer: Swiftness — your pets race ahead for 15 sec!");
+        return true;
+    }
+
+    // =======================================================================
     // STUBS — complex scripted effects deferred to later phase
     // =======================================================================
 
-    case AA_HUN_VOLLEY_BURST:           // 5207 — summon + AoE cast system needed
-    case AA_HUN_SCOUT_OF_THE_WILD:      // 5218 — guardian spawn system needed
     case AA_ROG_ASSASSINS_MARK:         // 5315 — custom debuff aura system needed
     case AA_PRI_CHANNELING_DIVINE:      // 5403 — spell proc counting hook needed
     case AA_PRI_FORCEFUL_REJUVENATION:  // 5404 — CD reset loop implementation needed
@@ -609,6 +838,14 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
     case AA_MAG_MEND_COMPANION:         // 5736 — pet full-heal command needed
     case AA_WRL_WAKE_THE_DEAD:          // 5826 — slain demon re-summon needed
     case AA_WRL_DIRE_CHARM:             // 5829 — demon charm system needed
+    // New stubs — not yet implemented
+    case AA_PAL_YAULP:                  // 5120 — toggle aura + mp5 hook needed
+    case AA_MAG_FOCUSED_MAGIC:          // 5718 — ground arcane zone DynObject needed
+    case AA_MAG_CALL_OF_XUZL:           // 5733 — orbiting arcane blade summoning needed
+    case AA_MAG_HOST_OF_THE_ELEMENTS:   // 5738 — Ice Elemental guardian spawn needed
+    case AA_WRL_THREADS_OF_DESPAIR:     // 5800 — spreading curse DoT system needed
+    case AA_WRL_SOUL_BARRAGE:           // 5822 — beam damage along line needed
+    case AA_WRL_FEIGNED_MINION:         // 5834 — demon feign death state needed
         handler->SendSysMessage("|cffff8c00[AA]|r This ability is not yet fully implemented.");
         return true;
 
@@ -616,4 +853,68 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         handler->SendSysMessage("|cffff0000[AA]|r That ability does not have an activate effect or is not recognized.");
         return true;
     }
+}
+
+// ---------------------------------------------------------------------------
+// WorldScript — ticks Mortal Eradication DoTs every 500ms
+// ---------------------------------------------------------------------------
+class aa_actives_worldscript : public WorldScript
+{
+public:
+    aa_actives_worldscript() : WorldScript("aa_actives_worldscript") {}
+
+    void OnUpdate(uint32 diff) override
+    {
+        _timer += diff;
+        if (_timer < 500)
+            return;
+        _timer = 0;
+
+        if (g_eradDots.empty())
+            return;
+
+        std::vector<uint32> toRemove;
+
+        for (auto& [playerGuid, dot] : g_eradDots)
+        {
+            if (dot.ticksLeft == 0) { toRemove.push_back(playerGuid); continue; }
+            if (GetMSTimeDiffToNow(dot.lastTickMs) < 3000u) continue;
+
+            dot.lastTickMs = getMSTime();
+
+            // Locate player
+            Player* player = ObjectAccessor::FindPlayerByLowGUID(playerGuid);
+            if (!player || !player->IsInWorld() || !player->IsAlive())
+            {
+                toRemove.push_back(playerGuid);
+                continue;
+            }
+
+            // Locate target
+            Unit* target = ObjectAccessor::GetUnit(*player, dot.targetGuid);
+            if (!target || !target->IsAlive())
+            {
+                toRemove.push_back(playerGuid);
+                continue;
+            }
+
+            Unit::DealDamage(player, target, dot.tickDmg, nullptr,
+                             DIRECT_DAMAGE, SPELL_SCHOOL_MASK_SHADOW, nullptr, false);
+            --dot.ticksLeft;
+
+            if (dot.ticksLeft == 0)
+                toRemove.push_back(playerGuid);
+        }
+
+        for (uint32 g : toRemove)
+            g_eradDots.erase(g);
+    }
+
+private:
+    uint32 _timer = 0;
+};
+
+void AddSC_aa_actives()
+{
+    new aa_actives_worldscript();
 }

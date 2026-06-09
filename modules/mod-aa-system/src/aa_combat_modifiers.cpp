@@ -223,6 +223,17 @@ public:
         {
             uint32 guid = player->GetGUID().GetCounter();
 
+            // Weapon Fury (archetype active 4205) — while the activated window is up,
+            // every melee swing deals +30% bonus damage (represents forced weapon procs).
+            {
+                extern bool SanctumAA_WeaponFuryActive(uint32 guid);
+                if (SanctumAA::GetRank(player, AA_D_WEAPON_FURY) > 0 &&
+                    SanctumAA_WeaponFuryActive(guid))
+                {
+                    damage += (uint32)(damage * 0.30f);
+                }
+            }
+
             // Double Strike — 3/6/10% chance: add 50% extra
             {
                 uint8 rank = SanctumAA::GetRank(player, AA_G_DOUBLE_STRIKE);

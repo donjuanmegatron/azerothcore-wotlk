@@ -1051,6 +1051,32 @@ class MulticlassPlayerScript : public PlayerScript
 public:
     MulticlassPlayerScript() : PlayerScript("MulticlassPlayerScript") {}
 
+    // Override IsClass for pet-related contexts only.
+    // Sanctum-wide pet design: all class-gated pet checks (Tame Beast, pet talent bonuses,
+    // pet ability scaling) recognize all 3 of the player's multiclass classes.
+    // Demonology buffs apply to every guardian; Tame Beast works for any char with Hunter.
+    // Explicitly excluded: TALENT_POINT_CALC (would corrupt talent trees), INIT, TELEPORT,
+    // QUEST, TAXI, SKILL, EQUIP_*, WEAPON_SWAP, GRAVEYARD, and NONE (default/generic).
+    Optional<bool> OnPlayerIsClass(Player const* player, Classes playerClass, ClassContext context) override
+    {
+        // Only intercept pet-relevant contexts
+        if (context != CLASS_CONTEXT_PET && context != CLASS_CONTEXT_PET_CHARM)
+            return std::nullopt;
+
+        if (player->getClass() == static_cast<uint8>(playerClass))
+            return true;
+
+        uint32 guid = player->GetGUID().GetCounter();
+        auto it = s_multiclassCache.find(guid);
+        if (it != s_multiclassCache.end())
+        {
+            if (it->second.class2 == static_cast<uint8>(playerClass)) return true;
+            if (it->second.class3 == static_cast<uint8>(playerClass)) return true;
+        }
+
+        return std::nullopt;
+    }
+
     // Fires when a brand-new character is first created (before their very first login).
     // Seeds the character_multiclass row with their starting class.
     // Uses INSERT (not INSERT IGNORE) so any stale row from a previously deleted

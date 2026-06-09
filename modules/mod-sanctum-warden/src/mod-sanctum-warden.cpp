@@ -645,6 +645,13 @@ static std::vector<uint32> BuildClassBaseItems(uint8 c1, uint8 c2, uint8 c3)
     if (CAN_USE_SHIELD[c1] && CAN_USE_SHIELD[c2] && CAN_USE_SHIELD[c3])
         baseItems.push_back(SHIELD_ITEM);
 
+    // Ranged weapon for Hunter — bows/guns can never appear in a 3-class weapon intersection,
+    // so Hunter's ranged slot is always missing from the shared weapon calculation above.
+    // Add explicitly when any of the 3 classes is Hunter.
+    bool hasHunter = (c1 == WOW_CLASS_HUNTER || c2 == WOW_CLASS_HUNTER || c3 == WOW_CLASS_HUNTER);
+    if (hasHunter)
+        baseItems.push_back(18680); // Ancient Bone Bow (UBRS) — enchanted/epic variants auto-generated
+
     for (size_t i = 0; i < ACCESSORY_COUNT; ++i)
         baseItems.push_back(ACCESSORY_ITEMS[i]);
 
@@ -1429,6 +1436,63 @@ public:
 };
 
 // ============================================================
+// Hunter ammo refill — Ammo is a Disabled System in Sanctum.
+// Called on login and level-up to keep the Hunter fully stocked with
+// the best ammo their level allows. Detects bow/crossbow vs gun automatically.
+// ============================================================
+
+static uint32 GetBestAmmoForLevel(uint8 level, bool useBullets)
+{
+    // Descending tier list — first entry whose minLevel <= player level wins.
+    struct AmmoTier { uint8 minLevel; uint32 arrowId; uint32 bulletId; };
+    static const AmmoTier TIERS[] =
+    {
+        { 80, 52021, 52020 }, // Iceblade Arrow       / Shatter Rounds
+        { 75, 41586, 41584 }, // Terrorshaft Arrow    / Frostbite Bullets
+        { 72, 41165, 41164 }, // Saronite Razorheads  / Mammoth Cutters
+        { 70, 31737, 31735 }, // Timeless Arrow       / Timeless Shell
+        { 65, 28056, 28061 }, // Blackflight Arrow    / Ironbite Shell
+        { 62, 33803, 23773 }, // Adamantite Stinger   / Adamantite Shells
+        { 55, 28053, 28060 }, // Wicked Arrow         / Impact Shot
+        { 51, 19316, 19317 }, // Ice Threaded Arrow   / Ice Threaded Bullet
+        { 40, 11285, 11284 }, // Jagged Arrow         / Accurate Slugs
+        { 25,  3030,  3033 }, // Razor Arrow          / Solid Shot
+        { 10,  2515,  2519 }, // Sharp Arrow          / Heavy Shot
+        {  1,  2512,  2516 }, // Rough Arrow          / Light Shot
+    };
+    for (auto const& t : TIERS)
+        if (level >= t.minLevel)
+            return useBullets ? t.bulletId : t.arrowId;
+    return useBullets ? 2516u : 2512u; // fallback
+}
+
+static void RefillHunterAmmo(Player* player)
+{
+    // Only Hunter multiclass players need ammo.
+    // Check equipped ranged weapon to decide arrows vs bullets.
+    // Default to arrows if no ranged weapon equipped.
+    bool useBullets = false;
+    Item* ranged = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    if (ranged && ranged->GetTemplate())
+        useBullets = (ranged->GetTemplate()->SubClass == ITEM_SUBCLASS_WEAPON_GUN);
+
+    uint32 ammoId = GetBestAmmoForLevel(player->GetLevel(), useBullets);
+    if (!ammoId) return;
+
+    // Top up to a full stack (1000). Remove the previous tier's ammo first if the
+    // player has just crossed into a new level bracket so they don't carry two types.
+    uint32 current = player->GetItemCount(ammoId);
+    static const uint32 AMMO_STACK = 1000;
+    if (current >= AMMO_STACK) return;
+
+    uint32 needed = AMMO_STACK - current;
+    ItemPosCountVec dest;
+    uint8 msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, ammoId, needed);
+    if (msg == EQUIP_ERR_OK)
+        player->StoreNewItem(dest, ammoId, true, Item::GenerateItemRandomPropertyId(ammoId));
+}
+
+// ============================================================
 // Quest Script — level-10 auto-complete for Quest 700004
 // ============================================================
 
@@ -1452,10 +1516,20 @@ public:
         uint8 sent = f[4].Get<uint8>();
         if (step >= 2 && sent == 0 && c1 && c2 && c3)
             SendStarterGearPackage(player, c1, c2, c3);
+
+        // Ammo is a Disabled System in Sanctum — Hunters should never run out.
+        // On every login, give a full stack of the best ammo the player can use at their level.
+        // Arrows for bow/crossbow users; bullets for gun users.
+        bool isHunter = (c1 == WOW_CLASS_HUNTER || c2 == WOW_CLASS_HUNTER || c3 == WOW_CLASS_HUNTER);
+        if (isHunter && player->GetLevel() >= 1)
+            RefillHunterAmmo(player);
     }
 
     void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
     {
+        // Refill ammo on level-up so Hunter always has the best usable tier.
+        RefillHunterAmmo(player);
+
         if (player->GetLevel() < 10)
             return;
         if (player->GetQuestStatus(QUEST_WHERE_ADVENTURE) != QUEST_STATUS_INCOMPLETE)

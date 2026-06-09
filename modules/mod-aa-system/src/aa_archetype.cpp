@@ -12,7 +12,7 @@
 //
 // DEFERRED (missing hooks or requires custom spells):
 //   4101  Stalwart        — block value (+50/100/150 flat) — in ApplyAAStat
-//   4103  Anchored        — stun/knockback duration hook not available
+//   4103  Anchored        — LIVE: OnAuraApply reduces stun/knockback duration 25/50/75%
 //   4106  Double Riposte  — no after-dodge/parry hook
 //   4201  Bloodletting    — crit flag not exposed in damage hooks
 //   4202  Haste Surge     — mod-haste not built yet
@@ -78,6 +78,7 @@ public:
         UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN,
         UNITHOOK_ON_UNIT_UPDATE,
         UNITHOOK_ON_UNIT_DEATH,
+        UNITHOOK_ON_AURA_APPLY,
     }) {}
 
     // -----------------------------------------------------------------------
@@ -167,6 +168,46 @@ public:
             if (it != g_lastStand.end() && getMSTime() < it->second.untilMs)
                 damage = (int32)(damage * 0.80f);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // OnAuraApply — Anchored: reduce stun/knockback duration on player.
+    // -----------------------------------------------------------------------
+    void OnAuraApply(Unit* unit, Aura* aura) override
+    {
+        Player* player = unit->ToPlayer();
+        if (!player)
+            return;
+
+        uint8 rank = SanctumAA::GetRank(player, AA_T_ANCHORED);
+        if (!rank)
+            return;
+
+        SpellInfo const* info = aura->GetSpellInfo();
+        if (!info)
+            return;
+
+        // Check if any effect has stun or knockback mechanic.
+        bool isStun = false;
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            uint32 mech = info->Effects[i].Mechanic;
+            if (mech == MECHANIC_STUN || mech == MECHANIC_KNOCKOUT || mech == MECHANIC_BANISH)
+            {
+                isStun = true;
+                break;
+            }
+        }
+        // Also check the spell-level mechanic flag.
+        if (!isStun && (info->Mechanic == MECHANIC_STUN || info->Mechanic == MECHANIC_KNOCKOUT))
+            isStun = true;
+
+        if (!isStun)
+            return;
+
+        static const float reduction[] = { 1.0f, 0.75f, 0.50f, 0.25f, 0.0f }; // rank 1/2/3/4 = 25/50/75/100%
+        int32 newDur = (int32)(aura->GetDuration() * reduction[std::min<uint8>(rank, 4)]);
+        aura->SetDuration(std::max(1, newDur)); // 1ms = effectively immune at rank 4
     }
 
     // -----------------------------------------------------------------------

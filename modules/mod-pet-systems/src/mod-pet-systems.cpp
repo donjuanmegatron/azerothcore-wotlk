@@ -197,6 +197,48 @@ static const PetBarSpellDef DK_GHOUL_BAR_SPELLS[] =
     { 0,     false, 0     },
 };
 
+// Frost Shock spell chain — highest rank first so we can find the best one the player has.
+// The bar always sends spell 8056 (R1); the CST handler resolves to the highest learned rank.
+static const uint32 FROST_SHOCK_RANKS[] = { 49232, 49231, 25464, 10473, 10472, 8058, 8056, 0 };
+
+static uint32 ResolveHighestFrostShock(Player* player)
+{
+    for (int i = 0; FROST_SHOCK_RANKS[i] != 0; ++i)
+        if (player->HasSpell(FROST_SHOCK_RANKS[i]))
+            return FROST_SHOCK_RANKS[i];
+    return 8056; // R1 fallback
+}
+
+static bool IsFrostShock(uint32 spellId)
+{
+    for (int i = 0; FROST_SHOCK_RANKS[i] != 0; ++i)
+        if (FROST_SHOCK_RANKS[i] == spellId) return true;
+    return false;
+}
+
+// Spirit Wolf (entry 29264): 4 abilities + ATK/FOL/STA controls.
+// Frost Brand uses spell 8056 as the placeholder; CST handler upgrades to highest known rank.
+static const PetBarSpellDef SHAMAN_WOLF_BAR_SPELLS[] =
+{
+    { 58875, false, 15000 }, // Spirit Wolf Leap  — charge/leap to target
+    { 8056,  false, 8000  }, // Frost Brand       — frost damage + slow (resolves to highest Frost Shock rank)
+    { 5781,  false, 45000 }, // Threatening Growl — AoE debuff (manual only)
+    { 2649,  true,  10000 }, // Growl             — single-target taunt (autocasts)
+    { 0,     false, 0     },
+};
+
+// Treant (entry 1964): control-only bar.
+static const PetBarSpellDef DRUID_TREANT_BAR_SPELLS[] =
+{
+    { 0, false, 0 },
+};
+
+// Shadowfiend (entry 19668): control-only bar.
+static const PetBarSpellDef PRIEST_SHADOWFIEND_BAR_SPELLS[] =
+{
+    { 0, false, 0 },
+};
+
 // Per-player autocast toggle: lowguid → classId → spellId → enabled
 static std::unordered_map<uint32, std::unordered_map<uint8, std::unordered_map<uint32, bool>>> s_autocast;
 
@@ -232,8 +274,10 @@ static std::unordered_map<uint32, PetAABonus> s_petAABonus; // key = player lowg
 
 // Snapshot of flat modifiers last applied to the real Pet* slot.
 // Reversed before each re-application to prevent stat stacking across level-ups.
-struct AppliedPetStats { float str=0,agi=0,sta=0,intel=0,spi=0,ap=0; };
+struct AppliedPetStats { float str=0,agi=0,sta=0,intel=0,spi=0,ap=0,hp=0; };
 static std::unordered_map<uint32, AppliedPetStats> s_appliedRealPetStats;
+
+static AppliedPetStats ApplyOwnerAndBagStatsToUnit(Player* player, Unit* target, uint8 classId);
 
 // ---------------------------------------------------------------------------
 // Talent-to-pet-bonus table.
@@ -266,8 +310,9 @@ static const TalentBonusEntry s_talentBonusTable[] =
     { {18769, 18770, 18771, 18772, 18773},  4.0f, 0.0f, 0.0f },
 
     // ---- Death Knight — Unholy ----
-    // Ravenous Dead (3 ranks): +5% pet damage per rank → all pets
-    { {50051, 50052, 50053, 0, 0},          5.0f, 0.0f, 0.0f },
+    // Ravenous Dead (3 ranks): +5% pet STR/STA per rank → all pets
+    // Confirmed R1=49998, R2=49999 from player spellbook; R3=50000 (inferred)
+    { {49998, 49999, 50000, 0, 0},          0.0f, 0.05f, 0.0f },
 };
 static const int s_talentBonusCount = 5;
 
@@ -414,6 +459,9 @@ static const PetBarSpellDef* GetBarSpells(uint8 classId)
     {
         case CLASS_WARLOCK:      return WARLOCK_BAR_SPELLS;
         case CLASS_DEATH_KNIGHT: return DK_GHOUL_BAR_SPELLS;
+        case CLASS_SHAMAN:       return SHAMAN_WOLF_BAR_SPELLS;
+        case CLASS_DRUID:        return DRUID_TREANT_BAR_SPELLS;
+        case CLASS_PRIEST:       return PRIEST_SHADOWFIEND_BAR_SPELLS;
         default:                 return nullptr;
     }
 }
@@ -424,6 +472,9 @@ static uint32 GetGuardianEntryForClass(uint8 classId)
     {
         case CLASS_WARLOCK:      return 17252;  // Felguard
         case CLASS_DEATH_KNIGHT: return 26125;  // Risen Ghoul
+        case CLASS_SHAMAN:       return 29264;  // Spirit Wolf
+        case CLASS_DRUID:        return 1964;   // Treant
+        case CLASS_PRIEST:       return 19668;  // Shadowfiend
         default:                 return 0;
     }
 }
@@ -524,7 +575,7 @@ static void HandlePetBarCommand(Player* player, const std::string& body)
     // INIT — client just loaded, wants current bar state for all active guardians
     if (op == "INIT")
     {
-        static const uint8 BAR_CLASSES[] = { CLASS_WARLOCK, CLASS_DEATH_KNIGHT, 0 };
+        static const uint8 BAR_CLASSES[] = { CLASS_WARLOCK, CLASS_DEATH_KNIGHT, CLASS_SHAMAN, CLASS_DRUID, CLASS_PRIEST, 0 };
         for (int i = 0; BAR_CLASSES[i] != 0; ++i)
         {
             uint8 cls = BAR_CLASSES[i];
@@ -548,7 +599,10 @@ static void HandlePetBarCommand(Player* player, const std::string& body)
     {
         Creature* g = GetGuardianByClass(player, classId);
         if (!g || !g->IsAlive()) return;
+        // Prefer explicit selection; fall back to player's current combat victim.
         Unit* target = player->GetSelectedUnit();
+        if (!target || !target->IsAlive() || !g->IsValidAttackTarget(target))
+            target = player->GetVictim();
         if (!target || !target->IsAlive() || !g->IsValidAttackTarget(target)) return;
         g->SetReactState(REACT_AGGRESSIVE);
         g->GetMotionMaster()->Clear();
@@ -590,6 +644,9 @@ static void HandlePetBarCommand(Player* player, const std::string& body)
         if (!g || !g->IsAlive()) return;
         uint32 spellId = 0;
         try { spellId = std::stoul(args); } catch (...) { return; }
+        // Frost Brand: upgrade to highest Frost Shock rank the Shaman player has learned.
+        if (classId == CLASS_SHAMAN && IsFrostShock(spellId))
+            spellId = ResolveHighestFrostShock(player);
         Unit* target = g->GetVictim() ? g->GetVictim() : player->GetSelectedUnit();
         if (!target || !target->IsAlive()) return;
         g->CastSpell(target, spellId, true);
@@ -774,16 +831,11 @@ static Creature* SummonCombatGuardian(Player* player, uint32 entry)
     guardian->SetFaction(player->GetFaction());
     guardian->SetLevel(player->GetLevel());
 
-    // SetLevel() updates the level field but does NOT recalculate HP for TempSummons —
-    // that only runs at spawn via SelectLevel() using the template level. We override HP
-    // directly here so both pets scale with the player's actual max HP (and gear).
-    //   Felguard (rare-elite demon): 75% of player HP
-    //   Risen Ghoul (normal rank):   50% of player HP
-    // Other utility guardians (Treant, Shadowfiend, Wolf) keep their template HP.
-    if (entry == 17252 || entry == ENTRY_RISEN_GHOUL)
+    // TESTING PHASE: All guardians treated as native pets for stat purposes.
+    // HP is set equal to player max HP so no guardian is weaker than any other.
+    // This removes the tiered 75/50/40% system until balance is tuned post-testing.
     {
-        float mult  = (entry == 17252) ? 0.75f : 0.50f;
-        uint32 newHP = std::max(static_cast<uint32>(player->GetMaxHealth() * mult), 200u);
+        uint32 newHP = std::max(player->GetMaxHealth(), 200u);
         guardian->SetCreateHealth(newHP);
         guardian->SetMaxHealth(newHP);
     }
@@ -897,11 +949,21 @@ static AppliedPetStats ApplyOwnerAndBagStatsToUnit(Player* player, Unit* target,
 {
     AppliedPetStats applied;
 
-    float inherit = 0.40f;
-    uint32 lguid = player->GetGUID().GetCounter();
-    auto it = s_petAABonus.find(lguid);
-    if (it != s_petAABonus.end())
-        inherit += it->second.inheritExtra;
+    // TESTING PHASE: Guardians (Creature*) use 100% stat inheritance to match native pet
+    // slot behavior. Real pets (Pet*) keep the 40% + talent bonus base.
+    float inherit;
+    if (target->IsPet())
+    {
+        inherit = 0.40f;
+        uint32 lguid = player->GetGUID().GetCounter();
+        auto it = s_petAABonus.find(lguid);
+        if (it != s_petAABonus.end())
+            inherit += it->second.inheritExtra;
+    }
+    else
+    {
+        inherit = 1.00f; // guardians = full native-pet-equivalent stat inheritance
+    }
 
     applied.str   = player->GetStat(STAT_STRENGTH)  * inherit;
     applied.agi   = player->GetStat(STAT_AGILITY)   * inherit;
@@ -925,6 +987,17 @@ static AppliedPetStats ApplyOwnerAndBagStatsToUnit(Player* player, Unit* target,
     target->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER,   BASE_VALUE, applied.ap,    true);
     target->UpdateAllStats();
     target->UpdateAttackPowerAndDamage();
+
+    // Creatures don't auto-derive HP from Stamina the way Players/Pets do.
+    // Apply HP directly: 10 HP per Stamina point (same ratio as pet scaling).
+    // Reverse any previous bonus first so this function is idempotent on repeated calls.
+    float prevHpMod = target->GetFlatModifierValue(UNIT_MOD_HEALTH, BASE_VALUE);
+    if (prevHpMod > 0.0f)
+        target->HandleStatFlatModifier(UNIT_MOD_HEALTH, BASE_VALUE, prevHpMod, false);
+    applied.hp = applied.sta * 10.0f;
+    target->HandleStatFlatModifier(UNIT_MOD_HEALTH, BASE_VALUE, applied.hp, true);
+    target->UpdateMaxHealth();
+    target->SetHealth(target->GetMaxHealth());
 
     return applied;
 }
@@ -952,6 +1025,11 @@ static void ApplyAllPetBonuses(Player* player)
             pet->HandleStatFlatModifier(UNIT_MOD_STAT_INTELLECT, BASE_VALUE, old.intel, false);
             pet->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT,    BASE_VALUE, old.spi,   false);
             pet->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER,   BASE_VALUE, old.ap,    false);
+            if (old.hp > 0.0f)
+            {
+                pet->HandleStatFlatModifier(UNIT_MOD_HEALTH, BASE_VALUE, old.hp, false);
+                pet->UpdateMaxHealth();
+            }
         }
 
         uint8 petClass = GetPetSlotClass(player);
@@ -1154,6 +1232,14 @@ static void EnsureHunterPetActive(Player* player)
         }
         return; // Slot already has Hunter's beast (or Mage WE) — nothing to do
     }
+
+    // After player death, AzerothCore saves the pet with slot=100 (NOT_IN_SLOT).
+    // Call Pet only finds pets in slot=0, so it silently fails after resurrection.
+    // DirectExecute (sync) ensures the slot update completes before the spell's
+    // internal DB read looks up the pet.
+    CharacterDatabase.DirectExecute(
+        "UPDATE character_pet SET slot = 0 WHERE owner = {} AND slot = 100",
+        player->GetGUID().GetCounter());
 
     if (player->HasSpell(SPELL_REVIVE_PET))
         player->CastSpell(player, SPELL_REVIVE_PET, true);
@@ -1474,8 +1560,23 @@ public:
                         g->SetHomePosition(player->GetPositionX(), player->GetPositionY(),
                                            player->GetPositionZ(), player->GetOrientation());
 
-                        // Re-apply follow when not actively fighting
-                        if (!g->IsInCombat())
+                        // Auto-assist: if player is in combat and guardian is aggressive
+                        // but idle, direct it at the player's current victim automatically.
+                        if (!g->IsInCombat() && g->GetReactState() == REACT_AGGRESSIVE)
+                        {
+                            Unit* victim = player->GetVictim();
+                            if (victim && victim->IsAlive() && g->IsValidAttackTarget(victim))
+                            {
+                                g->AI()->AttackStart(victim);
+                            }
+                            else
+                            {
+                                g->GetMotionMaster()->Clear();
+                                g->GetMotionMaster()->MoveFollow(player,
+                                    GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
+                            }
+                        }
+                        else if (!g->IsInCombat())
                         {
                             g->GetMotionMaster()->Clear();
                             g->GetMotionMaster()->MoveFollow(player,
@@ -1599,7 +1700,7 @@ public:
 
             uint32 lguid = player->GetGUID().GetCounter();
 
-            static const uint8 BAR_CLASSES[] = { CLASS_WARLOCK, CLASS_DEATH_KNIGHT, 0 };
+            static const uint8 BAR_CLASSES[] = { CLASS_WARLOCK, CLASS_DEATH_KNIGHT, CLASS_SHAMAN, CLASS_DRUID, CLASS_PRIEST, 0 };
             for (int ci = 0; BAR_CLASSES[ci] != 0; ++ci)
             {
                 uint8 classId = BAR_CLASSES[ci];
@@ -1830,6 +1931,206 @@ public:
 };
 
 // ============================================================
+// Spirit Hunt — permanent guardian wolf heals owner for 5% of melee damage dealt.
+// Mirrors the Feral Spirit wolves' Spirit Hunt passive at a reduced rate.
+// ============================================================
+
+class SpiritHuntUnitScript : public UnitScript
+{
+public:
+    SpiritHuntUnitScript() : UnitScript("SpiritHuntUnitScript") {}
+
+    void OnDamage(Unit* attacker, Unit* /*victim*/, uint32& damage) override
+    {
+        if (!attacker || damage == 0) return;
+        if (attacker->GetEntry() != ENTRY_SPIRIT_WOLF) return;
+
+        Unit* owner = attacker->GetOwner();
+        if (!owner || !owner->IsAlive() || owner->GetTypeId() != TYPEID_PLAYER) return;
+
+        uint32 heal = std::max(1u, damage / 20); // 5%
+        owner->ModifyHealth((int32)heal);
+    }
+};
+
+// ============================================================
+// .petbag command — show pet bag contents + force stat refresh
+//
+// Use after moving items in/out of a pet bag mid-session.
+// Without this, stat changes only take effect on relog or level-up.
+// ============================================================
+
+static const char* GetBagName(uint32 entry)
+{
+    switch (entry)
+    {
+        case 700200: return "Beastmaster's Pack (Hunter)";
+        case 700201: return "Beastmaster's Grand Pack (Hunter)";
+        case 700202: return "Grimoire of Summons (Warlock)";
+        case 700203: return "Grand Grimoire of Summons (Warlock)";
+        case 700204: return "Death's Satchel (DK)";
+        case 700205: return "Death's Grand Satchel (DK)";
+        case 700206: return "Grove Keeper's Pouch (Druid)";
+        case 700207: return "Grove Keeper's Satchel (Druid)";
+        case 700208: return "Shaman's War Fetish (Shaman)";
+        case 700209: return "Shaman's Grand War Fetish (Shaman)";
+        case 700210: return "Devoted Relic (Priest)";
+        case 700211: return "Greater Devoted Relic (Priest)";
+        case 700212: return "Arcane Focus (Mage)";
+        case 700213: return "Greater Arcane Focus (Mage)";
+        default:     return "Unknown";
+    }
+}
+
+class mod_pet_bag_commandscript : public CommandScript
+{
+public:
+    mod_pet_bag_commandscript() : CommandScript("mod_pet_bag_commandscript") {}
+
+    ChatCommandTable GetCommands() const override
+    {
+        static ChatCommandTable table =
+        {
+            { "petbag", HandlePetBagCommand, SEC_PLAYER, Console::No },
+        };
+        return table;
+    }
+
+    static bool HandlePetBagCommand(ChatHandler* handler)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player) return false;
+
+        handler->SendSysMessage("|cff00ccff[PetBag]|r Scanning equipped pet bags...");
+
+        bool foundAny = false;
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = player->GetBagByPos(bagSlot);
+            if (!bag) continue;
+
+            uint32 entry = bag->GetEntry();
+            // Check if this is a pet bag entry (700200–700213)
+            if (entry < 700200 || entry > 700213) continue;
+
+            foundAny = true;
+            handler->PSendSysMessage("|cff00ccff[PetBag]|r  {} (slot {})", GetBagName(entry), (uint32)bagSlot);
+
+            // Find which class this bag belongs to and sum stats
+            uint8 bagClass = 0;
+            for (uint32 i = 0; i < PET_BAG_COUNT; ++i)
+            {
+                if (PET_BAG_DEFS[i].smallEntry == entry || PET_BAG_DEFS[i].largeEntry == entry)
+                {
+                    bagClass = PET_BAG_DEFS[i].classId;
+                    break;
+                }
+            }
+
+            uint32 itemCount = 0;
+            BagStatTotals totals;
+            for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+            {
+                Item* item = bag->GetItemByPos(slot);
+                if (!item) continue;
+                ItemTemplate const* proto = item->GetTemplate();
+                if (!proto) continue;
+                ++itemCount;
+                for (uint32 s = 0; s < MAX_ITEM_PROTO_STATS; ++s)
+                {
+                    if (proto->ItemStat[s].ItemStatValue == 0) continue;
+                    switch (proto->ItemStat[s].ItemStatType)
+                    {
+                        case ITEM_MOD_STRENGTH:  totals.str   += proto->ItemStat[s].ItemStatValue; break;
+                        case ITEM_MOD_AGILITY:   totals.agi   += proto->ItemStat[s].ItemStatValue; break;
+                        case ITEM_MOD_STAMINA:   totals.sta   += proto->ItemStat[s].ItemStatValue; break;
+                        case ITEM_MOD_INTELLECT: totals.intel += proto->ItemStat[s].ItemStatValue; break;
+                        case ITEM_MOD_SPIRIT:    totals.spi   += proto->ItemStat[s].ItemStatValue; break;
+                        default: break;
+                    }
+                }
+            }
+
+            if (itemCount == 0)
+            {
+                handler->PSendSysMessage("    {} items — empty", bag->GetBagSize());
+            }
+            else
+            {
+                handler->PSendSysMessage("    {}/{} items — STR +{:.0f}  AGI +{:.0f}  STA +{:.0f}  INT +{:.0f}  SPI +{:.0f}",
+                    itemCount, bag->GetBagSize(),
+                    totals.str, totals.agi, totals.sta, totals.intel, totals.spi);
+            }
+            (void)bagClass;
+        }
+
+        if (!foundAny)
+            handler->SendSysMessage("|cff00ccff[PetBag]|r No pet bags equipped.");
+
+        // Force immediate stat re-application to all active pets and guardians.
+        // This is the same function called on login and level-up, so it's safe mid-session.
+        ApplyAllPetBonuses(player);
+        handler->SendSysMessage("|cff00ccff[PetBag]|r Stats refreshed on all active pets/guardians.");
+
+        return true;
+    }
+};
+
+// ============================================================
+// .pets dismiss — despawn all active guardians and the real pet slot.
+// Useful during testing when GM mode interferes with pet logic.
+// ============================================================
+
+class mod_pet_dismiss_commandscript : public CommandScript
+{
+public:
+    mod_pet_dismiss_commandscript() : CommandScript("mod_pet_dismiss_commandscript") {}
+
+    ChatCommandTable GetCommands() const override
+    {
+        static ChatCommandTable table =
+        {
+            { "pets dismiss", HandlePetsDismissCommand, SEC_PLAYER, Console::No },
+        };
+        return table;
+    }
+
+    static bool HandlePetsDismissCommand(ChatHandler* handler)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player) return false;
+
+        uint32 lguid = player->GetGUID().GetCounter();
+        uint8 count = 0;
+
+        // Despawn all tracked guardians.
+        auto it = s_guardianGuids.find(lguid);
+        if (it != s_guardianGuids.end())
+        {
+            for (auto& [entry, guid] : it->second)
+            {
+                if (Creature* g = ObjectAccessor::GetCreature(*player, guid))
+                {
+                    g->DespawnOrUnsummon();
+                    ++count;
+                }
+            }
+            s_guardianGuids.erase(it);
+        }
+
+        // Dismiss real pet slot (Hunter beast / Warlock demon).
+        if (Pet* pet = player->GetPet())
+        {
+            player->RemovePet(pet, PET_SAVE_AS_CURRENT);
+            ++count;
+        }
+
+        handler->PSendSysMessage("|cff00ccff[Pets]|r Dismissed {} pet(s)/guardian(s).", (uint32)count);
+        return true;
+    }
+};
+
+// ============================================================
 // Registration
 // ============================================================
 
@@ -1840,7 +2141,10 @@ void AddSC_mod_pet_systems()
     new PetBarsPlayerScript();
     new PetBarsWorldScript();
     new mod_pet_bonus_commandscript();
+    new mod_pet_bag_commandscript();
+    new mod_pet_dismiss_commandscript();
     new SoulLinkUnitScript();
+    new SpiritHuntUnitScript();
     LOG_INFO("module", "[mod-pet-systems] Module loaded. "
              "Pet priority: Hunter=native slot, Warlock/DK=guardian. "
              "SanctumPetBars active for Warlock + DK guardian ability bars.");

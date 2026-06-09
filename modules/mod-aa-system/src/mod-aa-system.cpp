@@ -293,6 +293,28 @@ static void ApplyAAStat(Player* player, uint32 aaId, uint8 rankDelta, bool apply
             player->ApplyRatingMod(CR_HIT_RANGED, 16 * (int32)rankDelta, apply);
             break;
         }
+        case AA_HUN_STEADY_FOCUS:       // +60 ranged attack power per rank delta (≈60/120/180 at R1/R2/R3)
+        {
+            // Uses the same additive-per-rank-delta pattern as Iron Will (+200/delta) and
+            // Sanctum Essence (+20/delta). Each rank purchased or applied on login adds 60 AP.
+            // Cumulative at R3 = 180 AP (design target was 200; the 20 AP difference is acceptable
+            // for a solo server and keeps the implementation identical to every other stat passive).
+            float bonus = 60.0f * (float)rankDelta;
+            player->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, TOTAL_VALUE, bonus, apply);
+            player->UpdateAttackPowerAndDamage(true);
+            break;
+        }
+        case AA_HUN_PIERCING_ROUNDS:    // +84 armor pen rating per rank (~3% ArP at L80, same as Tactical Mastery)
+        {
+            player->ApplyRatingMod(CR_ARMOR_PENETRATION, 84 * (int32)rankDelta, apply);
+            break;
+        }
+        case AA_HUN_SURVIVAL_TACTICS:   // +dodge rating per rank (~2/4/7% at L80)
+        {
+            // 45/90/160 dodge rating cumulative: applying 45 per rank-delta matches the additive step.
+            player->ApplyRatingMod(CR_DODGE, 45 * (int32)rankDelta, apply);
+            break;
+        }
         case AA_G_MANA_SURGE:   // +2/4/6% mana regen — Spirit proxy (+40/80/120 Spirit per rank)
         {
             // No direct %-mana-regen stat in 3.3.5a. Spirit drives mana regen via the
@@ -573,6 +595,7 @@ static const char* GetAAName(uint32 aaId)
         case AA_P_PACK_TACTICS:     return "Pack Tactics";
         case AA_P_PREDATORS_HOWL:   return "Predator's Howl";
         case AA_P_SAVAGE_FLURRY:    return "Savage Flurry";
+        case AA_P_BLOODSCENT:       return "Bloodscent";
         // Pet — Defense
         case AA_P_HARDENED_HIDE:     return "Hardened Hide";
         case AA_P_IRON_CONSTITUTION: return "Iron Constitution (Pet)";
@@ -580,6 +603,7 @@ static const char* GetAAName(uint32 aaId)
         case AA_P_UNCRUSHABLE:       return "Uncrushable";
         case AA_P_STEELED_RESOLVE:   return "Steeled Resolve";
         case AA_P_GUARDIANS_RESOLVE: return "Guardian's Resolve";
+        case AA_P_MENDING_BOND:      return "Mending Bond";
         // Pet — Utility
         case AA_P_ASSIST_ME:        return "Assist Me";
         case AA_P_REDIRECTION:      return "Redirection";
@@ -704,6 +728,12 @@ static const char* GetAAName(uint32 aaId)
         case AA_HUN_RANGED_MASTERY:          return "Ranged Mastery";
         case AA_HUN_IMPROVED_TRAPS:          return "Improved Traps";
         case AA_HUN_THRILL_OF_THE_HUNT:      return "Thrill of the Hunt";
+        case AA_HUN_STEADY_FOCUS:            return "Steady Focus";
+        case AA_HUN_PIERCING_ROUNDS:         return "Piercing Rounds";
+        case AA_HUN_SURVIVAL_TACTICS:        return "Survival Tactics";
+        case AA_HUN_BEAST_SYNERGY:           return "Beast Synergy";
+        case AA_HUN_COORDINATED_ASSAULT:     return "Coordinated Assault";
+        case AA_HUN_GO_FOR_THE_THROAT:       return "Go for the Throat";
         // Rogue
         case AA_ROG_AMBIDEXTERITY:    return "Ambidexterity";
         case AA_ROG_BACKSTAB_FOCUS:   return "Backstab Focus";
@@ -967,11 +997,19 @@ static const char* GetAADesc(uint32 aaId)
 {
     switch (aaId)
     {
-        case AA_G_IRON_WILL:        return "+200 HP per rank";
-        case AA_G_SANCTUM_ESSENCE:  return "+20 to all primary stats per rank";
-        case AA_T_TITANS_BLOOD:     return "+200 HP per rank (Tank archetype)";
-        case AA_TEMPER:             return "Sacrifice gear for Gear XP (free)";
-        default:                    return "Phase 2+ mechanic — tracked, not yet active";
+        case AA_G_IRON_WILL:              return "+200 HP per rank";
+        case AA_G_SANCTUM_ESSENCE:        return "+20 to all primary stats per rank";
+        case AA_T_TITANS_BLOOD:           return "+200 HP per rank (Tank archetype)";
+        case AA_TEMPER:                   return "Sacrifice gear for Gear XP (free)";
+        case AA_HUN_STEADY_FOCUS:         return "+60/+120/+180 ranged attack power";
+        case AA_HUN_PIERCING_ROUNDS:      return "+5%/+10%/+15% armor penetration (ranged)";
+        case AA_HUN_SURVIVAL_TACTICS:     return "+2%/+4%/+7% dodge chance";
+        case AA_HUN_BEAST_SYNERGY:        return "+3%/+6%/+10% damage while pet or guardian is alive";
+        case AA_HUN_COORDINATED_ASSAULT:  return "+5%/+10%/+15% damage to the target your pet is attacking";
+        case AA_HUN_GO_FOR_THE_THROAT:    return "Auto-attacks 10%/20%/30% chance: pet bites for 40/60/80% of the hit";
+        case AA_P_BLOODSCENT:             return "+10%/+20%/+30% pet damage to targets below 35% HP";
+        case AA_P_MENDING_BOND:           return "Pet/guardian regens 2%/4%/6% max HP per second while below 50% HP";
+        default:                          return "Phase 2+ mechanic — tracked, not yet active";
     }
 }
 
@@ -1379,6 +1417,9 @@ public:
         LoadAAData(player);
         ApplyAllAAStats(player);
         PushAADataToClient(player);
+
+        // Active AAs are activated via the SanctumAA "Sanctum Abilities" Lua bar
+        // (client-side, sends ".aa use <id>"). No server-side spell/skill grant needed.
 
         // Sprinter / Pathfinding — apply OOC speed bonus on login
         if (!player->IsInCombat())
