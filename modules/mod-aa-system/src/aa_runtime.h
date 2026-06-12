@@ -13,6 +13,13 @@
 #include "Define.h"
 
 class Player;
+class Unit;
+
+// Deal damage that shows a VISIBLE floating combat-log number (attributed to a
+// representative spell per school), instead of silent Unit::DealDamage. Use for
+// all AA active/proc damage so the player sees the numbers. Defined in
+// aa_combat_modifiers.cpp. schoolMask is a SpellSchoolMask value.
+void SanctumAA_DealVisibleDamage(Player* attacker, Unit* victim, uint32 damage, uint32 schoolMask);
 
 // ---------------------------------------------------------------------------
 // Master ID enum — all approved AAs.
@@ -76,6 +83,7 @@ enum SanctumAAId : uint32
     AA_G_HINDSIGHT        = 2109,   // After spike hit absorb shield 30%/60%/100% of that hit
     AA_G_FREE_WILL        = 2110,   // ONE-SHOT: first CC each combat auto-removed
     AA_G_RECOVERY         = 2111,   // 5%/10%/15% of damage taken healed back over 6s
+    AA_G_INDOMITABLE      = 2112,   // ONE-SHOT (15pt): permanent immunity to ALL crowd control
     AA_G_COMBAT_AGILITY   = 2121,   // +2%/+4%/+7% dodge/parry/block + defense rating
     AA_G_CHANNELING_FOCUS = 2122,   // 25%/50%/75% less spell pushback
 

@@ -47,6 +47,7 @@
 #include "ObjectMgr.h"
 #include "Log.h"
 #include "Unit.h"
+#include "SharedDefines.h"
 #include "Creature.h"
 #include "Item.h"
 #include <unordered_map>
@@ -140,20 +141,33 @@ static uint8 GetAAMaxRank(uint32 aaId)
 {
     static const std::unordered_map<uint32, uint8> s_max = {
         // maxRank 1
-        {2019,1},{2110,1},{2204,1},
+        {2019,1},{2110,1},{2112,1},{2204,1},
         {3104,1},{3201,1},{3202,1},{3204,1},
         {4104,1},{4204,1},{4304,1},
-        {5002,1},{5018,1},
+        {5002,1},
+        // 5018 Unending Fury — SCRAPPED (Tier 1)
         {5207,1},{5208,1},{5218,1},{5236,1},
         {5303,1},{5312,1},{5321,1},{5328,1},
         {5404,1},{5426,1},
         {5518,1},{5519,1},{5520,1},{5522,1},
         {5731,1},
-        {5828,1},{5829,1},{5833,1},
+        {5828,1},
+        // 5800 Threads of Despair    — SCRAPPED (Tier 1)
+        // 5821 Well of Souls         — SCRAPPED (Tier 1)
+        // 5822 Soul Barrage          — SCRAPPED (Tier 1)
+        // 5823 Soulstorm             — SCRAPPED (Tier 1)
+        // 5824 Circle of the Damned  — SCRAPPED (Tier 1)
+        // 5825 Soul Mirror           — SCRAPPED (Tier 1)
+        // 5826 Wake the Dead         — SCRAPPED (Tier 1)
+        // 5829 Dire Charm            — SCRAPPED (Tier 1)
+        // 5833 Suspended Minion      — SCRAPPED (Tier 1)
+        // 5834 Feigned Minion        — SCRAPPED (Tier 1)
+        // 5835 Spell Casting Subtlety — SCRAPPED (Tier 1)
         {5925,1},
         {9001,1},
         // maxRank 2
-        {5009,2},{5011,2},{5014,2},{5015,2},{5016,2},
+        {5009,2},{5011,2},{5014,2},{5015,2},
+        // 5016 Titan's Grip — SCRAPPED (Tier 1)
         // maxRank 4
         {5012,4},{4103,4},
     };
@@ -165,14 +179,17 @@ static uint8 GetAARankCost(uint32 aaId, uint8 nextRank)
 {
     static const std::unordered_map<uint32, std::array<uint8,4>> s_costs = {
         {9001,{0,0,0,0}},{2019,{5,0,0,0}},{2110,{5,0,0,0}},{2121,{2,3,4,0}},
+        {2112,{15,0,0,0}},
         {2204,{5,0,0,0}},{3002,{2,4,6,0}},{3104,{5,0,0,0}},{3105,{2,3,4,0}},
         {3201,{5,0,0,0}},{3202,{5,0,0,0}},{3204,{3,0,0,0}},{3205,{2,3,4,0}},
         {4103,{1,2,3,4}},
         {4104,{5,0,0,0}},{4106,{2,3,4,0}},{4202,{2,3,4,0}},{4204,{5,0,0,0}},
         {4205,{3,5,8,0}},{4206,{2,3,4,0}},{4304,{4,0,0,0}},
         {5002,{4,0,0,0}},{5007,{2,3,4,0}},{5009,{1,2,0,0}},{5011,{2,3,0,0}},
-        {5012,{1,2,3,4}},{5014,{2,4,0,0}},{5015,{1,2,0,0}},{5016,{2,3,0,0}},
-        {5018,{5,0,0,0}},{5204,{2,3,4,0}},{5207,{5,0,0,0}},{5208,{4,0,0,0}},
+        {5012,{1,2,3,4}},{5014,{2,4,0,0}},{5015,{1,2,0,0}},
+        // 5016 Titan's Grip — SCRAPPED (Tier 1); 5018 Unending Fury — SCRAPPED (Tier 1)
+        // 5008 Cleaving Strikes — SCRAPPED (Tier 1) (used default 1/2/3 cost; now excluded)
+        {5204,{2,3,4,0}},{5207,{5,0,0,0}},{5208,{4,0,0,0}},
         {5218,{3,0,0,0}},{5236,{4,0,0,0}},{5240,{2,3,4,0}},{5246,{2,3,4,0}},
         {5303,{5,0,0,0}},{5312,{3,0,0,0}},{5314,{2,3,4,0}},{5317,{2,3,4,0}},
         {5321,{3,0,0,0}},{5328,{4,0,0,0}},{5333,{2,3,4,0}},{5340,{2,3,4,0}},
@@ -180,9 +197,10 @@ static uint8 GetAARankCost(uint32 aaId, uint8 nextRank)
         {5421,{2,3,4,0}},{5426,{3,0,0,0}},{5431,{2,3,4,0}},{5435,{2,3,4,0}},
         {5443,{2,3,4,0}},{5514,{2,3,4,0}},{5518,{5,0,0,0}},{5519,{5,0,0,0}},
         {5520,{4,0,0,0}},{5522,{4,0,0,0}},{5621,{3,5,8,0}},{5704,{2,3,4,0}},
-        {5731,{5,0,0,0}},{5738,{2,3,4,0}},{5816,{2,3,4,0}},{5817,{2,3,4,0}},
-        {5821,{2,3,4,0}},{5823,{2,3,4,0}},{5824,{2,3,4,0}},{5825,{2,3,4,0}},
-        {5828,{5,0,0,0}},{5829,{4,0,0,0}},{5833,{3,0,0,0}},{5925,{4,0,0,0}},
+        {5731,{5,0,0,0}},{5738,{2,3,4,0}},
+        {5816,{2,3,4,0}},{5817,{2,3,4,0}},
+        {5828,{5,0,0,0}},{5925,{4,0,0,0}},
+        // 5800,5821,5822,5823,5824,5825,5826,5829,5833,5834,5835 — SCRAPPED (Tier 1)
     };
     auto it = s_costs.find(aaId);
     if (it != s_costs.end())
@@ -228,6 +246,21 @@ static void ApplyAAStat(Player* player, uint32 aaId, uint8 rankDelta, bool apply
             float bonus = 200.0f * rankDelta;
             player->HandleStatFlatModifier(UNIT_MOD_HEALTH, TOTAL_VALUE, bonus, apply);
             player->UpdateMaxHealth();
+            break;
+        }
+        case AA_G_INDOMITABLE:      // ONE-SHOT: permanent immunity to ALL crowd control
+        {
+            // Apply mechanic immunity for every loss-of-control effect. Re-applied
+            // on login via ApplyAllAAStats, removed on respec (apply == false).
+            static const uint32 ccMechanics[] = {
+                MECHANIC_CHARM, MECHANIC_DISORIENTED, MECHANIC_FEAR, MECHANIC_ROOT,
+                MECHANIC_SILENCE, MECHANIC_SLEEP, MECHANIC_STUN, MECHANIC_FREEZE,
+                MECHANIC_KNOCKOUT, MECHANIC_POLYMORPH, MECHANIC_BANISH, MECHANIC_SHACKLE,
+                MECHANIC_HORROR, MECHANIC_TURN, MECHANIC_SAPPED, MECHANIC_DAZE,
+                MECHANIC_SNARE
+            };
+            for (uint32 m : ccMechanics)
+                player->ApplySpellImmune(0, IMMUNITY_MECHANIC, m, apply);
             break;
         }
         case AA_G_SANCTUM_ESSENCE:  // +20 to all primary stats per rank
@@ -535,6 +568,12 @@ static void AwardAAXP(Player* player, uint64 xpAmount)
             (uint32)data.bleedPct, threshold));
     }
 
+    // Live progress update for the AA UI bar on EVERY award (not just on a
+    // point-up). Lightweight — updates the XP bar + points without rebuilding
+    // the purchased-ability list the way INIT does.
+    SendToAAAddon(player, Acore::StringFormat("SANCTUMAA:XP:{}:{}:{}",
+        (uint32)data.aaXp, data.pointsEarned, threshold));
+
     SaveAAPoints(player);
 }
 
@@ -577,6 +616,7 @@ static const char* GetAAName(uint32 aaId)
         case AA_G_HINDSIGHT:        return "Hindsight";
         case AA_G_FREE_WILL:        return "Free Will";
         case AA_G_RECOVERY:         return "Recovery";
+        case AA_G_INDOMITABLE:      return "Indomitable";
         case AA_G_COMBAT_AGILITY:   return "Combat Agility";
         case AA_G_CHANNELING_FOCUS: return "Channeling Focus";
         // General — Utility

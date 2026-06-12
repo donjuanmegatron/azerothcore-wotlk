@@ -153,6 +153,23 @@ namespace
                 unit->UpdateArmor();
             }
         }
+
+        // ── Demonic Synergy (Warlock 5818) — additional +8/15/25% of owner primary stats ──
+        // Added on top of the 40% base inheritance already applied by mod-pet-systems.
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_WRL_DEMONIC_SYNERGY);
+            if (rank > 0)
+            {
+                static const float pct[] = { 0.0f, 0.08f, 0.15f, 0.25f };
+                float bonus = pct[Idx<uint8>(rank)];
+                unit->HandleStatFlatModifier(UNIT_MOD_STAT_STRENGTH,  TOTAL_VALUE, player->GetStat(STAT_STRENGTH)  * bonus, true);
+                unit->HandleStatFlatModifier(UNIT_MOD_STAT_AGILITY,   TOTAL_VALUE, player->GetStat(STAT_AGILITY)   * bonus, true);
+                unit->HandleStatFlatModifier(UNIT_MOD_STAT_STAMINA,   TOTAL_VALUE, player->GetStat(STAT_STAMINA)   * bonus, true);
+                unit->HandleStatFlatModifier(UNIT_MOD_STAT_INTELLECT, TOTAL_VALUE, player->GetStat(STAT_INTELLECT) * bonus, true);
+                unit->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT,    TOTAL_VALUE, player->GetStat(STAT_SPIRIT)    * bonus, true);
+                unit->UpdateAllStats();
+            }
+        }
     }
 }
 
@@ -255,6 +272,16 @@ public:
                     }
                 }
 
+                // Empowered Demons (Warlock 5819) — +10/18/28% pet/guardian damage done
+                {
+                    uint8 rank = SanctumAA::GetRank(player, AA_WRL_EMPOWERED_DEMONS);
+                    if (rank > 0)
+                    {
+                        static const float bonus[] = { 0.0f, 0.10f, 0.18f, 0.28f };
+                        damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                    }
+                }
+
                 // Savage Flurry — 5/10/15% chance: add 50% extra dmg (third hit). 200ms ICD.
                 {
                     uint8 rank = SanctumAA::GetRank(player, AA_P_SAVAGE_FLURRY);
@@ -321,12 +348,28 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // ModifySpellDamageTaken — spell damage to the pet/guardian.
-    //   Handler, Guardian's Resolve apply to all damage types.
+    // ModifySpellDamageTaken — spell damage to/from the pet/guardian.
+    //   Attacker = pet: Empowered Demons damage bonus.
+    //   Victim   = pet: Handler, Guardian's Resolve, Cheer: Defensive.
     // -----------------------------------------------------------------------
     void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* /*spellInfo*/) override
     {
         if (damage <= 0) return;
+
+        // ── ATTACKER IS PET OR GUARDIAN ─────────────────────────────────────
+        {
+            Player* pOwner = GetOwnerPlayer(attacker);
+            if (pOwner)
+            {
+                // Empowered Demons (Warlock 5819) — +10/18/28% pet/guardian spell damage done
+                uint8 rank = SanctumAA::GetRank(pOwner, AA_WRL_EMPOWERED_DEMONS);
+                if (rank > 0)
+                {
+                    static const float bonus[] = { 0.0f, 0.10f, 0.18f, 0.28f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+        }
 
         Player* player = GetOwnerPlayer(target);
         if (!player) return;

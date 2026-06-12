@@ -68,6 +68,7 @@
 #include "Timer.h"
 #include "Random.h"
 #include "Creature.h"
+#include "Spell.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -85,6 +86,9 @@ namespace
 
     template<typename T>
     static inline T Idx(uint8 rank) { return static_cast<T>(std::min<uint8>(rank, 3)); }
+
+    // Crusader's Might (5100) proc ICD
+    std::unordered_map<uint32, uint32> g_cmIcd;
 
     // Punishing Blade ICD: playerGuid → last proc timestamp
     std::unordered_map<uint32, uint32> g_pbIcd;
@@ -150,6 +154,7 @@ namespace
             if (fIt != g_frenzyPct.end() && fIt->second > 0.0f)
                 player->ApplyAttackTimePercentMod(BASE_ATTACK, fIt->second, false);
         }
+        g_cmIcd.erase(guid);
         g_pbIcd.erase(guid);
         g_dbsIcd.erase(guid);
         g_triIcd.erase(guid);
@@ -656,6 +661,82 @@ public:
                 }
             }
 
+            // Divine Storm Mastery (5103) — +15/25/40% Divine Storm damage
+            {
+                static const std::unordered_set<uint32> s_divineStorm = { 53385 };
+                uint8 rank = SanctumAA::GetRank(player, AA_PAL_DIVINE_STORM_MASTERY);
+                if (rank > 0 && s_divineStorm.count(spellInfo->Id))
+                {
+                    static const float bonus[] = { 0.0f, 0.15f, 0.25f, 0.40f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Improved Avenger's Shield (5110) — +20% Avenger's Shield damage;
+            // also applies a damage-dealt-reduction debuff to the target for 8s.
+            {
+                static const std::unordered_set<uint32> s_avengerShield = {
+                    31935, 32699, 32700, 48826, 48827
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_PAL_IMPROVED_AVENGERS_SHIELD);
+                if (rank > 0 && s_avengerShield.count(spellInfo->Id) && target)
+                {
+                    damage += (int32)(damage * 0.20f);
+                    // Apply debuff to target
+                    static const float dr[] = { 0.0f, 0.05f, 0.08f, 0.12f };
+                    extern void SanctumAA_ApplyAvengerDebuff(uint32 playerGuid, uint32 targetGuid, float dr, uint32 durationMs);
+                    SanctumAA_ApplyAvengerDebuff(player->GetGUID().GetCounter(), target->GetGUID().GetCounter(),
+                                                  dr[Idx<uint8>(rank)], 8000u);
+                }
+            }
+
+            // Fist of Reckoning (5111) — +30/50/80% Hand of Reckoning damage
+            {
+                static const std::unordered_set<uint32> s_hor = { 62124 };
+                uint8 rank = SanctumAA::GetRank(player, AA_PAL_FIST_OF_RECKONING);
+                if (rank > 0 && s_hor.count(spellInfo->Id))
+                {
+                    static const float bonus[] = { 0.0f, 0.30f, 0.50f, 0.80f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Holy Wrath Mastery (5118) — +20/35/50% Holy Wrath damage
+            {
+                static const std::unordered_set<uint32> s_holyWrath = {
+                    2812, 10312, 10313, 27139, 48816, 48817
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_PAL_HOLY_WRATH_MASTERY);
+                if (rank > 0 && s_holyWrath.count(spellInfo->Id))
+                {
+                    static const float bonus[] = { 0.0f, 0.20f, 0.35f, 0.50f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Crusader's Might (5100) — 10/18/25% chance on Crusader Strike to hit a 2nd time for full holy dmg
+            {
+                static const std::unordered_set<uint32> s_cs = {
+                    35395, 35396, 35397, 35398, 35399
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_PAL_CRUSADERS_MIGHT);
+                if (rank > 0 && s_cs.count(spellInfo->Id) && target)
+                {
+                    auto& stamp = g_cmIcd[player->GetGUID().GetCounter()];
+                    if (GetMSTimeDiffToNow(stamp) >= 500u)
+                    {
+                        static const float chance[] = { 0.0f, 10.0f, 18.0f, 25.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        {
+                            // Deal holy damage equal to current strike damage
+                            Unit::DealDamage(player, target, (uint32)damage, nullptr,
+                                             DIRECT_DAMAGE, SPELL_SCHOOL_MASK_HOLY, nullptr, false);
+                            stamp = getMSTime();
+                        }
+                    }
+                }
+            }
+
             // Improved Consecration (Paladin) — +15/25/40% Consecration damage
             {
                 static const std::unordered_set<uint32> s_consecration = {
@@ -814,6 +895,36 @@ public:
                 if (rank > 0 && s_howlingBlast.count(spellInfo->Id))
                     damage += (int32)(damage * 0.10f);
             }
+
+            // Improved Drains (5802) — +10/18/30% Unstable Affliction damage
+            {
+                static const std::unordered_set<uint32> s_ua = {
+                    30108, 30404, 30405, 47843, 47842
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_WRL_IMPROVED_DRAINS);
+                if (rank > 0 && s_ua.count(spellInfo->Id))
+                {
+                    static const float bonus[] = { 0.0f, 0.10f, 0.18f, 0.30f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Improved Devastate (5017) — +25% Devastate damage; apply stacking damage debuff on target
+            {
+                static const std::unordered_set<uint32> s_devastate = { 20243, 30016, 30022 };
+                uint8 rank = SanctumAA::GetRank(player, AA_WAR_IMPROVED_DEVASTATE);
+                if (rank > 0 && s_devastate.count(spellInfo->Id) && target)
+                {
+                    // +25% Devastate damage (all ranks)
+                    damage += (int32)(damage * 0.25f);
+
+                    // Apply stacking debuff (logic lives in aa_combat_modifiers.cpp)
+                    extern void SanctumAA_ApplyDevastateStack(uint32 attackerGuid, uint32 victimGuid, uint8 rank);
+                    uint32 attackerGuid = player->GetGUID().GetCounter();
+                    SanctumAA_ApplyDevastateStack(attackerGuid, target->GetGUID().GetCounter(), rank);
+                }
+            }
+
         } // end ATTACKER IS PLAYER
 
         // ── VICTIM IS PLAYER ────────────────────────────────────────────────
@@ -934,6 +1045,37 @@ public:
             uint8 rank = SanctumAA::GetRank(player, AA_WAR_REND_MASTERY);
             if (rank > 0 && s_rend.count(spellInfo->Id))
                 damage += (uint32)(damage * 0.30f);
+        }
+
+        // Soul Abrasion (5830) — Drain Life ticks: bonus healing to caster (+15/25/40% of tick dmg)
+        // Drain Life normally heals the caster for the damage dealt; this adds an extra fraction.
+        // Implemented here (ModifyPeriodicDamageAurasTick) so we can call ModifyHealth.
+        // This is safe because we are NOT inside ModifyMeleeDamage/ModifySpellDamageTaken.
+        {
+            static const std::unordered_set<uint32> s_drainLife = {
+                689, 699, 709, 7651, 11699, 11700, 27219, 27220, 47857
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_WRL_SOUL_ABRASION);
+            if (rank > 0 && s_drainLife.count(spellInfo->Id) && !player->IsFullHealth())
+            {
+                static const float bonus[] = { 0.0f, 0.15f, 0.25f, 0.40f };
+                int32 extraHeal = (int32)(damage * bonus[Idx<uint8>(rank)]);
+                if (extraHeal > 0)
+                    player->ModifyHealth(extraHeal);
+            }
+        }
+
+        // Improved Curses (5806) — +15/25/40% Curse of Agony damage
+        {
+            static const std::unordered_set<uint32> s_coa = {
+                980, 1014, 6217, 11711, 11712, 11713, 27218, 47863, 47864
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_WRL_IMPROVED_CURSES);
+            if (rank > 0 && s_coa.count(spellInfo->Id))
+            {
+                static const float bonus[] = { 0.0f, 0.15f, 0.25f, 0.40f };
+                damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+            }
         }
 
         // Blood Tithe (Shaman) — Flame Shock ticks heal player 15/25/40% of damage
@@ -1215,6 +1357,102 @@ class aa_class_player : public PlayerScript
 {
 public:
     aa_class_player() : PlayerScript("aa_class_player") {}
+
+    // -----------------------------------------------------------------------
+    // OnPlayerSpellCast — Paladin cast-based AAs.
+    // -----------------------------------------------------------------------
+    void OnPlayerSpellCast(Player* player, Spell* spell, bool skipCheck) override
+    {
+        if (!player || !spell || skipCheck)
+            return;
+
+        SpellInfo const* info = spell->GetSpellInfo();
+        if (!info)
+            return;
+
+        uint32 guid = player->GetGUID().GetCounter();
+
+        // Judge (5101) — detect Judgement cast, open Judge window
+        {
+            // Judgement of Light / Wisdom / Justice (the base judgement apply spells)
+            static const std::unordered_set<uint32> s_judgement = {
+                20271, 53408, 53407,    // Judgement of Light / Wisdom / Justice
+                20184, 20186, 20187,    // Judgement (older ranks)
+                54158                   // Judgement
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_PAL_JUDGE);
+            if (rank > 0 && s_judgement.count(info->Id))
+            {
+                // Open Judge window: R1=3, R2=4, R3=5 swings remaining. Window lasts 15s.
+                static const uint8 swings[] = { 0, 3, 4, 5 };
+                extern void SanctumAA_OpenJudgeWindow(uint32 guid, uint8 swings, uint32 durationMs);
+                SanctumAA_OpenJudgeWindow(guid, swings[Idx<uint8>(rank)], 15000u);
+            }
+        }
+
+        // Purifying Judgment (5125) — 25/50/75% chance on Judgement to dispel one magic/disease
+        {
+            static const std::unordered_set<uint32> s_judgement2 = {
+                20271, 53408, 53407, 20184, 20186, 20187, 54158
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_PAL_PURIFYING_JUDGMENT);
+            if (rank > 0 && s_judgement2.count(info->Id))
+            {
+                static const float chance[] = { 0.0f, 25.0f, 50.0f, 75.0f };
+                if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                {
+                    // Remove one harmful magic or disease aura from the player
+                    for (auto& auraMap : player->GetAppliedAuras())
+                    {
+                        AuraApplication const* aurApp = auraMap.second;
+                        if (!aurApp) continue;
+                        SpellInfo const* auraInfo = aurApp->GetBase()->GetSpellInfo();
+                        if (!auraInfo) continue;
+                        if (aurApp->IsPositive()) continue; // skip beneficial auras
+                        uint32 dispel = auraInfo->Dispel;
+                        if (dispel == DISPEL_MAGIC || dispel == DISPEL_DISEASE)
+                        {
+                            player->RemoveAura(auraMap.first);
+                            break; // only one
+                        }
+                    }
+                }
+            }
+        }
+
+        // Improved Flash of Light (5114) — each Flash of Light cast adds a Radiance stack (max 5)
+        {
+            static const std::unordered_set<uint32> s_fol = {
+                19750, 19939, 19940, 19941, 19942, 25363, 27137, 48784, 48785
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_PAL_IMPROVED_FLASH_OF_LIGHT);
+            if (rank > 0 && s_fol.count(info->Id))
+            {
+                extern void SanctumAA_AddRadianceStack(uint32 guid);
+                SanctumAA_AddRadianceStack(guid);
+            }
+        }
+
+        // Lay of Hands Mastery (5117) — reduce LoH cooldown on cast via SpellHistory
+        {
+            static const std::unordered_set<uint32> s_loh = { 633, 2800, 10310, 27154, 48788 };
+            uint8 rank = SanctumAA::GetRank(player, AA_PAL_LAY_OF_HANDS_MASTERY);
+            if (rank > 0 && s_loh.count(info->Id))
+            {
+                // Default LoH base CD = 20 min (1200s). Reduce per rank: -20/-40/-60 min.
+                // Since we're IN the cast handler, the CD gets set AFTER this fires in some engines.
+                // We reduce it by modifying after a brief update — actually the simplest approach is
+                // to call player->ModifySpellCooldown after cast. The hook fires during cast, not after.
+                // Apply a CD override: reduce by 20/40/60 minutes in milliseconds.
+                // Default LoH base CD = 20 min (1200s). Reduce per rank: -20/-40/-60 min.
+                // ModifySpellCooldown adjusts the existing cooldown by the given ms delta.
+                static const int32 cdRedMs[] = { 0, 1200000, 2400000, 3600000 };
+                int32 reduction = cdRedMs[Idx<uint8>(rank)];
+                for (uint32 spellId : s_loh)
+                    player->ModifySpellCooldown(spellId, -reduction);
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // OnPlayerCreatureKill — fires when the player kills any creature.
