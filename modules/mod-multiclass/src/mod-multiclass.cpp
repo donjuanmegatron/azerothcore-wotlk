@@ -187,10 +187,40 @@ void Notify(Player* player, const std::string& msg)
 //                            This causes armor/weapon proficiency loss → item auto-unequip → item
 //                            deletion if there is no bag space at load time.  Trainer spells (actual
 //                            class abilities) are not affected by this validation.
+
+// Sanctum signature ability: each chosen class grants ONE iconic ability for free,
+// at level 1, regardless of whether the class is primary/secondary/tertiary. Curated
+// "iconic but tame" per class (avoids the most broken capstones). Decided 2026-06-22.
+// NOTE: base ranks are granted (confident IDs). If a scaling nuke (Pyroblast / Chaos
+// Bolt / Starfall / Penance / Stormstrike) feels weak at endgame in testing, bump it
+// to its max rank — a one-line ID swap here.
+static uint32 GetSignatureSpell(uint8 classId)
+{
+    switch (classId)
+    {
+        case WOW_CLASS_WARRIOR:      return 46917; // Titan's Grip (dual-wield 2H, passive)
+        case WOW_CLASS_PALADIN:      return 31884; // Avenging Wrath (wings cooldown)
+        case WOW_CLASS_HUNTER:       return 19574; // Bestial Wrath
+        case WOW_CLASS_ROGUE:        return 36554; // Shadowstep
+        case WOW_CLASS_PRIEST:       return 47540; // Penance (R1)
+        case WOW_CLASS_DEATH_KNIGHT: return 49576; // Death Grip
+        case WOW_CLASS_SHAMAN:       return 17364; // Stormstrike (R1)
+        case WOW_CLASS_MAGE:         return 11366; // Pyroblast (R1)
+        case WOW_CLASS_WARLOCK:      return 50796; // Chaos Bolt (R1)
+        case WOW_CLASS_DRUID:        return 48505; // Starfall (R1)
+        default:                     return 0;
+    }
+}
+
 void GrantClassSpells(Player* player, uint8 classId, bool skipStartSpells = false)
 {
     // classmask is a bitmask where bit (classId - 1) represents the class.
     uint32 classMask = (1u << (classId - 1));
+
+    // Sanctum signature ability — one iconic spell per chosen class, free at level 1.
+    if (uint32 sig = GetSignatureSpell(classId))
+        if (!player->HasSpell(sig))
+            player->learnSpell(sig, false);
 
     // --- Starting / passive spells ---
     // Skipped for secondary/tertiary classes: these are proficiency (skill-teaching) spells that
@@ -294,6 +324,12 @@ void GrantClassSpells(Player* player, uint8 classId, bool skipStartSpells = fals
             if (!player->HasSpell(48265)) player->learnSpell(48265, false); // Unholy Presence
             if (!player->HasSpell(45477)) player->learnSpell(45477, false); // Icy Touch R1
             if (!player->HasSpell(45462)) player->learnSpell(45462, false); // Plague Strike R1
+            // Sanctum: secondary/tertiary DKs get the same utility a real DK gets from
+            // mod-dk-rework (which only fires for primary-class DKs). Death Gate = the
+            // Acherus teleport (needed to reach the Runeforge); Runeforging = DK weapon
+            // enchants. Neither is in the trainer table, so grant explicitly.
+            if (!player->HasSpell(50977)) player->learnSpell(50977, false); // Death Gate (Acherus)
+            if (!player->HasSpell(53428)) player->learnSpell(53428, false); // Runeforging (DK enchants)
         }
         if (level >= 4)
             if (!player->HasSpell(45902)) player->learnSpell(45902, false); // Blood Strike R1

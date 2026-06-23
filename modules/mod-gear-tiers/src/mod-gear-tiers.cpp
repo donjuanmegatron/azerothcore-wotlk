@@ -49,9 +49,12 @@
 #include "ObjectMgr.h"
 #include "Log.h"
 #include "Random.h"
+#include "DBCStores.h"
+#include "QuestDef.h"
 #include <sstream>
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 using namespace Acore::ChatCommands;
 
@@ -572,7 +575,17 @@ static bool TryApplyLootTier(Player* player, Item* item, bool& outPendingRestart
     uint32 enchEntry = cacheIt->second.enchantedEntry;
     uint32 epicEntry = cacheIt->second.epicEntry;
 
-    uint8 rolledTier = RollTierForQuality(proto->Quality);
+    uint8 rolledTier;
+    Map* map = player->GetMap();
+    if (map && map->IsRaid())
+    {
+        // Raid gear: flat 80% Epic / 20% Enchanted (no Normal). "All raid gear 80/20."
+        rolledTier = (urand(0, 99) < 20) ? TIER_ENCHANTED : TIER_EPIC;
+    }
+    else
+    {
+        rolledTier = RollTierForQuality(proto->Quality);
+    }
 
     // Normal = nothing to do
     if (rolledTier == TIER_NORMAL)
@@ -644,10 +657,12 @@ public:
     {
         static ChatCommandTable armoryTable =
         {
-            { "designate", HandleSetEntry, SEC_PLAYER, Console::No },
-            { "clear",     HandleClear,    SEC_PLAYER, Console::No },
-            { "status",    HandleStatus,   SEC_PLAYER, Console::No },
-            { "roll",      HandleGearRoll, SEC_PLAYER, Console::No }
+            { "designate",  HandleSetEntry,   SEC_PLAYER,      Console::No  },
+            { "clear",      HandleClear,      SEC_PLAYER,      Console::No  },
+            { "status",     HandleStatus,     SEC_PLAYER,      Console::No  },
+            { "roll",         HandleGearRoll,     SEC_PLAYER,      Console::No  },
+            { "prepraids",    HandlePrepRaids,    SEC_GAMEMASTER,  Console::Yes },
+            { "prepdungeons", HandlePrepDungeons, SEC_GAMEMASTER,  Console::Yes }
         };
         static ChatCommandTable commandTable =
         {
@@ -835,6 +850,233 @@ public:
 
         return true;
     }
+
+    // .armoryslot prepraids — GM-only, console-safe.
+    // Pre-creates Enchanted + Epic variants for every equippable gear item
+    // that can drop in any raid instance (via creature_loot_template and
+    // reference_loot_template).  Run once after adding raid loot tables.
+    // A server restart is required after this command for new variants to
+    // be live in ObjectMgr and TryApplyLootTier's cache.
+    static bool HandlePrepRaids(ChatHandler* handler)
+    {
+        // ------------------------------------------------------------------
+        // Step 1 — Build the set of raid map IDs from the DBC store.
+        // ------------------------------------------------------------------
+        std::set<uint32> raidMaps;
+        for (uint32 i = 0; i < sMapStore.GetNumRows(); ++i)
+        {
+            if (MapEntry const* me = sMapStore.LookupEntry(i))
+                if (me->IsRaid())
+                    raidMaps.insert(me->MapID);
+        }
+
+        if (raidMaps.empty())
+        {
+            handler->SendSysMessage("[Gear Prep] No raid maps found in DBC store.");
+            return true;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 2 — Build the IN (...) clause.
+        // ------------------------------------------------------------------
+        std::ostringstream mapList;
+        bool firstMap = true;
+        for (uint32 mid : raidMaps)
+        {
+            if (!firstMap) mapList << ",";
+            mapList << mid;
+            firstMap = false;
+        }
+        std::string mapInClause = mapList.str();
+
+        // ------------------------------------------------------------------
+        // Step 3 — Query DISTINCT equippable gear base entries from raid loot
+        //           tables (direct loot + reference loot UNION).
+        // ------------------------------------------------------------------
+        std::ostringstream querySS;
+        querySS <<
+            "SELECT DISTINCT it.entry "
+            "FROM creature c "
+            "JOIN creature_loot_template l ON l.Entry = c.id1 "
+            "JOIN item_template it ON it.entry = l.Item "
+            "WHERE c.map IN (" << mapInClause << ") "
+            "  AND l.Reference = 0 "
+            "  AND it.class IN (2,4) "
+            "  AND it.InventoryType > 0 "
+            "  AND it.Quality BETWEEN 2 AND 4 "
+            "  AND it.entry < " << SANCTUM_ENTRY_MIN <<
+            " UNION "
+            "SELECT DISTINCT it.entry "
+            "FROM creature c "
+            "JOIN creature_loot_template l ON l.Entry = c.id1 AND l.Reference > 0 "
+            "JOIN reference_loot_template r ON r.Entry = l.Reference "
+            "JOIN item_template it ON it.entry = r.Item "
+            "WHERE c.map IN (" << mapInClause << ") "
+            "  AND it.class IN (2,4) "
+            "  AND it.InventoryType > 0 "
+            "  AND it.Quality BETWEEN 2 AND 4 "
+            "  AND it.entry < " << SANCTUM_ENTRY_MIN;
+
+        QueryResult result = WorldDatabase.Query(querySS.str());
+
+        if (!result)
+        {
+            handler->PSendSysMessage("[Gear Prep] No qualifying raid gear found in loot tables for {} raid map(s). "
+                "Nothing to create.", static_cast<uint32>(raidMaps.size()));
+            return true;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 4 — Iterate results; call GetOrCreateVariants for each entry.
+        // ------------------------------------------------------------------
+        uint32 totalFound    = 0;
+        uint32 newlyCreated  = 0;
+        uint32 alreadyExisted = 0;
+
+        do
+        {
+            uint32 baseEntry = (*result)[0].Get<uint32>();
+            ++totalFound;
+
+            // Check if variants already exist (avoid redundant DB work)
+            QueryResult existing = WorldDatabase.Query(
+                "SELECT enchanted_entry, epic_entry FROM sanctum_item_variants WHERE base_entry = {}",
+                baseEntry);
+            if (existing)
+            {
+                ++alreadyExisted;
+                continue;
+            }
+
+            // GetOrCreateVariants logs on missing ObjectMgr entry and returns {} — safe to call
+            ItemVariants v = GetOrCreateVariants(baseEntry);
+            if (v.valid)
+                ++newlyCreated;
+
+        } while (result->NextRow());
+
+        // ------------------------------------------------------------------
+        // Step 5 — Summary message.
+        // ------------------------------------------------------------------
+        handler->PSendSysMessage(
+            "[Gear Prep] Raid loot scan complete. "
+            "Maps scanned: {}  |  Items found: {}  |  Variants created: {}  |  Already existed: {}. "
+            "RESTART REQUIRED to load new variants into memory.",
+            static_cast<uint32>(raidMaps.size()), totalFound, newlyCreated, alreadyExisted);
+
+        LOG_INFO("module",
+            "[mod-gear-tiers] HandlePrepRaids: {} raid maps, {} items found, {} variants created, {} already existed. Restart required.",
+            static_cast<uint32>(raidMaps.size()), totalFound, newlyCreated, alreadyExisted);
+
+        return true;
+    }
+
+    // .armoryslot prepdungeons — GM-only, console-safe.
+    // Same as prepraids but for 5-man DUNGEON maps (instance, non-raid).
+    // Dungeon loot tiers via the EXISTING quality-based roll (green 70/25/5,
+    // blue 60/30/10, epic 0/20/80) — no roll override. This command only
+    // pre-creates the Enchanted/Epic variants so dungeon drops have something
+    // to tier into. Run once; RESTART required to load variants into memory.
+    static bool HandlePrepDungeons(ChatHandler* handler)
+    {
+        // Step 1 — collect 5-man dungeon map IDs (instance, not raid).
+        std::set<uint32> dungeonMaps;
+        for (uint32 i = 0; i < sMapStore.GetNumRows(); ++i)
+        {
+            if (MapEntry const* me = sMapStore.LookupEntry(i))
+                if (me->IsDungeon() && !me->IsRaid())
+                    dungeonMaps.insert(me->MapID);
+        }
+
+        if (dungeonMaps.empty())
+        {
+            handler->SendSysMessage("[Gear Prep] No dungeon maps found in DBC store.");
+            return true;
+        }
+
+        // Step 2 — build the IN (...) clause.
+        std::ostringstream mapList;
+        bool firstMap = true;
+        for (uint32 mid : dungeonMaps)
+        {
+            if (!firstMap) mapList << ",";
+            mapList << mid;
+            firstMap = false;
+        }
+        std::string mapInClause = mapList.str();
+
+        // Step 3 — DISTINCT equippable gear from dungeon loot (direct + reference).
+        std::ostringstream querySS;
+        querySS <<
+            "SELECT DISTINCT it.entry "
+            "FROM creature c "
+            "JOIN creature_loot_template l ON l.Entry = c.id1 "
+            "JOIN item_template it ON it.entry = l.Item "
+            "WHERE c.map IN (" << mapInClause << ") "
+            "  AND l.Reference = 0 "
+            "  AND it.class IN (2,4) "
+            "  AND it.InventoryType > 0 "
+            "  AND it.Quality BETWEEN 2 AND 4 "
+            "  AND it.entry < " << SANCTUM_ENTRY_MIN <<
+            " UNION "
+            "SELECT DISTINCT it.entry "
+            "FROM creature c "
+            "JOIN creature_loot_template l ON l.Entry = c.id1 AND l.Reference > 0 "
+            "JOIN reference_loot_template r ON r.Entry = l.Reference "
+            "JOIN item_template it ON it.entry = r.Item "
+            "WHERE c.map IN (" << mapInClause << ") "
+            "  AND it.class IN (2,4) "
+            "  AND it.InventoryType > 0 "
+            "  AND it.Quality BETWEEN 2 AND 4 "
+            "  AND it.entry < " << SANCTUM_ENTRY_MIN;
+
+        QueryResult result = WorldDatabase.Query(querySS.str());
+
+        if (!result)
+        {
+            handler->PSendSysMessage("[Gear Prep] No qualifying dungeon gear found in loot tables for {} dungeon map(s). "
+                "Nothing to create.", static_cast<uint32>(dungeonMaps.size()));
+            return true;
+        }
+
+        // Step 4 — create variants for each.
+        uint32 totalFound     = 0;
+        uint32 newlyCreated   = 0;
+        uint32 alreadyExisted = 0;
+
+        do
+        {
+            uint32 baseEntry = (*result)[0].Get<uint32>();
+            ++totalFound;
+
+            QueryResult existing = WorldDatabase.Query(
+                "SELECT enchanted_entry, epic_entry FROM sanctum_item_variants WHERE base_entry = {}",
+                baseEntry);
+            if (existing)
+            {
+                ++alreadyExisted;
+                continue;
+            }
+
+            ItemVariants v = GetOrCreateVariants(baseEntry);
+            if (v.valid)
+                ++newlyCreated;
+
+        } while (result->NextRow());
+
+        // Step 5 — summary.
+        handler->PSendSysMessage(
+            "[Gear Prep] Dungeon loot scan complete. "
+            "Maps scanned: {}  |  Items found: {}  |  Variants created: {}  |  Already existed: {}. "
+            "RESTART REQUIRED to load new variants into memory.",
+            static_cast<uint32>(dungeonMaps.size()), totalFound, newlyCreated, alreadyExisted);
+
+        LOG_INFO("module",
+            "[mod-gear-tiers] HandlePrepDungeons: {} dungeon maps, {} items found, {} variants created, {} already existed. Restart required.",
+            static_cast<uint32>(dungeonMaps.size()), totalFound, newlyCreated, alreadyExisted);
+
+        return true;
+    }
 };
 
 // ===========================================================================
@@ -1010,6 +1252,99 @@ public:
         bool pending = false;
         TryApplyLootTier(player, item, pending);
         // No need to message for pending — .gear roll can be used retroactively after restart.
+    }
+
+    // Fires at the end of Player::RewardQuest, after reward items are already stored
+    // (and TryApplyLootTier may have already run on them via OnPlayerStoreNewItem).
+    // For any EPIC-quality gear reward in the quest we guarantee the player ends up
+    // holding the Epic variant — not the base or the Enchanted variant that a bad roll
+    // may have produced.  Non-epic quest rewards are left alone.
+    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
+    {
+        if (!player || !quest)
+            return;
+
+        // Build a combined list: fixed rewards first, then choice rewards.
+        // QuestDef.h: QUEST_REWARDS_COUNT = 4, QUEST_REWARD_CHOICES_COUNT = 6
+        // Members: RewardItemId[QUEST_REWARDS_COUNT], RewardChoiceItemId[QUEST_REWARD_CHOICES_COUNT]
+        uint32 rewardEntries[QUEST_REWARDS_COUNT + QUEST_REWARD_CHOICES_COUNT];
+        uint32 count = 0;
+        for (uint32 i = 0; i < QUEST_REWARDS_COUNT; ++i)
+            rewardEntries[count++] = quest->RewardItemId[i];
+        for (uint32 i = 0; i < QUEST_REWARD_CHOICES_COUNT; ++i)
+            rewardEntries[count++] = quest->RewardChoiceItemId[i];
+
+        for (uint32 i = 0; i < count; ++i)
+        {
+            uint32 baseEntry = rewardEntries[i];
+            if (!baseEntry)
+                continue;
+
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(baseEntry);
+            if (!proto)
+                continue;
+
+            // Only force Epic quality turn-ins to Epic.  Lower-quality rewards keep
+            // whatever tier TryApplyLootTier already assigned them.
+            if (proto->Quality != 4) // 4 = ITEM_QUALITY_EPIC
+                continue;
+
+            if (!ShouldRollTier(proto))
+                continue;
+
+            // Look up variants from the in-memory cache.
+            auto cacheIt = g_variantCache.find(baseEntry);
+            if (cacheIt == g_variantCache.end() || !cacheIt->second.valid)
+                continue;
+
+            uint32 enchEntry = cacheIt->second.enchantedEntry;
+            uint32 epicEntry = cacheIt->second.epicEntry;
+
+            if (!epicEntry || !sObjectMgr->GetItemTemplate(epicEntry))
+                continue;
+
+            // If the player already holds the Epic variant, nothing to do.
+            if (player->HasItemCount(epicEntry, 1, false))
+                continue;
+
+            // Check whether the player is holding the base or the Enchanted variant
+            // (the loot hook may have swapped base → enchantedEntry on a bad roll).
+            uint32 wrongEntry = 0;
+            if (baseEntry && player->HasItemCount(baseEntry, 1, false))
+                wrongEntry = baseEntry;
+            else if (enchEntry && player->HasItemCount(enchEntry, 1, false))
+                wrongEntry = enchEntry;
+
+            if (!wrongEntry)
+                continue;
+
+            // Swap wrongEntry out and give the Epic variant.
+            player->DestroyItemCount(wrongEntry, 1, true, false);
+
+            ItemPosCountVec dest;
+            if (player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, epicEntry, 1) == EQUIP_ERR_OK)
+            {
+                Item* ni = player->StoreNewItem(dest, epicEntry, true);
+                if (ni)
+                {
+                    ni->SetBinding(true);
+                    ni->SetState(ITEM_CHANGED, player);
+                    player->SendNewItem(ni, 1, false, false);
+                }
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffFFD700[Gear]|r Turn-in reward set to |cffa335eeEpic|r quality.");
+
+                LOG_INFO("module",
+                    "[mod-gear-tiers] OnPlayerCompleteQuest: {} quest reward entry {} forced to Epic (entry {})",
+                    player->GetName(), baseEntry, epicEntry);
+            }
+            else
+            {
+                LOG_WARN("module",
+                    "[mod-gear-tiers] OnPlayerCompleteQuest: {} could not store Epic variant {} — inventory full?",
+                    player->GetName(), epicEntry);
+            }
+        }
     }
 };
 

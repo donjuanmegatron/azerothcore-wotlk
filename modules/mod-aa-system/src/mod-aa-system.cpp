@@ -50,6 +50,8 @@
 #include "SharedDefines.h"
 #include "Creature.h"
 #include "Item.h"
+#include "SpellMgr.h"
+#include "SpellInfo.h"
 #include <unordered_map>
 #include <map>
 #include <sstream>
@@ -141,14 +143,19 @@ static uint8 GetAAMaxRank(uint32 aaId)
 {
     static const std::unordered_map<uint32, uint8> s_max = {
         // maxRank 1
-        {2019,1},{2110,1},{2112,1},{2204,1},
+        {2019,1},{2110,1},{2112,1},{2113,1},{2204,1},
         {3104,1},{3201,1},{3202,1},{3204,1},
         {4104,1},{4204,1},{4304,1},
         {5002,1},
         // 5018 Unending Fury — SCRAPPED (Tier 1)
         {5207,1},{5208,1},{5218,1},{5236,1},
         {5303,1},{5312,1},{5321,1},{5328,1},
-        {5404,1},{5426,1},
+        {5404,1},
+        // 5424 Sanctification — SCRAPPED (Tier 1)
+        // 5426 Wake of Tranquility — SCRAPPED (Tier 1)
+        // 5435 Disciple of C'Thun — SCRAPPED (Tier 1)
+        // 5436 Wandering Spirits — SCRAPPED (Tier 1)
+        // 5442 Improved Lightwell — SCRAPPED (Tier 1)
         {5518,1},{5519,1},{5520,1},{5522,1},
         {5731,1},
         {5828,1},
@@ -193,9 +200,17 @@ static uint8 GetAARankCost(uint32 aaId, uint8 nextRank)
         {5218,{3,0,0,0}},{5236,{4,0,0,0}},{5240,{2,3,4,0}},{5246,{2,3,4,0}},
         {5303,{5,0,0,0}},{5312,{3,0,0,0}},{5314,{2,3,4,0}},{5317,{2,3,4,0}},
         {5321,{3,0,0,0}},{5328,{4,0,0,0}},{5333,{2,3,4,0}},{5340,{2,3,4,0}},
-        {5401,{2,3,4,0}},{5403,{2,3,4,0}},{5404,{5,0,0,0}},{5412,{2,3,4,0}},
-        {5421,{2,3,4,0}},{5426,{3,0,0,0}},{5431,{2,3,4,0}},{5435,{2,3,4,0}},
-        {5443,{2,3,4,0}},{5514,{2,3,4,0}},{5518,{5,0,0,0}},{5519,{5,0,0,0}},
+        // 2113 Cleanse Curse (General-Defensive active)
+        {2113,{5,0,0,0}},
+        // Priest — non-default costs
+        {5401,{2,3,4,0}},  // Twinheal R1=2 R2=3 R3=4
+        {5403,{2,3,4,0}},  // Channeling the Divine R1=2 R2=3 R3=4
+        {5404,{5,0,0,0}},  // Forceful Rejuvenation ONE-SHOT 5pt
+        {5412,{2,3,4,0}},  // Force of Will R1=2 R2=3 R3=4
+        {5421,{2,3,4,0}},  // Bestow Divine Aura R1=2 R2=3 R3=4
+        {5431,{2,3,4,0}},  // Harbinger R1=2 R2=3 R3=4
+        // 5424/5426/5435/5436/5442 SCRAPPED — no entry needed
+        {5443,{2,3,4,0}},  // Divine Purpose R1=2 R2=3 R3=4{5514,{2,3,4,0}},{5518,{5,0,0,0}},{5519,{5,0,0,0}},
         {5520,{4,0,0,0}},{5522,{4,0,0,0}},{5621,{3,5,8,0}},{5704,{2,3,4,0}},
         {5731,{5,0,0,0}},{5738,{2,3,4,0}},
         {5816,{2,3,4,0}},{5817,{2,3,4,0}},
@@ -261,6 +276,20 @@ static void ApplyAAStat(Player* player, uint32 aaId, uint8 rankDelta, bool apply
             };
             for (uint32 m : ccMechanics)
                 player->ApplySpellImmune(0, IMMUNITY_MECHANIC, m, apply);
+
+            // Mechanic immunity alone MISSES crowd control that lands via the aura
+            // type without a CC mechanic flag (e.g. ZG "Whirling Trip" 24048 stuns
+            // with no MECHANIC_STUN). Also grant IMMUNITY_STATE for every loss-of-
+            // control aura type so ALL stuns/fears/roots/etc. are blocked regardless
+            // of how the spell is defined.
+            static const uint32 ccAuraTypes[] = {
+                SPELL_AURA_MOD_STUN, SPELL_AURA_MOD_FEAR, SPELL_AURA_MOD_CONFUSE,
+                SPELL_AURA_MOD_ROOT, SPELL_AURA_MOD_SILENCE, SPELL_AURA_MOD_CHARM,
+                SPELL_AURA_MOD_POSSESS, SPELL_AURA_MOD_PACIFY, SPELL_AURA_MOD_PACIFY_SILENCE,
+                SPELL_AURA_MOD_DECREASE_SPEED, SPELL_AURA_TRANSFORM
+            };
+            for (uint32 a : ccAuraTypes)
+                player->ApplySpellImmune(0, IMMUNITY_STATE, a, apply);
             break;
         }
         case AA_G_SANCTUM_ESSENCE:  // +20 to all primary stats per rank
@@ -355,6 +384,14 @@ static void ApplyAAStat(Player* player, uint32 aaId, uint8 rankDelta, bool apply
             float bonus = 40.0f * rankDelta;
             player->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT, TOTAL_VALUE, bonus, apply);
             player->UpdateAllStats();
+            break;
+        }
+        case AA_ROG_AMBIDEXTERITY:      // +8%/16%/25% off-hand hit (≈30 melee hit rating per rank)
+        {
+            // Off-hand hit proxy: +30 melee hit rating per rank delta.
+            // ~1% hit at L80 per 32.8 hit rating; 30 ≈ ~0.9% per rank, ×3 ranks ≈ +2.7% hit total.
+            // The off-hand damage reduction is handled in aa_class.cpp ModifyMeleeDamage.
+            player->ApplyRatingMod(CR_HIT_MELEE, 30 * (int32)rankDelta, apply);
             break;
         }
         case AA_HUN_ENDLESS_QUIVER:     // +5%/+10%/+15% ranged attack speed (164 rating ≈ 5% at L80)
@@ -816,6 +853,9 @@ static const char* GetAAName(uint32 aaId)
         case AA_ROG_POISON_MASTER:    return "Poison Master";
         case AA_ROG_SHADOWSTEP_MASTERY: return "Shadowstep Mastery";
         case AA_ROG_CHAOTIC_STAB:     return "Chaotic Stab";
+        case AA_ROG_LEECHING_TOXINS:  return "Leeching Toxins";
+        // General-Defensive (2113)
+        case AA_G_CLEANSE_CURSE:      return "Cleanse Curse";
         // Priest
         case AA_PRI_TWINHEAL:              return "Twinheal";
         case AA_PRI_GIFT_OF_MANA:          return "Gift of Mana";
@@ -1049,6 +1089,34 @@ static const char* GetAADesc(uint32 aaId)
         case AA_HUN_GO_FOR_THE_THROAT:    return "Auto-attacks 10%/20%/30% chance: pet bites for 40/60/80% of the hit";
         case AA_P_BLOODSCENT:             return "+10%/+20%/+30% pet damage to targets below 35% HP";
         case AA_P_MENDING_BOND:           return "Pet/guardian regens 2%/4%/6% max HP per second while below 50% HP";
+        // Priest AAs
+        case AA_PRI_TWINHEAL:             return "Heal spells 5%/10%/15% chance to fire twice";
+        case AA_PRI_GIFT_OF_MANA:         return "Heals 5%/10%/15% chance to make next spell cost 0 mana";
+        case AA_PRI_CHANNELING_DIVINE:    return "Next 5/8/12 heals fire twice. 3min CD";
+        case AA_PRI_FORCEFUL_REJUVENATION:return "ONE-SHOT: Instantly reset all spell cooldowns. 10min CD";
+        case AA_PRI_YAULP:                return "Melee speed +15/25/40% and dmg +10/20/30% for 30s. 2min CD";
+        case AA_PRI_CELESTIAL_HAMMER:     return "Conjure hammer: 3 holy strikes, each 80/110/150%% SP. 2min CD";
+        case AA_PRI_CELESTIAL_REGEN:      return "Free HoT: 5/8/12%% max HP per tick over 30s. 5min CD";
+        case AA_PRI_MARK_OF_KARNA:        return "Holy/shadow spell marks target: +8/15/25%% dmg from you for 15s";
+        case AA_PRI_TURN_UNDEAD:          return "Holy spells vs undead below 35%% HP: 5/10/20%% instant kill chance";
+        case AA_PRI_RADIANT_CURE:         return "Dispel also removes disease+poison; R2: +curse; R3: AoE";
+        case AA_PRI_DIVINE_ARBITRATION:   return "Equalize HP%% between you and active pets/guardians. 3/2/1.5min CD";
+        case AA_PRI_CELESTIAL_BARRIER:    return "Absorb shield = 30/50/75%% SP for 10s. 60s CD";
+        case AA_PRI_BESTOW_DIVINE_AURA:   return "Target invulnerable for 3/5/8s. 5min CD";
+        case AA_PRI_TOUCH_OF_THE_DIVINE:  return "Attackers take 15/25/40%% SP as holy on each melee hit";
+        case AA_PRI_IMP_POWER_INFUSION:   return "+5/8/12%% all magic damage. (PI CD-reduction half stubbed)";
+        case AA_PRI_SPREADING_MISERY:     return "SW:P/VT/DP jumps to nearest enemy on kill; R2: +10%% shadow dmg";
+        case AA_PRI_CHAIN_REACTION:       return "Mind Blast 10/20/30%% chance: 75%% to random nearby enemy";
+        case AA_PRI_HARBINGER:            return "SW:Death hits all in 6/8/10 yd; +10/20/30%% dmg";
+        case AA_PRI_ENCROACHING_DARKNESS: return "SW:P/VT/DP +5/10/15%% dmg per tick";
+        case AA_PRI_INSPIRE:              return "After empowered shadow spell: all active pets +8/15/25%% dmg for 10s";
+        // Priest deferred/stubbed
+        case AA_PRI_PROLONGED_SALVE:      return "Phase 2+ — HoT duration extension (hook not available)";
+        case AA_PRI_QUICK_BUFF:           return "Next 3/5/7 spells at half cast time — approximated as haste burst. 90s CD";
+        case AA_PRI_PERSISTENT_CASTING:   return "Phase 2+ — cast-through-interrupt (hook not available)";
+        case AA_PRI_LASTING_RITES:        return "Phase 2+ — long self-buff extension (aura-apply hook not available)";
+        case AA_PRI_PERSISTENCE:          return "Phase 2+ — DoT-expiry burst (DoT-expiry hook not available)";
+        case AA_PRI_SHADOW_ERUPTION:      return "Phase 2+ — requires Persistence (not yet built)";
         default:                          return "Phase 2+ mechanic — tracked, not yet active";
     }
 }
@@ -1565,6 +1633,61 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Chaotic Stab (AA 5341) — strip Backstab positional + weapon requirements
+//
+// Backstab in 3.3.5a is gated by:
+//   1. SPELL_ATTR0_CU_REQ_CASTER_BEHIND_TARGET — custom attribute set by AC core at
+//      startup via SpellInfo::_LoadSpellCustomAttr; the Spell.cpp CheckCast checks this
+//      and returns SPELL_FAILED_NOT_BEHIND if target is in front.
+//   2. EquippedItemClass = 2 (weapon) with EquippedItemSubClassMask = 0x4 (dagger) — the
+//      core CheckCast returns SPELL_FAILED_EQUIPPED_ITEM_CLASS if no dagger is equipped.
+//
+// Since Sanctum is solo, a global strip at startup is the cleanest solution.
+// Players without Chaotic Stab are unaffected mechanically (the damage reduction for
+// front attacks is enforced in aa_class.cpp ModifySpellDamageTaken, not here).
+// ---------------------------------------------------------------------------
+class mod_aa_chaotic_stab_worldscript : public WorldScript
+{
+public:
+    mod_aa_chaotic_stab_worldscript() : WorldScript("mod_aa_chaotic_stab_worldscript") {}
+
+    // OnStartup fires after sSpellMgr is fully loaded (same timing mod-multiclass
+    // uses for its spell strips). OnAfterConfigLoad runs too early — the spell
+    // store isn't populated yet, so GetSpellInfo() would return null for all IDs.
+    void OnStartup() override
+    {
+        // All WotLK Backstab spell IDs (all ranks)
+        static const uint32 backstabIds[] = { 53, 2589, 2590, 2591, 8721, 11279, 11280, 11281, 25300, 26863, 48656, 48657 };
+
+        uint32 stripped = 0;
+        for (uint32 spellId : backstabIds)
+        {
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+            if (!si)
+                continue;
+
+            // const_cast is the same pattern used by AC's StripDruidForms and other
+            // startup-time spell info modifications in 3.3.5a modules.
+            SpellInfo* info = const_cast<SpellInfo*>(si);
+
+            // 1. Strip behind-target requirement
+            info->AttributesCu &= ~uint32(SPELL_ATTR0_CU_REQ_CASTER_BEHIND_TARGET);
+
+            // 2. Strip dagger-only weapon class requirement
+            if (info->EquippedItemClass == 2 /* ITEM_CLASS_WEAPON */)
+            {
+                info->EquippedItemClass          = -1;
+                info->EquippedItemSubClassMask   = 0;
+                info->EquippedItemInventoryTypeMask = 0;
+            }
+            ++stripped;
+        }
+        if (stripped > 0)
+            LOG_INFO("server.loading", "[mod-aa-system] Chaotic Stab: stripped positional + weapon requirements from {} Backstab spells.", stripped);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 void AddSC_mod_aa_system()
@@ -1572,4 +1695,5 @@ void AddSC_mod_aa_system()
     LOG_INFO("server.loading", "[mod-aa-system] Module loaded.");
     new mod_aa_system_commandscript();
     new mod_aa_system_playerscript();
+    new mod_aa_chaotic_stab_worldscript();
 }

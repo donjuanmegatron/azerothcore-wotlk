@@ -71,13 +71,17 @@ enum Emotes
 
 enum HitCounter
 {
-    HITCOUNTER_SLOW             = 100,
-    HITCOUNTER_SLOW_MORE        = 150,
-    HITCOUNTER_FREEZE           = 200,
+    // Sanctum (solo): scaled from raid-size (100/150/200 frost hits, 50/100/150 melee)
+    // down to solo range. The original needs ~40 players spraying Frost to hit 200 frost
+    // hits within the freeze window, then 150 melee hits to explode — impossible solo.
+    // The full Slow->Freeze->Shatter->Explode dance is unchanged; just reachable solo.
+    HITCOUNTER_SLOW             = 8,
+    HITCOUNTER_SLOW_MORE        = 12,
+    HITCOUNTER_FREEZE           = 15,
 
-    HITCOUNTER_CRACK            = 50,
-    HITCOUNTER_SHATTER          = 100,
-    HITCOUNTER_EXPLODE          = 150,
+    HITCOUNTER_CRACK            = 5,
+    HITCOUNTER_SHATTER          = 10,
+    HITCOUNTER_EXPLODE          = 15,
 };
 
 enum MovePoints

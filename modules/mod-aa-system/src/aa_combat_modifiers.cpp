@@ -44,6 +44,7 @@
 #include "ScriptMgr.h"
 #include "Player.h"
 #include "Unit.h"
+#include "Creature.h"
 #include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -127,6 +128,37 @@ namespace
     std::unordered_map<uint32, HardeningState> g_hardening;
     std::unordered_map<uint32, HindsightState> g_hindsight;
     std::unordered_map<uint32, uint32>         g_reanimTick;
+
+    // ── Rogue: Puncture (5311) — stacking armor-shred debuff ─────────────────
+    // attackerLow → victimLow → {stacks, expireMs}
+    struct PunctureEntry { uint8 stacks = 0; uint32 expireMs = 0; };
+    std::unordered_map<uint32, std::unordered_map<uint32, PunctureEntry>> g_puncture;
+
+    // ── Rogue: Assassin's Mark (5315) — timed dmg bonus on a specific target ──
+    struct AMark { uint32 targetLow; uint32 untilMs; uint8 rank; };
+    std::unordered_map<uint32, AMark> g_assassinsMark;
+
+    // ── Priest: Mark of Karna (5414) — like Assassin's Mark but triggered by holy/shadow spell cast ──
+    struct KarnaMark { uint32 targetLow; uint32 untilMs; uint8 rank; };
+    std::unordered_map<uint32, KarnaMark> g_markOfKarna;
+
+    // ── Priest: Celestial Barrier (5420) — active absorb shield ──────────────
+    struct CelestialBarrier { int32 absorb = 0; uint32 expireMs = 0; };
+    std::unordered_map<uint32, CelestialBarrier> g_celestialBarrier;
+
+    // ── Priest: Bestow Divine Aura (5421) — large absorb = effective invuln ──
+    // Stored as CelestialBarrier in same map with a huge absorb value.
+
+    // ── Priest: Twinheal (5401) — per-cast guard to prevent double-trigger ───
+    // Value = getMSTime() stamp of last heal double; simple cooldown per cast.
+    std::unordered_map<uint32, uint32> g_twinHealIcd;
+
+    // ── Priest: Channeling the Divine (5403) — double-heal charges ───────────
+    struct ChannelingState { uint8 charges = 0; };
+    std::unordered_map<uint32, ChannelingState> g_channelingDivine;
+
+    // ── Priest: Gift of Mana (5402) — "next spell free" flag ─────────────────
+    std::unordered_map<uint32, bool> g_giftOfMana;
 
     // Recursion guard for Twincast
     bool g_inTwincast = false;
@@ -218,6 +250,16 @@ namespace
         g_divineShieldWasActive.erase(guid);
         g_radianceStacks.erase(guid);
         g_crusaderMightIcd.erase(guid);
+        // Rogue
+        g_puncture.erase(guid);
+        for (auto& [ag, vm] : g_puncture) vm.erase(guid);
+        g_assassinsMark.erase(guid);
+        // Priest
+        g_markOfKarna.erase(guid);
+        g_celestialBarrier.erase(guid);
+        g_twinHealIcd.erase(guid);
+        g_channelingDivine.erase(guid);
+        g_giftOfMana.erase(guid);
     }
 }
 
@@ -268,6 +310,67 @@ void SanctumAA_AddRadianceStack(uint32 guid)
 {
     auto& stacks = g_radianceStacks[guid];
     if (stacks < 5) ++stacks;
+}
+
+// ---------------------------------------------------------------------------
+// Exported for aa_actives.cpp — Assassin's Mark state management
+// ---------------------------------------------------------------------------
+void SanctumAA_SetAssassinsMark(uint32 playerGuid, uint32 targetLow, uint32 untilMs, uint8 rank)
+{
+    g_assassinsMark[playerGuid] = { targetLow, untilMs, rank };
+}
+
+bool SanctumAA_AssassinsMarkBonus(uint32 playerGuid, Unit* target, float& outPct)
+{
+    if (!target) return false;
+    auto it = g_assassinsMark.find(playerGuid);
+    if (it == g_assassinsMark.end()) return false;
+    if (getMSTime() > it->second.untilMs) return false;
+    if (target->GetGUID().GetCounter() != it->second.targetLow) return false;
+    static const float b[] = { 0.0f, 0.10f, 0.18f, 0.28f };
+    outPct = b[std::min<uint8>(it->second.rank, 3)];
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Exported for aa_actives.cpp — Priest: Mark of Karna setter
+// ---------------------------------------------------------------------------
+void SanctumAA_SetMarkOfKarna(uint32 playerGuid, uint32 targetLow, uint32 untilMs, uint8 rank)
+{
+    g_markOfKarna[playerGuid] = { targetLow, untilMs, rank };
+}
+
+// ---------------------------------------------------------------------------
+// Exported for aa_actives.cpp — Priest: Celestial Barrier absorb setter
+// ---------------------------------------------------------------------------
+void SanctumAA_SetCelestialBarrier(uint32 guid, int32 amount, uint32 durationMs)
+{
+    g_celestialBarrier[guid] = { amount, getMSTime() + durationMs };
+}
+
+// ---------------------------------------------------------------------------
+// Exported for aa_actives.cpp — Priest: Channeling the Divine charge setter
+// ---------------------------------------------------------------------------
+void SanctumAA_SetChannelingDivineCharges(uint32 guid, uint8 charges)
+{
+    g_channelingDivine[guid].charges = charges;
+}
+
+// ---------------------------------------------------------------------------
+// Exported for aa_actives.cpp — Priest: Gift of Mana flag setter
+// (set by aa_actives_player OnPlayerSpellCast to grant the refund)
+// ---------------------------------------------------------------------------
+void SanctumAA_SetGiftOfMana(uint32 guid, bool val)
+{
+    g_giftOfMana[guid] = val;
+}
+
+bool SanctumAA_ConsumeGiftOfMana(uint32 guid)
+{
+    auto it = g_giftOfMana.find(guid);
+    if (it == g_giftOfMana.end() || !it->second) return false;
+    it->second = false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +735,33 @@ public:
                 }
             }
 
+            // Puncture (5311) — stacking armor-shred: +1/2/3% damage per stack (cap 5)
+            if (target)
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_PUNCTURE);
+                if (rank > 0)
+                {
+                    uint32 victimGuid = target->GetGUID().GetCounter();
+                    auto&  entry      = g_puncture[guid][victimGuid];
+                    uint32 now        = getMSTime();
+                    if (entry.stacks > 0 && now > entry.expireMs)
+                        entry = PunctureEntry{};
+                    if (entry.stacks < 5)
+                        entry.stacks++;
+                    entry.expireMs = now + 5000u;
+                    static const float perStack[] = { 0.0f, 0.01f, 0.02f, 0.03f };
+                    damage += (uint32)(damage * perStack[Idx<uint8>(rank)] * entry.stacks);
+                }
+            }
+
+            // Assassin's Mark (5315) — melee bonus on marked target
+            if (target)
+            {
+                float amBonus = 0.0f;
+                if (SanctumAA_AssassinsMarkBonus(guid, target, amBonus) && amBonus > 0.0f)
+                    damage += (uint32)(damage * amBonus);
+            }
+
         } // end ATTACKER IS PLAYER
 
         // ── ATTACKER IS PET (owner is player) ──────────────────────────────
@@ -670,6 +800,17 @@ public:
                             int32 healAmt = (int32)(damage * pct[Idx<uint8>(rank)]);
                             if (healAmt > 0)
                                 pOwner->ModifyHealth(healAmt);
+                        }
+                    }
+
+                    // Inspire (5440) — +8/15/25% pet damage for 10s after empowered shadow spell
+                    {
+                        extern bool SanctumAA_InspireActive(uint32 guid, uint8& outRank);
+                        uint8 insRank = 0;
+                        if (SanctumAA_InspireActive(pOwner->GetGUID().GetCounter(), insRank))
+                        {
+                            static const float bonus[] = { 0.0f, 0.08f, 0.15f, 0.25f };
+                            damage += (uint32)(damage * bonus[Idx<uint8>(insRank)]);
                         }
                     }
                 }
@@ -855,6 +996,38 @@ public:
                 }
             }
 
+            // Celestial Barrier (5420) — absorb shield consuming melee damage
+            // Safe to use ModifyHealth here (not a damage call).
+            {
+                auto it = g_celestialBarrier.find(vGuid);
+                if (it != g_celestialBarrier.end() && it->second.absorb > 0 &&
+                    getMSTime() < it->second.expireMs)
+                {
+                    int32 absorbed = std::min((int32)damage, it->second.absorb);
+                    it->second.absorb -= absorbed;
+                    damage = (uint32)((int32)damage - absorbed);
+                    if (damage == 0) damage = 0;
+                    if (it->second.absorb <= 0)
+                        g_celestialBarrier.erase(it);
+                }
+            }
+
+            // Touch of the Divine (5423) — reflect 15/25/40% SP as holy to attacker on each melee hit
+            // Uses SanctumAA_DealVisibleDamage which is safe (not re-entrant through ModifyMeleeDamage).
+            if (attacker && attacker->IsAlive() && damage > 0)
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_PRI_TOUCH_OF_THE_DIVINE);
+                if (rank > 0)
+                {
+                    static const float pct[] = { 0.0f, 0.15f, 0.25f, 0.40f };
+                    int32 sp = player->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_HOLY);
+                    if (sp < 0) sp = 0;
+                    uint32 reflectDmg = (uint32)(sp * pct[Idx<uint8>(rank)]);
+                    if (reflectDmg > 0)
+                        SanctumAA_DealVisibleDamage(player, attacker, reflectDmg, SPELL_SCHOOL_MASK_HOLY);
+                }
+            }
+
         } // end VICTIM IS PLAYER
 
         // ── VICTIM IS PET (owner is player) ────────────────────────────────
@@ -1016,6 +1189,139 @@ public:
                 {
                     static const float bonus[] = { 0.0f, 0.10f, 0.18f, 0.30f };
                     damage += (int32)(damage * bonus[Idx<uint8>(it->second.rank)]);
+                }
+            }
+
+            // Assassin's Mark (5315) — spell/ability damage bonus on marked target
+            if (target)
+            {
+                float amBonus = 0.0f;
+                if (SanctumAA_AssassinsMarkBonus(guid, target, amBonus) && amBonus > 0.0f)
+                    damage += (int32)(damage * amBonus);
+            }
+
+            // ── Mark of Karna (5414) — bonus dmg on marked target ─────────────
+            // Mark is set from OnPlayerSpellCast when a holy/shadow spell is cast.
+            // Bonus is applied once here (only in ModifySpellDamageTaken, NOT in
+            // ModifyMeleeDamage, to mirror Assassin's Mark and avoid double-dip).
+            if (target)
+            {
+                uint32 tLow = target->GetGUID().GetCounter();
+                auto it = g_markOfKarna.find(guid);
+                if (it != g_markOfKarna.end() &&
+                    it->second.targetLow == tLow &&
+                    getMSTime() <= it->second.untilMs)
+                {
+                    static const float bonus[] = { 0.0f, 0.08f, 0.15f, 0.25f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(it->second.rank)]);
+                }
+            }
+
+            // ── Improved Power Infusion (5427) — +5/8/12% bonus to all magic damage ──
+            // Applies to all spell schools. Simple flat multiplier; no PI detection needed
+            // (the PI-CD-reduction half is stubbed — see STUBS below).
+            if (isMagical)
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_PRI_IMP_POWER_INFUSION);
+                if (rank > 0)
+                {
+                    static const float bonus[] = { 0.0f, 0.05f, 0.08f, 0.12f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // ── Harbinger (5431) — SW:Death hits all enemies in 6/8/10 yd + bonus dmg ──
+            // NOTE: SW:Death's self-backlash is an existing mechanic we do NOT touch.
+            // We only amplify the outgoing damage and AoE the full damage+bonus to nearby enemies.
+            // Safe: we use SanctumAA_DealVisibleDamage (not a re-entrant call through ModifySpellDamageTaken).
+            if (target)
+            {
+                static const std::unordered_set<uint32> s_swdeath = { 32379, 32996 };
+                if (s_swdeath.count(spellInfo->Id))
+                {
+                    uint8 rank = SanctumAA::GetRank(player, AA_PRI_HARBINGER);
+                    if (rank > 0)
+                    {
+                        static const float radii[]  = { 0.0f, 6.0f, 8.0f, 10.0f };
+                        static const float bonus[]  = { 0.0f, 0.10f, 0.20f, 0.30f };
+                        float r = radii[Idx<uint8>(rank)];
+                        // Apply the bonus to the primary hit
+                        damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                        // AoE the (bonus-amplified) splash to nearby enemies excluding primary target
+                        uint32 splashDmg = (uint32)std::max(0, damage);
+                        if (splashDmg > 0)
+                        {
+                            std::list<Unit*> nearbyList;
+                            Acore::AnyUnfriendlyUnitInObjectRangeCheck check(player, player, r);
+                            Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(player, nearbyList, check);
+                            Cell::VisitObjects(player, searcher, r);
+                            for (Unit* u : nearbyList)
+                            {
+                                if (!u || u == target || !u->IsAlive()) continue;
+                                SanctumAA_DealVisibleDamage(player, u, splashDmg, SPELL_SCHOOL_MASK_SHADOW);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Chain Reaction (5430) — Mind Blast 10/20/30% chance: 75% to random nearby enemy ──
+            if (target)
+            {
+                static const std::unordered_set<uint32> s_mindblast = {
+                    8092, 10945, 10946, 10947, 25375, 25376, 48126, 48127
+                };
+                if (s_mindblast.count(spellInfo->Id))
+                {
+                    uint8 rank = SanctumAA::GetRank(player, AA_PRI_CHAIN_REACTION);
+                    if (rank > 0 && CheckICD(guid, AA_PRI_CHAIN_REACTION, 500u))
+                    {
+                        static const float chance[] = { 0.0f, 10.0f, 20.0f, 30.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        {
+                            uint32 splashDmg = (uint32)(std::max(0, damage) * 0.75f);
+                            if (splashDmg > 0)
+                            {
+                                // Find a random nearby enemy within 10 yd (not primary target)
+                                std::vector<Unit*> nearbyVec;
+                                std::list<Unit*> nearbyList;
+                                Acore::AnyUnfriendlyUnitInObjectRangeCheck check(player, player, 10.0f);
+                                Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(player, nearbyList, check);
+                                Cell::VisitObjects(player, searcher, 10.0f);
+                                for (Unit* u : nearbyList)
+                                    if (u && u != target && u->IsAlive())
+                                        nearbyVec.push_back(u);
+                                if (!nearbyVec.empty())
+                                {
+                                    uint32 idx = urand(0, (uint32)(nearbyVec.size() - 1));
+                                    SanctumAA_DealVisibleDamage(player, nearbyVec[idx], splashDmg, SPELL_SCHOOL_MASK_SHADOW);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Turn Undead (5416) — Holy spells vs undead <35% HP: lethal chance ──
+            // Mirror of Headshot (aa_class.cpp). Placed here (attacker side, ModifySpellDamageTaken)
+            // rather than aa_class.cpp to avoid double-file conflict. NOT in ModifyMeleeDamage.
+            if (target && target->ToCreature() &&
+                !(target->ToCreature()->isElite() || target->ToCreature()->IsDungeonBoss()))
+            {
+                if (schoolMask & SPELL_SCHOOL_MASK_HOLY)
+                {
+                    Creature const* cr = target->ToCreature();
+                    if (cr && cr->GetCreatureType() == CREATURE_TYPE_UNDEAD &&
+                        target->GetHealthPct() < 35.0f)
+                    {
+                        uint8 rank = SanctumAA::GetRank(player, AA_PRI_TURN_UNDEAD);
+                        if (rank > 0 && CheckICD(guid, AA_PRI_TURN_UNDEAD, 500u))
+                        {
+                            static const float chance[] = { 0.0f, 5.0f, 10.0f, 20.0f };
+                            if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                                damage = (int32)target->GetHealth();
+                        }
+                    }
                 }
             }
 
@@ -1229,6 +1535,21 @@ public:
                 }
             }
 
+            // Celestial Barrier (5420) — also absorbs spell damage (same absorb pool as melee)
+            {
+                auto it = g_celestialBarrier.find(vGuid);
+                if (it != g_celestialBarrier.end() && it->second.absorb > 0 &&
+                    getMSTime() < it->second.expireMs)
+                {
+                    int32 absorbed = std::min((int32)damage, it->second.absorb);
+                    it->second.absorb -= absorbed;
+                    damage -= absorbed;
+                    if (damage < 0) damage = 0;
+                    if (it->second.absorb <= 0)
+                        g_celestialBarrier.erase(it);
+                }
+            }
+
         } // end VICTIM IS PLAYER
     }
 
@@ -1258,6 +1579,39 @@ public:
 
         if (rank > 0)
             damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+
+        // ── Encroaching Darkness (5433) — SW:P/VT/DP +5/10/15% per DoT tick ──
+        // Placed in ModifyPeriodicDamageAurasTick (not ModifySpellDamageTaken) because
+        // periodic ticks are routed through this hook, not the spell-hit hook.
+        {
+            static const std::unordered_set<uint32> s_shadowDots = {
+                // Shadow Word: Pain all ranks
+                589, 594, 970, 992, 2767, 10892, 10893, 25367, 48124, 48125,
+                // Vampiric Touch all ranks
+                34914, 34916, 34917, 48159, 48160,
+                // Devouring Plague all ranks
+                2944, 19276, 19277, 19278, 25467, 48300, 48301
+            };
+            if (s_shadowDots.count(spellInfo->Id))
+            {
+                uint8 eRank = SanctumAA::GetRank(player, AA_PRI_ENCROACHING_DARKNESS);
+                if (eRank > 0)
+                {
+                    static const float eBonus[] = { 0.0f, 0.05f, 0.10f, 0.15f };
+                    damage += (uint32)(damage * eBonus[Idx<uint8>(eRank)]);
+                }
+            }
+        }
+
+        // ── Spreading Misery (5428) R2 — +10% shadow damage on all shadow DoT ticks ──
+        // (Kill-trigger for jumping diseases is in aa_class.cpp OnPlayerCreatureKill)
+        {
+            uint8 smRank = SanctumAA::GetRank(player, AA_PRI_SPREADING_MISERY);
+            if (smRank >= 2 && (schoolMask & SPELL_SCHOOL_MASK_SHADOW))
+            {
+                damage += (uint32)(damage * 0.10f);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1335,6 +1689,48 @@ public:
                     heal += (uint32)(heal * bonus[Idx<uint8>(rank)]);
                 }
             }
+            // ── Twinheal (5401) — 5/10/15% chance to double heal ──────────────
+            // Guarded by a per-GUID 50ms ICD to prevent double-doubling (Twincast interaction).
+            {
+                uint8 rank = SanctumAA::GetRank(hPlayer, AA_PRI_TWINHEAL);
+                if (rank > 0)
+                {
+                    static const float chance[] = { 0.0f, 5.0f, 10.0f, 15.0f };
+                    if (CheckICD(hGuid, AA_PRI_TWINHEAL, 50u) &&
+                        roll_chance_f(chance[Idx<uint8>(rank)]))
+                    {
+                        heal *= 2;
+                    }
+                }
+            }
+
+            // ── Channeling the Divine (5403) — consume a double-heal charge ──
+            {
+                auto it = g_channelingDivine.find(hGuid);
+                if (it != g_channelingDivine.end() && it->second.charges > 0)
+                {
+                    heal *= 2;
+                    --it->second.charges;
+                }
+            }
+
+            // ── Gift of Mana (5402) — 5/10/15% chance to set "next spell free" flag ──
+            {
+                uint8 rank = SanctumAA::GetRank(hPlayer, AA_PRI_GIFT_OF_MANA);
+                if (rank > 0)
+                {
+                    // Only set if the flag isn't already pending (avoid waste)
+                    auto flagIt = g_giftOfMana.find(hGuid);
+                    bool alreadyPending = (flagIt != g_giftOfMana.end() && flagIt->second);
+                    if (!alreadyPending)
+                    {
+                        static const float chance[] = { 0.0f, 5.0f, 10.0f, 15.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                            g_giftOfMana[hGuid] = true;
+                    }
+                }
+            }
+
         } // end HEALER IS PLAYER
 
         // ── TARGET IS PLAYER — incoming heal buffs ─────────────────────────
@@ -1556,6 +1952,8 @@ public:
             victimMap.erase(deadGuid);
         for (auto& [ag, victimMap] : g_drainLife)
             victimMap.erase(deadGuid);
+        for (auto& [ag, victimMap] : g_puncture)
+            victimMap.erase(deadGuid);
 
         if (unit->IsPlayer())
             ClearPlayerState(deadGuid);
@@ -1572,6 +1970,8 @@ public:
         for (auto& [ag, victimMap] : g_devastate)
             victimMap.erase(evadeGuid);
         for (auto& [ag, victimMap] : g_drainLife)
+            victimMap.erase(evadeGuid);
+        for (auto& [ag, victimMap] : g_puncture)
             victimMap.erase(evadeGuid);
     }
 };

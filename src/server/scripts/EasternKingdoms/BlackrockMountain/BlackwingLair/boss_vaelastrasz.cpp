@@ -235,7 +235,12 @@ struct boss_vaelastrasz : public BossAI
                     }
                     else
                     {
-                        me->CastSpell(me->GetVictim(), SPELL_BURNING_ADRENALINE, true);
+                        // Sanctum (solo): the original force-casts Burning Adrenaline on the
+                        // current victim (the tank) every 3rd cast — solo the victim is the
+                        // only player, so this is a guaranteed self explosion + instakill.
+                        // Skip it. The two random-target casts above already no-op solo (they
+                        // require a NON-victim mana user). Vael keeps Cleave / Flame Breath /
+                        // Fire Nova / Tail Sweep / Essence of the Red.
                         _burningAdrenalineCast = 0;
                     }
                     events.ScheduleEvent(EVENT_BURNING_ADRENALINE, 15s);

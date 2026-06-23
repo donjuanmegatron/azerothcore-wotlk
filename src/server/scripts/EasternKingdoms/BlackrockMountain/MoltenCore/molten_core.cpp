@@ -149,22 +149,13 @@ class spell_mc_play_dead_aura : public AuraScript
         if (!creatureTarget->IsInCombat())
             return;
 
+        // Sanctum (solo): Core Hounds stay dead when killed. The original revives a
+        // hound to FULL HEALTH when its Play Dead expires if any pack-mate is still
+        // alive within 80yd — only the LAST hound truly dies. A solo player can never
+        // kill the whole pack within the Play Dead window, so the pack resurrects
+        // forever (an impossible trash gate). Force shouldDie so each hound dies when
+        // killed; you still fight the entire pack, they just no longer rez each other.
         bool shouldDie = true;
-        std::list<Creature*> hounds;
-        creatureTarget->GetCreaturesWithEntryInRange(hounds, 80.0f, NPC_CORE_HOUND);
-
-        // Perform lambda based check to find if there is any nearby
-        if (!hounds.empty())
-        {
-            // Alive hound been found within 80 yards -> cancel suicide
-            if (std::find_if(hounds.begin(), hounds.end(), [creatureTarget](Creature const* hound)
-            {
-                return creatureTarget != hound && creatureTarget->IsWithinLOSInMap(hound) && hound->IsAlive() && hound->IsInCombat() && !hound->HasAura(SPELL_PLAY_DEAD);
-            }) != hounds.end())
-            {
-                shouldDie = false;
-            }
-        }
 
         if (!shouldDie)
         {

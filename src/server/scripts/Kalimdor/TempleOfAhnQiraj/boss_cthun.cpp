@@ -370,6 +370,20 @@ struct boss_cthun : public BossAI
         DoZoneInCombat();
     }
 
+    // Sanctum (solo): soften Carapace. The Carapace aura (26156) reduces damage taken by
+    // ~99% (all schools) — solo this makes the body un-grindable, forcing the ENTIRE fight
+    // through the fragile stomach loop (swallow -> kill flesh tentacles -> 45s weaken ->
+    // find the exit areatrigger). A single missed stomach exit = unavoidable wipe with no
+    // fallback. Here we let ~10% of damage through while Carapace is up (instead of ~1%),
+    // so the body can be ground down slowly even if the stomach hiccups — but the stomach
+    // weaken (full 100% damage for 45s) is still by far the better path, so the mechanic
+    // stays meaningful and the fight stays hard. TUNING KNOB: the x10 below (1% -> ~10%).
+    void DamageTaken(Unit* /*attacker*/, uint32& damage, DamageEffectType, SpellSchoolMask) override
+    {
+        if (damage && me->HasAura(SPELL_CARAPACE_CTHUN))
+            damage *= 10;
+    }
+
     void DoAction(int32 actionId) override
     {
         if (actionId == ACTION_START_PHASE_TWO)
@@ -483,7 +497,10 @@ struct boss_cthun : public BossAI
 
             creature->CastSpell(creature, SPELL_ROCKY_GROUND_IMPACT, true);
 
-            if (_fleshTentaclesKilled > 1)
+            // Sanctum (solo): weaken after just ONE flesh tentacle (was > 1, i.e. both).
+            // Halves time spent in the stomach per cycle so a solo player gets to the
+            // 45s weaken window faster and spends less time eating Digestive Acid.
+            if (_fleshTentaclesKilled > 0)
             {
                 scheduler.CancelAll();
 

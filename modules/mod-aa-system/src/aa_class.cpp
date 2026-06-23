@@ -130,6 +130,18 @@ namespace
     // Frenzy — currently applied attack speed bonus pct (0 = not active)
     std::unordered_map<uint32, float> g_frenzyPct;
 
+    // Tricks (5324) proc ICD
+    std::unordered_map<uint32, uint32> g_tricksIcd;
+
+    // Rogue Poison system (5339 Poison Master, 5330 Imp Rupture, 5336 Imp Mutilate, 5338 Invigoration, 5342 Leeching Toxins)
+    struct RoguePoison { uint8 stacks = 0; uint32 endMs = 0; uint32 lastTickMs = 0; uint32 tickDmg = 0; };
+    // playerGuid → victimLow → state
+    std::unordered_map<uint32, std::unordered_map<uint32, RoguePoison>> g_roguePoison;
+    // last time player queued a poison application (for Invigoration window)
+    std::unordered_map<uint32, uint32> g_poisonAppliedMs;
+    // Invigoration energy tick tracker
+    std::unordered_map<uint32, uint32> g_invigorTick;
+
     // Spirit Lash 3s tick
     std::unordered_map<uint32, uint32> g_spiritLashTick;
 
@@ -174,7 +186,53 @@ namespace
         g_celHammerIcd.erase(guid);
         g_classRegenTick.erase(guid);
         g_contDrainTick.erase(guid);
+        // Rogue
+        g_tricksIcd.erase(guid);
+        g_roguePoison.erase(guid);
+        g_poisonAppliedMs.erase(guid);
+        g_invigorTick.erase(guid);
     }
+}
+
+// ---------------------------------------------------------------------------
+// File-local helper — apply / refresh Rogue poison stacks on a victim.
+// Called from multiple hooks in this file (Improved Rupture, Improved Mutilate,
+// Poison Master) so it lives here as a file-local static function.
+// ---------------------------------------------------------------------------
+static void QueueRoguePoison(Player* player, Unit* victim, uint32 weaponCount)
+{
+    if (!player || !victim) return;
+    uint32 guid     = player->GetGUID().GetCounter();
+    uint32 victLow  = victim->GetGUID().GetCounter();
+    uint32 now      = getMSTime();
+
+    // Stack cap: R3 Poison Master raises it to 6, otherwise 5.
+    uint8 capStacks = (SanctumAA::GetRank(player, AA_ROG_POISON_MASTER) >= 3) ? 6 : 5;
+
+    auto& entry = g_roguePoison[guid][victLow];
+    // Reset expired state
+    if (entry.stacks > 0 && now > entry.endMs)
+        entry = RoguePoison{};
+
+    // Add stacks, capped
+    entry.stacks = (uint8)std::min<uint32>(capStacks, (uint32)entry.stacks + weaponCount);
+    entry.endMs  = now + 12000u;
+    if (entry.lastTickMs == 0)
+        entry.lastTickMs = now;
+
+    // Recalculate tick damage: AP × 0.04 × stacks × Poison Mastery bonus
+    uint32 ap = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+    float  pm = 1.0f;
+    uint8  pmRank = SanctumAA::GetRank(player, AA_ROG_POISON_MASTERY);
+    if (pmRank > 0)
+    {
+        static const float pb[] = { 0.0f, 0.15f, 0.30f, 0.45f };
+        pm = 1.0f + pb[std::min<uint8>(pmRank, 3)];
+    }
+    entry.tickDmg = std::max(1u, (uint32)(ap * 0.04f * entry.stacks * pm));
+
+    // Record last application time for Invigoration window
+    g_poisonAppliedMs[guid] = now;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +635,49 @@ public:
                 }
             }
 
+            // Ambidexterity (5301) — reduce off-hand damage penalty (off-hand swings only)
+            // The hit-rating portion lives in ApplyAAStat. Here we add a bonus to partially
+            // offset the normal 50% off-hand damage penalty.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_AMBIDEXTERITY);
+                if (rank > 0 && player->haveOffhandWeapon())
+                {
+                    static const float bonus[] = { 0.0f, 0.04f, 0.08f, 0.12f };
+                    damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Tricks (5324) — 8/15/25% chance free strike for 75% bonus damage. 200ms ICD.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_TRICKS);
+                if (rank > 0)
+                {
+                    auto& stamp = g_tricksIcd[guid];
+                    if (GetMSTimeDiffToNow(stamp) >= 200u)
+                    {
+                        static const float chance[] = { 0.0f, 8.0f, 15.0f, 25.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        {
+                            damage += (uint32)(damage * 0.75f);
+                            stamp = getMSTime();
+                        }
+                    }
+                }
+            }
+
+            // ── Priest Yaulp (5405) — +10/20/30% melee damage while active window ──
+            // Speed is handled at activation (ApplyAttackTimePercentMod).
+            // Damage bonus is applied here per-swing while the window is open.
+            {
+                extern bool SanctumAA_PriestYaulpActive(uint32 guid, uint8& outRank);
+                uint8 yRank = 0;
+                if (SanctumAA_PriestYaulpActive(guid, yRank))
+                {
+                    static const float bonus[] = { 0.0f, 0.10f, 0.20f, 0.30f };
+                    damage += (uint32)(damage * bonus[Idx<uint8>(yRank)]);
+                }
+            }
+
         } // end ATTACKER IS PLAYER
 
         // ── VICTIM IS PLAYER ────────────────────────────────────────────────
@@ -861,6 +962,119 @@ public:
                 }
             }
 
+            // Chaotic Stab (5341) — Backstab from front: apply rank-based damage scaling
+            // Positional strip (SPELL_ATTR0_CU_REQ_CASTER_BEHIND_TARGET) handled in OnWorldStartup.
+            // This hook applies the damage multiplier when attacking from in front.
+            {
+                // All WotLK Backstab ranks
+                static const std::unordered_set<uint32> s_backstab = {
+                    53, 2589, 2590, 2591, 8721, 11279, 11280, 11281, 25300, 26863, 48656, 48657
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_CHAOTIC_STAB);
+                if (rank > 0 && s_backstab.count(spellInfo->Id) && target)
+                {
+                    // Only apply penalty if attacking from the front (not behind)
+                    // At R3 the penalty disappears entirely (multiply by 1.0 = no change).
+                    if (target->isInBack(player))
+                    {
+                        // Already behind — no Chaotic Stab interaction needed
+                    }
+                    else
+                    {
+                        // Front/side attack: apply rank-scaled multiplier
+                        // R1: 75%, R2: 88%, R3: 100% (no penalty)
+                        static const float mult[] = { 0.0f, 0.75f, 0.88f, 1.00f };
+                        damage = (int32)(damage * mult[Idx<uint8>(rank)]);
+                    }
+                }
+            }
+
+            // Debilitation (5332) — finisher +8/15/25% damage vs targets with Expose Armor or Rupture
+            {
+                // WotLK Rogue finisher spell IDs
+                static const std::unordered_set<uint32> s_finishers = {
+                    // Eviscerate (all ranks)
+                    2098, 6760, 6761, 6762, 8623, 8624, 11299, 11300, 26865, 48667, 48668,
+                    // Rupture (all ranks)
+                    1943, 8639, 8640, 11273, 11274, 11275, 26867, 48671, 48672,
+                    // Kidney Shot (all ranks)
+                    408, 8643, 11274, 11275,
+                    // Envenom (all ranks)
+                    32645, 32684, 41487, 41488,
+                    // Slice and Dice (all ranks)
+                    5171, 6774,
+                    // Expose Armor (all ranks)
+                    8647, 8649, 8650, 11197, 11198, 26866, 48668, 48669
+                };
+                // Expose Armor aura IDs on target
+                static const std::unordered_set<uint32> s_exposeArmor = {
+                    8647, 8649, 8650, 11197, 11198, 26866, 48668, 48669
+                };
+                // Rupture DoT aura IDs on target
+                static const std::unordered_set<uint32> s_ruptureAura = {
+                    1943, 8639, 8640, 11273, 11274, 11275, 26867, 48671, 48672
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_DEBILITATION);
+                if (rank > 0 && s_finishers.count(spellInfo->Id) && target)
+                {
+                    static const float bonus[] = { 0.0f, 0.08f, 0.15f, 0.25f };
+                    float b = bonus[Idx<uint8>(rank)];
+                    bool hasExposeArmor = false;
+                    bool hasRupture     = false;
+                    for (uint32 id : s_exposeArmor)
+                        if (target->HasAura(id)) { hasExposeArmor = true; break; }
+                    for (uint32 id : s_ruptureAura)
+                        if (target->HasAura(id)) { hasRupture = true; break; }
+                    if (hasExposeArmor)
+                        damage += (int32)(damage * b);
+                    if (hasRupture)
+                        damage += (int32)(damage * b);
+                }
+            }
+
+            // Assassin's Mark (5315) — spell/ability bonus is applied once, in
+            // aa_combat_modifiers.cpp's ModifySpellDamageTaken hook. Do NOT re-apply
+            // it here or the bonus would stack twice on the same spell hit.
+
+            // Improved Mutilate (5336) — Mutilate hits: chance to apply Rogue poison
+            {
+                // WotLK Mutilate spell IDs (base spell + ranks)
+                static const std::unordered_set<uint32> s_mutilate = {
+                    1329, 34411, 34412, 34413, 48661, 48662
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_IMP_MUTILATE);
+                if (rank > 0 && s_mutilate.count(spellInfo->Id) && target)
+                {
+                    static const float chance[] = { 0.0f, 10.0f, 20.0f, 30.0f };
+                    if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                    {
+                        uint32 weaponCount = player->haveOffhandWeapon() ? 2u : 1u;
+                        QueueRoguePoison(player, target, weaponCount);
+                    }
+                }
+            }
+
+            // Poison Master (5339) — finishers always apply Rogue poison
+            // R1+R2: finisher always queues a poison stack. R3 raises max cap (handled in QueueRoguePoison).
+            // R2 "crits always apply" is approximated as the same always-on R1 behavior (no crit-flag
+            // hook available in 3.3.5a damage pipeline). Document approximation clearly.
+            {
+                static const std::unordered_set<uint32> s_finishers2 = {
+                    2098, 6760, 6761, 6762, 8623, 8624, 11299, 11300, 26865, 48667, 48668,
+                    1943, 8639, 8640, 11273, 11274, 11275, 26867, 48671, 48672,
+                    408, 8643, 32645, 32684, 41487, 41488, 5171, 6774,
+                    8647, 8649, 8650, 11197, 11198, 26866, 48669
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_POISON_MASTER);
+                if (rank > 0 && s_finishers2.count(spellInfo->Id) && target)
+                {
+                    // R2 "crits always apply poison" is APPROXIMATED as always-on (same as R1)
+                    // because the crit flag is not accessible in ModifySpellDamageTaken.
+                    uint32 weaponCount = player->haveOffhandWeapon() ? 2u : 1u;
+                    QueueRoguePoison(player, target, weaponCount);
+                }
+            }
+
             // Frost Rot (Death Knight) — +3/6/10% HB/Frost Strike/Obliterate vs Frost Fever targets
             {
                 static const std::unordered_set<uint32> s_frostAbl = {
@@ -955,6 +1169,16 @@ public:
                     }
                 }
             }
+            // Slippery (5320) — AoE damage taken -8/15/25%
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_ROG_SLIPPERY);
+                if (rank > 0 && spellInfo->IsAffectingArea())
+                {
+                    static const float dr[] = { 0.0f, 0.08f, 0.15f, 0.25f };
+                    damage = (int32)(damage * (1.0f - dr[Idx<uint8>(rank)]));
+                }
+            }
+
             // Burning Soul (Warlock, 5809) — 20/35/50% incoming damage drained from mana instead.
             // Stops working when the player has no mana left.
             {
@@ -995,7 +1219,7 @@ public:
     // -----------------------------------------------------------------------
     // ModifyPeriodicDamageAurasTick
     // -----------------------------------------------------------------------
-    void ModifyPeriodicDamageAurasTick(Unit* /*target*/, Unit* attacker, uint32& damage, SpellInfo const* spellInfo) override
+    void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& damage, SpellInfo const* spellInfo) override
     {
         if (damage == 0 || !spellInfo)
             return;
@@ -1090,6 +1314,23 @@ public:
                 int32 healAmt = (int32)(damage * pct[Idx<uint8>(rank)]);
                 if (healAmt > 0)
                     player->ModifyHealth(healAmt);
+            }
+        }
+
+        // Improved Rupture (5330) — Rupture ticks: 15/25/40% chance to apply Rogue poison
+        {
+            static const std::unordered_set<uint32> s_ruptureDot = {
+                1943, 8639, 8640, 11273, 11274, 11275, 26867, 48671, 48672
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_ROG_IMP_RUPTURE);
+            if (rank > 0 && s_ruptureDot.count(spellInfo->Id) && target)
+            {
+                static const float chance[] = { 0.0f, 15.0f, 25.0f, 40.0f };
+                if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                {
+                    uint32 weaponCount = player->haveOffhandWeapon() ? 2u : 1u;
+                    QueueRoguePoison(player, target, weaponCount);
+                }
             }
         }
     }
@@ -1303,6 +1544,66 @@ public:
                         uint32 lashDmg = std::max(1u, (uint32)(sp * spPct[Idx<uint8>(rank)]));
                         Unit::DealDamage(player, nearest, lashDmg, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_SHADOW, nullptr, false);
                     }
+                }
+            }
+        }
+
+        // Rogue Poison DoT ticking — 1 tick per 2s, nature school (visible damage)
+        {
+            auto rpIt = g_roguePoison.find(guid);
+            if (rpIt != g_roguePoison.end() && !rpIt->second.empty())
+            {
+                std::vector<uint32> toErase;
+                for (auto& [victLow, rpState] : rpIt->second)
+                {
+                    if (now > rpState.endMs) { toErase.push_back(victLow); continue; }
+                    if (GetMSTimeDiffToNow(rpState.lastTickMs) < 2000u) continue;
+                    rpState.lastTickMs = now;
+
+                    // Locate victim
+                    Unit* victim = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                        if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                    if (!victim)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                    }
+                    if (!victim || !victim->IsAlive()) continue;
+
+                    // Deliver visible poison damage
+                    SanctumAA_DealVisibleDamage(player, victim, rpState.tickDmg, SPELL_SCHOOL_MASK_NATURE);
+
+                    // Leeching Toxins (5342) — heal player for a % of poison tick damage
+                    {
+                        uint8 lt = SanctumAA::GetRank(player, AA_ROG_LEECHING_TOXINS);
+                        if (lt > 0 && !player->IsFullHealth())
+                        {
+                            static const float lf[] = { 0.0f, 0.04f, 0.07f, 0.10f };
+                            int32 heal = (int32)(rpState.tickDmg * lf[Idx<uint8>(lt)]);
+                            if (heal > 0)
+                                player->ModifyHealth(heal);
+                        }
+                    }
+                }
+                for (uint32 v : toErase) rpIt->second.erase(v);
+            }
+        }
+
+        // Invigoration (5338) — gain 10 Energy every 4/3/2s if a poison was applied that window
+        {
+            uint8 ir = SanctumAA::GetRank(player, AA_ROG_INVIGORATION);
+            if (ir > 0 && player->getPowerType() == POWER_ENERGY)
+            {
+                static const uint32 win[] = { 0, 4000u, 3000u, 2000u };
+                uint32 w = win[Idx<uint8>(ir)];
+                auto& invTick = g_invigorTick[guid];
+                if (GetMSTimeDiffToNow(invTick) >= w)
+                {
+                    invTick = now;
+                    auto pit = g_poisonAppliedMs.find(guid);
+                    if (pit != g_poisonAppliedMs.end() && GetMSTimeDiffToNow(pit->second) <= w)
+                        player->ModifyPower(POWER_ENERGY, 10);
                 }
             }
         }
@@ -1530,6 +1831,48 @@ public:
                         for (uint32 diseaseId : diseaseIds)
                             player->CastSpell(atk, diseaseId, true);
                         ++jumped;
+                    }
+                }
+            }
+        }
+
+        // Spreading Misery (5428) — SW:P/VT/DP jumps to nearest enemy on kill.
+        // R3 raises jump range by +5yd (10→15 yd).
+        // Mirror of Pestilence but for Priest shadow DoTs (by spell ID, not DISPEL_DISEASE).
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_PRI_SPREADING_MISERY);
+            if (rank > 0)
+            {
+                static const std::unordered_set<uint32> s_priestDots = {
+                    // Shadow Word: Pain all ranks
+                    589, 594, 970, 992, 2767, 10892, 10893, 25367, 48124, 48125,
+                    // Vampiric Touch all ranks
+                    34914, 34916, 34917, 48159, 48160,
+                    // Devouring Plague all ranks
+                    2944, 19276, 19277, 19278, 25467, 48300, 48301
+                };
+                float jumpRange = (rank >= 3) ? 15.0f : 10.0f;
+
+                std::unordered_set<uint32> dotIds;
+                for (auto const& pair : creature->GetAppliedAuras())
+                {
+                    AuraApplication const* app = pair.second;
+                    if (app->GetBase()->GetCasterGUID() == player->GetGUID() &&
+                        s_priestDots.count(pair.first))
+                    {
+                        dotIds.insert(pair.first);
+                    }
+                }
+                if (!dotIds.empty())
+                {
+                    // Jump to one nearby enemy (like Pestilence R1)
+                    for (Unit* atk : player->getAttackers())
+                    {
+                        if (atk == creature || player->GetDistance(atk) > jumpRange)
+                            continue;
+                        for (uint32 dotId : dotIds)
+                            player->CastSpell(atk, dotId, true);
+                        break; // jump to one target (consistent with Pestilence R1 analog)
                     }
                 }
             }

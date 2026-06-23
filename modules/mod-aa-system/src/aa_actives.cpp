@@ -12,12 +12,14 @@
 //                 Death Pact, DK Leech Touch, Cannibalize, Elemental Fury,
 //                 Harvest of Druzzil, Manaburn, Fearstorm, WRL Lifeburn,
 //                 WRL Leech Touch, Volley Burst, Scout of the Wild
-//   STUBBED:      Assassin's Mark, all
+//   IMPLEMENTED:  Assassin's Mark (5315), Cleanse Curse (2113), Flurry (5306)
+//   STUBBED:      all
 //                 remaining Priest actives (5403-5409,5418,5420-5421,5424,5426),
 //                 Frenzied Burnout, Mend Companion, Wake the Dead, Dire Charm
 
 #include "aa_runtime.h"
 #include "Player.h"
+#include "Pet.h"
 #include "Unit.h"
 #include "Creature.h"
 #include "Chat.h"
@@ -145,10 +147,22 @@ bool SanctumAA_WeaponFuryActive(uint32 guid)
     return true;
 }
 
-// ---- Yaulp haste window (5120) ---------------------------------------------
-// guid -> {expiry, haste%} — used by worldscript to reverse melee speed mod when expired.
-struct YaulpState { uint32 untilMs; float hastePct; };
+// ---- Yaulp haste window (5120 Paladin / 5405 Priest) -----------------------
+// guid -> {expiry, haste%, aaId, rank} — worldscript reverses speed mod on expiry.
+// aaId field distinguishes Paladin Yaulp (5120) from Priest Yaulp (5405).
+struct YaulpState { uint32 untilMs; float hastePct; uint32 aaId = 0; uint8 rank = 0; };
 static std::unordered_map<uint32, YaulpState> g_yaulpUntil;
+
+// Exported for aa_class.cpp — check if Priest Yaulp damage window is active.
+bool SanctumAA_PriestYaulpActive(uint32 guid, uint8& outRank)
+{
+    auto it = g_yaulpUntil.find(guid);
+    if (it == g_yaulpUntil.end()) return false;
+    if (it->second.aaId != AA_PRI_YAULP) return false;
+    if (getMSTime() >= it->second.untilMs) return false;
+    outRank = it->second.rank;
+    return true;
+}
 
 // ---- Rampage cleave window (5001) ------------------------------------------
 // guid -> getMSTime() at which the Rampage window expires.
@@ -190,9 +204,42 @@ bool SanctumAA_CheerOffensiveActive(uint32 guid) { return CheerWindowActive(g_ch
 bool SanctumAA_CheerDefensiveActive(uint32 guid) { return CheerWindowActive(g_cheerDefUntil,   guid); }
 bool SanctumAA_CheerSwiftnessActive(uint32 guid) { return CheerWindowActive(g_cheerSwiftUntil, guid); }
 
+// ---- Flurry (5306) rapid-strike state -------------------------------------
+// On melee special cast: queue 3 physical hits delivered every 300ms via OnUpdate.
+struct FlurryHits { uint32 victimLow; uint8 hitsLeft; uint32 lastHitMs; uint32 dmgPerHit; };
+static std::unordered_map<uint32, FlurryHits> g_flurryActive;
+static std::unordered_map<uint32, uint32>     g_flurryIcd;  // 10s ICD
+
 // ---- Furious Charge window (5012) -----------------------------------------
 // Window managed in aa_combat_modifiers.cpp via SanctumAA_SetFuriousChargeWindow.
 // aa_actives_player below detects Charge cast and opens the window.
+
+// ---- Priest: Priest Yaulp (5405) — separate map from Paladin's g_yaulpUntil ──
+// Shares the same YaulpState struct and the same worldscript expiry path.
+// NOTE: g_yaulpUntil is also used for Priest Yaulp (same struct, same worldscript expiry).
+// The map key is playerGuid, and at most one Yaulp is active at a time per player.
+
+// ---- Priest: Celestial Hammer (5406) — 3 queued holy strikes ───────────────
+struct CelestialHammerState { uint32 targetLow; uint8 hitsLeft; uint32 lastHitMs; uint32 dmgPerHit; };
+static std::unordered_map<uint32, CelestialHammerState> g_celestialHammer;
+
+// ---- Priest: Celestial Regeneration (5407) — free HoT ──────────────────────
+struct CelRegenState { uint8 ticksLeft; uint32 lastTickMs; uint32 healPerTick; };
+static std::unordered_map<uint32, CelRegenState> g_celRegen;
+
+// ---- Priest: Inspire (5440) — pet damage window after empowered shadow spell ──
+struct InspireWindow { uint32 untilMs; uint8 rank; };
+static std::unordered_map<uint32, InspireWindow> g_inspireWindow;
+
+// Exported for aa_pet.cpp — true while Inspire window is active
+bool SanctumAA_InspireActive(uint32 guid, uint8& outRank)
+{
+    auto it = g_inspireWindow.find(guid);
+    if (it == g_inspireWindow.end()) return false;
+    if (getMSTime() > it->second.untilMs) { g_inspireWindow.erase(it); return false; }
+    outRank = it->second.rank;
+    return true;
+}
 
 // ---- public API -----------------------------------------------------------
 
@@ -216,6 +263,12 @@ void SanctumAA_ClearActivateState(uint32 guid)
     g_cheerOffUntil.erase(guid);
     g_cheerDefUntil.erase(guid);
     g_cheerSwiftUntil.erase(guid);
+    g_flurryActive.erase(guid);
+    g_flurryIcd.erase(guid);
+    // Priest
+    g_celestialHammer.erase(guid);
+    g_celRegen.erase(guid);
+    g_inspireWindow.erase(guid);
 }
 
 bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
@@ -1017,28 +1070,327 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         }
 
         // Queue haste reversal after 30s via the existing g_yaulpUntil map
-        g_yaulpUntil[guid] = { getMSTime() + 30000u, haste };
+        // aaId = AA_PAL_YAULP so the class hook can distinguish Paladin vs Priest Yaulp.
+        g_yaulpUntil[guid] = { getMSTime() + 30000u, haste, AA_PAL_YAULP, rank };
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Yaulp! +{}% attack speed for 30 sec.", (uint32)haste);
         return true;
     }
 
     // =======================================================================
-    // STUBS — complex scripted effects deferred to later phase
+    // ROGUE — Assassin's Mark (5315)
     // =======================================================================
 
-    case AA_ROG_ASSASSINS_MARK:         // 5315 — custom debuff aura system needed
-    case AA_PRI_CHANNELING_DIVINE:      // 5403 — spell proc counting hook needed
-    case AA_PRI_FORCEFUL_REJUVENATION:  // 5404 — CD reset loop implementation needed
-    case AA_PRI_YAULP:                  // 5405 — toggle aura + mana regen hook needed
-    case AA_PRI_CELESTIAL_HAMMER:       // 5406 — SP-based multi-hit spell delivery needed
-    case AA_PRI_CELESTIAL_REGEN:        // 5407 — custom HoT aura delivery needed
-    case AA_PRI_QUICK_BUFF:             // 5409 — cast-time intercept hook needed
-    case AA_PRI_DIVINE_ARBITRATION:     // 5418 — multi-pet HP equalization needed
-    case AA_PRI_CELESTIAL_BARRIER:      // 5420 — absorb aura delivery needed
-    case AA_PRI_BESTOW_DIVINE_AURA:     // 5421 — target invulnerability aura needed
-    case AA_PRI_SANCTIFICATION:         // 5424 — ground aura / DynObject system needed
-    case AA_PRI_WAKE_OF_TRANQUILITY:    // 5426 — aggro radius modification needed
+    case AA_ROG_ASSASSINS_MARK:
+    // Activate: mark a hostile target for 15s. All damage dealt to that target increased
+    // by +10%/+18%/+28% for the duration. 60s CD.
+    {
+        static const uint32 CD_MS = 60000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Assassin's Mark on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        Unit* tgt = GetTarget(player);
+        if (!tgt || !tgt->IsAlive() || !player->IsValidAttackTarget(tgt))
+        {
+            handler->SendSysMessage("|cffff0000[AA]|r No valid hostile target.");
+            return true;
+        }
+        {
+            extern void SanctumAA_SetAssassinsMark(uint32 playerGuid, uint32 targetLow, uint32 untilMs, uint8 rank);
+            SanctumAA_SetAssassinsMark(guid, tgt->GetGUID().GetCounter(), getMSTime() + 15000u, rank);
+        }
+        SetCD(guid, aaId);
+        static const uint32 pctDisplay[] = { 0, 10, 18, 28 };
+        handler->PSendSysMessage("|cffff6600[AA]|r Assassin's Mark — target marked for 15s (+{}%% damage).", pctDisplay[std::min<uint8>(rank, 3)]);
+        return true;
+    }
+
+    // =======================================================================
+    // GENERAL DEFENSIVE — Cleanse Curse (2113)
+    // =======================================================================
+
+    case AA_G_CLEANSE_CURSE:
+    // Activate: remove all curse effects from the player. 30s CD.
+    {
+        static const uint32 CD_MS = 30000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Cleanse Curse on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        // Remove all curse auras from the player
+        // AC 3.3.5a has no RemoveAurasWithDispelType; iterate and remove manually.
+        {
+            std::vector<uint32> curseAuraKeys;
+            for (auto const& [auraKey, aurApp] : player->GetAppliedAuras())
+            {
+                if (!aurApp) continue;
+                SpellInfo const* si = aurApp->GetBase()->GetSpellInfo();
+                if (!si) continue;
+                if (si->Dispel == DISPEL_CURSE && !aurApp->IsPositive())
+                    curseAuraKeys.push_back(auraKey);
+            }
+            for (uint32 key : curseAuraKeys)
+                player->RemoveAura(key);
+        }
+        SetCD(guid, aaId);
+        handler->SendSysMessage("|cff00ff00[AA]|r Cleanse Curse — all curse effects removed.");
+        return true;
+    }
+
+    // =======================================================================
+    // PRIEST — remaining actives (formerly stubbed)
+    // =======================================================================
+
+    case AA_PRI_CHANNELING_DIVINE:
+    // Activate: grant 5/8/12 double-heal charges; next N heals fire twice. 3min CD.
+    // The charge consumption happens in aa_combat_modifiers.cpp ModifyHealReceived.
+    {
+        static const uint32 CD_MS = 180000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Channeling the Divine on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        static const uint8 charges[] = { 0, 5, 8, 12 };
+        uint8 ch = charges[std::min<uint8>(rank, 3)];
+        {
+            extern void SanctumAA_SetChannelingDivineCharges(uint32 guid, uint8 charges);
+            SanctumAA_SetChannelingDivineCharges(guid, ch);
+        }
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Channeling the Divine — next {} heal(s) will fire twice!", (uint32)ch);
+        return true;
+    }
+
+    case AA_PRI_FORCEFUL_REJUVENATION:
+    // ONE-SHOT: Instantly reset all spell cooldowns. 10min CD.
+    {
+        static const uint32 CD_MS = 600000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Forceful Rejuvenation on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        // Reset all player spell cooldowns
+        player->RemoveAllSpellCooldown();
+        SetCD(guid, aaId);
+        handler->SendSysMessage("|cff00ff00[AA]|r Forceful Rejuvenation — all spell cooldowns reset!");
+        return true;
+    }
+
+    case AA_PRI_YAULP:
+    // Activate: +15/25/40% melee attack speed and +10/20/30% melee damage for 30s. 2min CD.
+    // Melee damage bonus stored in g_priYaulpDmgPct, read in aa_class.cpp ModifyMeleeDamage.
+    // Speed reversed on expiry by the existing worldscript Yaulp-expiry path (g_yaulpUntil).
+    {
+        static const uint32 CD_MS = 120000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Yaulp on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        static const float hastePct[]  = { 0.0f, 15.0f, 25.0f, 40.0f };
+        float haste = hastePct[std::min<uint8>(rank, 3)];
+        if (haste > 0.0f)
+            player->ApplyAttackTimePercentMod(BASE_ATTACK, haste, true);
+        // Store Yaulp window for expiry reversal; aaId = AA_PRI_YAULP so
+        // aa_class.cpp can identify this as Priest Yaulp and apply the dmg bonus.
+        g_yaulpUntil[guid] = { getMSTime() + 30000u, haste, AA_PRI_YAULP, rank };
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Yaulp! +{}%% attack speed for 30 sec.", (uint32)haste);
+        return true;
+    }
+
+    case AA_PRI_CELESTIAL_HAMMER:
+    // Activate: deliver 3 holy strikes over ~1.5s, each = 80/110/150% SP. 2min CD.
+    // Strikes delivered by worldscript OnUpdate tick.
+    {
+        static const uint32 CD_MS = 120000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Celestial Hammer on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        Unit* tgt = GetTarget(player);
+        if (!tgt || !tgt->IsAlive() || !player->IsValidAttackTarget(tgt))
+        {
+            handler->SendSysMessage("|cffff0000[AA]|r No valid target.");
+            return true;
+        }
+        static const float mult[] = { 0.0f, 0.80f, 1.10f, 1.50f };
+        int32 sp = player->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_HOLY);
+        if (sp < 0) sp = 0;
+        uint32 dmgPerHit = std::max(1u, (uint32)(sp * mult[std::min<uint8>(rank, 3)]));
+        g_celestialHammer[guid] = { tgt->GetGUID().GetCounter(), 3, getMSTime(), dmgPerHit };
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Celestial Hammer — 3 holy strikes ({} SP each)!", dmgPerHit);
+        return true;
+    }
+
+    case AA_PRI_CELESTIAL_REGEN:
+    // Activate: free HoT. 5/8/12% max HP per tick, every 3s for 30s (10 ticks). No mana cost. 5min CD.
+    {
+        static const uint32 CD_MS = 300000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Celestial Regeneration on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        static const float pct[] = { 0.0f, 0.05f, 0.08f, 0.12f };
+        uint32 healPerTick = std::max(1u, (uint32)(player->GetMaxHealth() * pct[std::min<uint8>(rank, 3)]));
+        g_celRegen[guid] = { 10, getMSTime(), healPerTick };
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Celestial Regeneration — +{} HP/tick for 30s.", healPerTick);
+        return true;
+    }
+
+    case AA_PRI_QUICK_BUFF:
+    // Activate: apply a short +100% spell haste burst aura to approximate half-cast-time for
+    // 3/5/7 casts. No clean per-cast cast-time hook exists in 3.3.5a.
+    // APPROXIMATION: cast Berserking (spell 26297, 20% cast speed bonus) for 10s as a proxy.
+    // Documents the limitation: the exact "N free fast casts then stop" mechanic is not available
+    // without a SpellCast counter hook. The flat haste buff provides the speed-up spirit.
+    // 90s CD.
+    {
+        static const uint32 CD_MS = 90000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Quick Buff on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        // Apply Heroism/Bloodlust (spell 2825) for 10s as a cast speed proxy.
+        // NOTE: Heroism also grants melee haste; this is an approximation.
+        // Spell 15473 (Shadow Form) would be wrong. Use 32182 = Heroism (40% haste) for 10s.
+        // Since CastSpell is safe in an active handler (not inside a damage hook), this is valid.
+        player->CastSpell(player, 32182, true);  // Heroism: +30% spell/melee haste for 40s
+        SetCD(guid, aaId);
+        static const uint32 castCount[] = { 0, 3, 5, 7 };
+        handler->PSendSysMessage("|cff00ff00[AA]|r Quick Buff — haste burst ({} cast approximation).", castCount[std::min<uint8>(rank, 3)]);
+        return true;
+    }
+
+    case AA_PRI_DIVINE_ARBITRATION:
+    // Activate: equalize HP% between player and active pets/guardians. 3/2/1.5min CD.
+    {
+        static const uint32 cdMs[] = { 0, 180000, 120000, 90000 };
+        uint32 cd = cdMs[std::min<uint8>(rank, 3)];
+        if (uint32 rem = CDRemaining(guid, aaId, cd))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Divine Arbitration on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        // Gather living targets: player + native pet + guardian
+        std::vector<Unit*> participants;
+        participants.push_back(player);
+        if (Pet* pet = player->GetPet())
+            if (pet->IsAlive())
+                participants.push_back(pet);
+        // Guardian pet (mod-pet-systems uses first guardian creature)
+        for (Unit* controlled : player->m_Controlled)
+        {
+            if (!controlled || controlled == player->GetPet()) continue;
+            Creature* cr = controlled->ToCreature();
+            if (cr && cr->IsAlive() && cr->GetOwnerGUID() == player->GetGUID())
+                participants.push_back(controlled);
+        }
+        if (participants.size() <= 1)
+        {
+            handler->SendSysMessage("|cffff0000[AA]|r No active pets or guardians to equalize with.");
+            return true;
+        }
+        // Compute average HP%
+        float totalPct = 0.0f;
+        for (Unit* u : participants)
+            totalPct += u->GetHealthPct();
+        float avgPct = totalPct / (float)participants.size();
+        // Apply equalized HP
+        for (Unit* u : participants)
+        {
+            uint32 targetHP = std::max(1u, (uint32)(u->GetMaxHealth() * avgPct / 100.0f));
+            u->SetHealth(targetHP);
+        }
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Divine Arbitration — HP equalized to {}%%.", (uint32)avgPct);
+        return true;
+    }
+
+    case AA_PRI_CELESTIAL_BARRIER:
+    // Activate: absorb shield = 30/50/75% SP for 10s. 60s CD.
+    // Absorb is consumed in aa_combat_modifiers.cpp ModifyMeleeDamage + ModifySpellDamageTaken.
+    {
+        static const uint32 CD_MS = 60000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Celestial Barrier on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        static const float mult[] = { 0.0f, 0.30f, 0.50f, 0.75f };
+        int32 sp = player->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_HOLY);
+        if (sp < 0) sp = 0;
+        int32 shieldAmt = (int32)(sp * mult[std::min<uint8>(rank, 3)]);
+        if (shieldAmt < 1) shieldAmt = 1;
+        {
+            extern void SanctumAA_SetCelestialBarrier(uint32 guid, int32 amount, uint32 durationMs);
+            SanctumAA_SetCelestialBarrier(guid, shieldAmt, 10000u);
+        }
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Celestial Barrier — absorb shield of {} for 10s!", shieldAmt);
+        return true;
+    }
+
+    case AA_PRI_BESTOW_DIVINE_AURA:
+    // Activate: target (self, pet, or guardian) becomes invulnerable for 3/5/8s. 5min CD.
+    // Implemented as a very large Celestial Barrier absorb (maxHP × 100) on the target.
+    // This reuses the safe absorb-struct mechanism. Applying a real Divine Shield aura on a
+    // non-player target via AddAura is risky (target typing); absorb is cleaner and safe.
+    {
+        static const uint32 CD_MS = 300000u;
+        if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
+        {
+            handler->PSendSysMessage("|cffff0000[AA]|r Bestow Divine Aura on cooldown ({} sec).", rem / 1000u);
+            return true;
+        }
+        static const uint32 durMs[] = { 0, 3000, 5000, 8000 };
+        uint32 dur = durMs[std::min<uint8>(rank, 3)];
+        // Target: prefer current victim's target or self (player cannot use on enemies)
+        Unit* tgt = player;  // default self
+        // Check if player has a selected friendly unit (pet or guardian)
+        ObjectGuid selGuid = player->GetTarget();
+        if (selGuid)
+        {
+            Unit* sel = ObjectAccessor::GetUnit(*player, selGuid);
+            if (sel && sel->IsAlive() && sel->IsFriendlyTo(player))
+                tgt = sel;
+        }
+        // Use a huge absorb (10× max HP effectively = invuln)
+        int32 bigAbsorb = (int32)(tgt->GetMaxHealth() * 100u);
+        if (bigAbsorb < 1) bigAbsorb = 999999999;
+        // If target is self, use Celestial Barrier map
+        if (tgt == player)
+        {
+            extern void SanctumAA_SetCelestialBarrier(uint32 guid, int32 amount, uint32 durationMs);
+            SanctumAA_SetCelestialBarrier(guid, bigAbsorb, dur);
+        }
+        // For pet/guardian targets, apply a real aura (Divine Shield 642) via CastSpell.
+        // CastSpell is safe here (active handler, not inside a damage hook).
+        else
+        {
+            player->CastSpell(tgt, 642, true);  // Divine Shield: bubble + immunity
+        }
+        SetCD(guid, aaId);
+        handler->PSendSysMessage("|cff00ff00[AA]|r Bestow Divine Aura — {} sec invulnerability!", dur / 1000u);
+        return true;
+    }
+
+    // =======================================================================
+    // STUBS — complex scripted effects deferred to later phase
+    // =======================================================================
+    // 5424 Sanctification    — SCRAPPED (Tier 1): ground DynObject zone not available
+    // 5426 Wake of Tranquility — SCRAPPED (Tier 1): aggro-radius hook not available
+
     case AA_MAG_FRENZIED_BURNOUT:       // 5735 — Water Elemental frenzy state needed
     case AA_MAG_MEND_COMPANION:         // 5736 — pet full-heal command needed
     // 5826 Wake the Dead  — SCRAPPED (Tier 1)
@@ -1093,6 +1445,96 @@ public:
                 g_yaulpUntil.erase(g);
         }
 
+        // Flurry (5306) — deliver queued rapid-strike hits every 300ms
+        if (!g_flurryActive.empty())
+        {
+            std::vector<uint32> flurryDone;
+            for (auto& [playerGuid, fstate] : g_flurryActive)
+            {
+                if (fstate.hitsLeft == 0) { flurryDone.push_back(playerGuid); continue; }
+                if (GetMSTimeDiffToNow(fstate.lastHitMs) < 300u) continue;
+
+                Player* p = ObjectAccessor::FindPlayerByLowGUID(playerGuid);
+                if (!p || !p->IsInWorld() || !p->IsAlive()) { flurryDone.push_back(playerGuid); continue; }
+
+                // Locate victim by stored low GUID
+                Unit* victim = nullptr;
+                for (Unit* atk : p->getAttackers())
+                    if (atk->GetGUID().GetCounter() == fstate.victimLow) { victim = atk; break; }
+                if (!victim)
+                {
+                    Unit* v = p->GetVictim();
+                    if (v && v->GetGUID().GetCounter() == fstate.victimLow) victim = v;
+                }
+                if (!victim || !victim->IsAlive()) { flurryDone.push_back(playerGuid); continue; }
+
+                SanctumAA_DealVisibleDamage(p, victim, fstate.dmgPerHit, SPELL_SCHOOL_MASK_NORMAL);
+                fstate.lastHitMs = getMSTime();
+                --fstate.hitsLeft;
+                if (fstate.hitsLeft == 0)
+                    flurryDone.push_back(playerGuid);
+            }
+            for (uint32 g : flurryDone)
+                g_flurryActive.erase(g);
+        }
+
+        // Celestial Hammer (5406) — deliver 3 queued holy strikes every 500ms
+        if (!g_celestialHammer.empty())
+        {
+            std::vector<uint32> hammerDone;
+            for (auto& [playerGuid, hstate] : g_celestialHammer)
+            {
+                if (hstate.hitsLeft == 0) { hammerDone.push_back(playerGuid); continue; }
+                if (GetMSTimeDiffToNow(hstate.lastHitMs) < 500u) continue;
+
+                Player* p = ObjectAccessor::FindPlayerByLowGUID(playerGuid);
+                if (!p || !p->IsInWorld() || !p->IsAlive()) { hammerDone.push_back(playerGuid); continue; }
+
+                Unit* victim = nullptr;
+                for (Unit* atk : p->getAttackers())
+                    if (atk->GetGUID().GetCounter() == hstate.targetLow) { victim = atk; break; }
+                if (!victim)
+                {
+                    Unit* v = p->GetVictim();
+                    if (v && v->GetGUID().GetCounter() == hstate.targetLow) victim = v;
+                }
+                if (!victim || !victim->IsAlive()) { hammerDone.push_back(playerGuid); continue; }
+
+                SanctumAA_DealVisibleDamage(p, victim, hstate.dmgPerHit, SPELL_SCHOOL_MASK_HOLY);
+                hstate.lastHitMs = getMSTime();
+                --hstate.hitsLeft;
+                if (hstate.hitsLeft == 0)
+                    hammerDone.push_back(playerGuid);
+            }
+            for (uint32 g : hammerDone)
+                g_celestialHammer.erase(g);
+        }
+
+        // Celestial Regeneration (5407) — tick HoT every 3s
+        if (!g_celRegen.empty())
+        {
+            std::vector<uint32> regenDone;
+            uint32 nowMs = getMSTime();
+            for (auto& [playerGuid, rs] : g_celRegen)
+            {
+                if (rs.ticksLeft == 0) { regenDone.push_back(playerGuid); continue; }
+                if (GetMSTimeDiffToNow(rs.lastTickMs) < 3000u) continue;
+
+                Player* p = ObjectAccessor::FindPlayerByLowGUID(playerGuid);
+                if (!p || !p->IsInWorld() || !p->IsAlive()) { regenDone.push_back(playerGuid); continue; }
+
+                int32 heal = (int32)rs.healPerTick;
+                if (heal > 0)
+                    p->ModifyHealth(heal);
+                rs.lastTickMs = nowMs;
+                --rs.ticksLeft;
+                if (rs.ticksLeft == 0)
+                    regenDone.push_back(playerGuid);
+            }
+            for (uint32 g : regenDone)
+                g_celRegen.erase(g);
+        }
+
         if (g_eradDots.empty())
             return;
 
@@ -1145,6 +1587,7 @@ public:
     aa_actives_player() : PlayerScript("aa_actives_player") {}
 
     // Furious Charge (5012) — detect Charge cast; open damage window; R4 AoE burst.
+    // Flurry (5306) — detect melee special cast and queue 3 rapid hits.
     void OnPlayerSpellCast(Player* player, Spell* spell, bool skipCheck) override
     {
         if (!player || skipCheck || !spell)
@@ -1153,6 +1596,127 @@ public:
         SpellInfo const* info = spell->GetSpellInfo();
         if (!info)
             return;
+
+        uint32 guid = player->GetGUID().GetCounter();
+
+        // Flurry (5306) — trigger on any melee DmgClass special
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_ROG_FLURRY);
+            if (rank > 0 && info->DmgClass == SPELL_DAMAGE_CLASS_MELEE)
+            {
+                auto& icdStamp = g_flurryIcd[guid];
+                if (GetMSTimeDiffToNow(icdStamp) >= 10000u)
+                {
+                    Unit* victim = spell->m_targets.GetUnitTarget();
+                    if (!victim) victim = player->GetVictim();
+                    if (victim && victim->IsAlive())
+                    {
+                        static const float pct[] = { 0.0f, 0.50f, 0.65f, 0.80f };
+                        uint32 dmgPerHit = std::max(1u,
+                            (uint32)(player->GetTotalAttackPowerValue(BASE_ATTACK) * 0.20f * pct[std::min<uint8>(rank, 3)]));
+                        g_flurryActive[guid] = { victim->GetGUID().GetCounter(), 3, getMSTime(), dmgPerHit };
+                        icdStamp = getMSTime();
+                    }
+                }
+            }
+        }
+
+        // ── Gift of Mana (5402) — refund mana on next spell cast if flag is set ──
+        // The flag is set in aa_combat_modifiers.cpp ModifyHealReceived when a proc fires.
+        {
+            uint8 gmRank = SanctumAA::GetRank(player, AA_PRI_GIFT_OF_MANA);
+            if (gmRank > 0)
+            {
+                extern bool SanctumAA_ConsumeGiftOfMana(uint32 guid);
+                if (SanctumAA_ConsumeGiftOfMana(guid))
+                {
+                    // Refund the spell's base mana cost
+                    uint32 cost = info->PowerType == POWER_MANA ? info->ManaCost : 0;
+                    if (cost == 0)
+                        cost = (uint32)(player->GetMaxPower(POWER_MANA) * info->ManaCostPercentage / 100.0f);
+                    if (cost > 0)
+                        player->ModifyPower(POWER_MANA, (int32)cost);
+                }
+            }
+        }
+
+        // ── Mark of Karna (5414) — set mark on target when player casts a holy or shadow spell ──
+        // The bonus is read in aa_combat_modifiers.cpp ModifySpellDamageTaken.
+        {
+            uint8 mkRank = SanctumAA::GetRank(player, AA_PRI_MARK_OF_KARNA);
+            if (mkRank > 0)
+            {
+                uint32 schoolMask = info->GetSchoolMask();
+                if ((schoolMask & SPELL_SCHOOL_MASK_HOLY) || (schoolMask & SPELL_SCHOOL_MASK_SHADOW))
+                {
+                    Unit* tgt = spell->m_targets.GetUnitTarget();
+                    if (!tgt) tgt = player->GetVictim();
+                    if (tgt && tgt->IsAlive() && player->IsValidAttackTarget(tgt))
+                    {
+                        extern void SanctumAA_SetMarkOfKarna(uint32 playerGuid, uint32 targetLow, uint32 untilMs, uint8 rank);
+                        SanctumAA_SetMarkOfKarna(guid, tgt->GetGUID().GetCounter(), getMSTime() + 15000u, mkRank);
+                    }
+                }
+            }
+        }
+
+        // ── Inspire (5440) — open pet damage window after empowered shadow spells ──
+        {
+            uint8 insRank = SanctumAA::GetRank(player, AA_PRI_INSPIRE);
+            if (insRank > 0)
+            {
+                static const std::unordered_set<uint32> s_empowered = {
+                    // Mind Blast all ranks
+                    8092, 10945, 10946, 10947, 25375, 25376, 48126, 48127,
+                    // Shadow Word: Death all ranks
+                    32379, 32996,
+                    // Vampiric Touch all ranks
+                    34914, 34916, 34917, 48159, 48160
+                };
+                if (s_empowered.count(info->Id))
+                    g_inspireWindow[guid] = { getMSTime() + 10000u, insRank };
+            }
+        }
+
+        // ── Radiant Cure (5417) — on Dispel/Cure casts, also remove disease+poison ──
+        // R1: disease+poison. R2: +curse. R3: Mass Dispel AoE (stub — see below).
+        {
+            uint8 rcRank = SanctumAA::GetRank(player, AA_PRI_RADIANT_CURE);
+            if (rcRank > 0)
+            {
+                // Dispel Magic (all ranks) + Mass Dispel
+                static const std::unordered_set<uint32> s_dispel = {
+                    527, 988, 32375, // Dispel Magic ranks + Mass Dispel
+                    2782, 19803, 19804, 19805, 25431  // Cure Disease ranks
+                };
+                if (s_dispel.count(info->Id))
+                {
+                    Unit* tgt = spell->m_targets.GetUnitTarget();
+                    if (!tgt) tgt = player;
+                    if (tgt)
+                    {
+                        // R1+: remove disease and poison
+                        std::vector<uint32> toRemove;
+                        for (auto const& [key, app] : tgt->GetAppliedAuras())
+                        {
+                            if (!app) continue;
+                            SpellInfo const* si = app->GetBase()->GetSpellInfo();
+                            if (!si || app->IsPositive()) continue;
+                            uint32 dt = si->Dispel;
+                            if (dt == DISPEL_DISEASE || dt == DISPEL_POISON)
+                                toRemove.push_back(key);
+                            // R2+: also curse
+                            if (rcRank >= 2 && dt == DISPEL_CURSE)
+                                toRemove.push_back(key);
+                        }
+                        for (uint32 k : toRemove)
+                            tgt->RemoveAura(k);
+                    }
+                    // R3 Mass Dispel AoE — extend to nearby allies
+                    // Stubbed: no clean radius-dispel hook; single-target above is the main effect.
+                }
+            }
+        }
 
         // Charge spell IDs in 3.3.5a
         static const std::unordered_set<uint32> s_charge = { 100, 6178, 11578 };
@@ -1163,7 +1727,7 @@ public:
         if (!rank)
             return;
 
-        uint32 guid = player->GetGUID().GetCounter();
+        // (guid declared above in the Flurry block)
 
         // Open the 6s damage window via exported function in aa_combat_modifiers.cpp
         {

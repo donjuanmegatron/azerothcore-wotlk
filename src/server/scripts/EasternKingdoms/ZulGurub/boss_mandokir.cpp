@@ -254,14 +254,13 @@ public:
         {
             if (type == ACTION_CHARGE)
             {
-                if (_chargeTarget.first == guid && _chargeTarget.second > 0.f)
-                {
-                    if (Unit* target = ObjectAccessor::GetUnit(*me, _chargeTarget.first))
-                    {
-                        me->RemoveAurasDueToSpell(SPELL_WHIRLWIND);
-                        DoCast(target, SPELL_WATCH_CHARGE, true);
-                    }
-                }
+                // Sanctum (solo): Watch no longer Charges + Mortal-Strikes the player for
+                // acting while watched. Solo, the player is ALWAYS the watched target, so
+                // the original punish forced them to stop attacking — an unwinnable DPS
+                // stall. Watch still applies (flavor); it just no longer triggers the
+                // Charge. Mandokir stays punishing via Overpower / Whirlwind / Mortal
+                // Strike / Frenzy / Execute / Level-Up.
+                (void)guid;
             }
             else
             {

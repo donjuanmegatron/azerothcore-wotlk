@@ -80,7 +80,12 @@ struct boss_razorgore : public BossAI
     {
         _Reset();
         _charmerGUID.Clear();
-        secondPhase = false;
+        // Sanctum (solo): skip Phase 1 (orb mind-control egg event). Razorgore starts
+        // already in his "second phase", so he is directly attackable and dies normally
+        // — no orb, no defenseless parked body, no add waves, no 30-egg requirement.
+        // The P1 lethal-damage orb-explosion in DamageTaken() is gated on !secondPhase,
+        // so it never fires; JustEngagedWith() no longer starts the egg event.
+        secondPhase = true;
         summons.DespawnAll();
         instance->SetData(DATA_EGG_EVENT, NOT_STARTED);
     }
@@ -118,8 +123,8 @@ struct boss_razorgore : public BossAI
         events.ScheduleEvent(EVENT_STOMP, 35s);
         events.ScheduleEvent(EVENT_FIREBALL, 7s);
         events.ScheduleEvent(EVENT_CONFLAGRATION, 12s);
-
-        instance->SetData(DATA_EGG_EVENT, IN_PROGRESS);
+        // Sanctum (solo): do NOT start the egg event — that's what spawns the add waves
+        // and requires orb-controlling Razorgore to destroy 30 eggs. He is fought directly.
     }
 
     void DoChangePhase()

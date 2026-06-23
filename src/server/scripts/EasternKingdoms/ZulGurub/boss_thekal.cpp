@@ -157,14 +157,13 @@ struct boss_thekal : public BossAI
     {
         UpdateZealotStatus(data, true);
         CheckPhaseTransition();
-
-        scheduler.Schedule(10s, [this, data](TaskContext /*context*/)
-        {
-            if (!_lorkhanDied || !_zathDied || !_wasDead)
-            {
-                ReviveZealot(data);
-            }
-        });
+        // Sanctum (solo): zealots stay dead when killed. The original scheduled a 10s
+        // revive of Lor'Khan/Zath unless Thekal had feigned AND both zealots were dead
+        // within the window — an impossible simultaneous-kill for a solo player.
+        // CheckPhaseTransition() (called above on each zealot death and when Thekal
+        // feigns in DamageTaken) still fires Phase 2 once all three conditions are met,
+        // in ANY order, so the fight completes sequentially. ReviveZealot() is left
+        // defined but intentionally unused.
     }
 
     void DamageTaken(Unit* attacker, uint32& damage, DamageEffectType damageEffectType, SpellSchoolMask spellSchoolMask) override

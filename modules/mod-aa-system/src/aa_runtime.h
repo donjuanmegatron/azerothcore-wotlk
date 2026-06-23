@@ -294,6 +294,10 @@ enum SanctumAAId : uint32
     AA_ROG_POISON_MASTER   = 5339,
     AA_ROG_SHADOWSTEP_MASTERY = 5340,
     AA_ROG_CHAOTIC_STAB    = 5341,
+    AA_ROG_LEECHING_TOXINS = 5342,  // +4%/7%/10% of Rogue poison damage returns as health
+
+    // ── GENERAL — DEFENSIVE additions ──────────────────────────
+    AA_G_CLEANSE_CURSE     = 2113,  // Active: remove all curse effects. 30s CD. (Placed out-of-sequence in enum; treated as General-Defensive)
 
     // ── CLASS — PRIEST (5401–5446) ──────────────────────────
     AA_PRI_TWINHEAL              = 5401,

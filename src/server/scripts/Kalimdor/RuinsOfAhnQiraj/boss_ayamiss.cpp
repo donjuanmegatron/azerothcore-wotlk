@@ -84,18 +84,11 @@ struct boss_ayamiss : public BossAI
     void Reset() override
     {
         BossAI::Reset();
-        me->SetCombatMovement(false);
+        // Sanctum (solo): Ayamiss stays grounded (see JustEngagedWith) so melee specs
+        // can reach her. CombatMovement on so she chases. The original 70%-HP "land from
+        // the air" transition is removed — she never takes off in the first place.
+        me->SetCombatMovement(true);
         me->SetReactState(REACT_AGGRESSIVE);
-
-        ScheduleHealthCheckEvent(70, [&] {
-            me->ClearUnitState(UNIT_STATE_ROOT);
-            me->SetReactState(REACT_PASSIVE);
-            me->SetCanFly(false);
-            me->SetDisableGravity(false);
-            me->GetMotionMaster()->MoveWaypoint(me->GetEntry() * 10, false);
-            DoResetThreatList();
-            scheduler.CancelGroup(GROUP_AIR);
-        });
 
         ScheduleHealthCheckEvent(20, [&] {
             DoCastSelf(SPELL_FRENZY);
@@ -199,10 +192,20 @@ struct boss_ayamiss : public BossAI
     void JustEngagedWith(Unit* attacker) override
     {
         BossAI::JustEngagedWith(attacker);
-        me->SetCanFly(true);
-        me->SetDisableGravity(true);
-        me->GetMotionMaster()->MovePoint(POINT_AIR, AyamissAirPos);
+        // Sanctum (solo): do NOT take off. The original flies up and roots high in the
+        // air (100%->70% HP), which MELEE specs can never reach (only ranged could damage
+        // her airborne) — an impossible gate for half of all specs. She fights grounded
+        // the whole time, keeping every ability and all 28 swarmers. Schedule her ranged
+        // kit (Stinger Spray / Poison Stinger / swarmers / Paralyze) AND the melee kit
+        // (Lash / Thrash) the original only scheduled on landing.
         ScheduleTasks();
+        scheduler.Schedule(5s, 8s, [this](TaskContext context) {
+            DoCastVictim(SPELL_LASH);
+            context.Repeat(8s, 15s);
+        }).Schedule(16s, [this](TaskContext context) {
+            DoCastSelf(SPELL_THRASH);
+            context.Repeat();
+        });
     }
 
 private:
@@ -220,9 +223,13 @@ struct npc_hive_zara_larva : public ScriptedAI
 
     void MovementInform(uint32 type, uint32 id) override
     {
-        if (type == POINT_MOTION_TYPE && id == POINT_PARALYZE)
-            if (Player* target = ObjectAccessor::GetPlayer(*me, _instance->GetGuidData(DATA_PARALYZED)))
-                DoCast(target, SPELL_FEED);
+        // Sanctum (solo): the larva no longer Feeds (sacrifices) the paralyzed player at
+        // the altar. Solo, the paralyzed target is always the only player, so the Feed is
+        // a guaranteed unavoidable sacrifice-kill (you're paralyzed, can't react). The
+        // larva still spawns; the paralyze still flickers (and Indomitable blocks it for
+        // owners), but there's no lethal sacrifice.
+        (void)type;
+        (void)id;
     }
 
     void JustSummoned(Creature* summon) override
