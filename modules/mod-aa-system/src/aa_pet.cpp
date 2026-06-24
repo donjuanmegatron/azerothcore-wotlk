@@ -20,6 +20,10 @@
 // creatures (Felguard, Risen Ghoul, Spirit Wolf, Treant, Shadowfiend).
 // GetOwnerPlayer() detects both types by checking GetOwner() for a Player.
 //
+//   5521  Ghoul Infestation — DK: 10/20/30% proc on ghoul swing → queue Frost Fever/Blood Plague (alternating)
+//   5522  Detonation        — DK: on ghoul death, 80% ghoul max HP as AoE Shadow dmg in 10 yd
+//   5523  Army Commander    — DK: +10/20/30% damage for ghoul (26125) and AotD ghoul (24207)
+//
 // DEFERRED:
 //   3004  Predator's Howl   — needs spell ID for debuff apply
 //   3201  Assist Me         — active ability → aa_actives.cpp
@@ -32,17 +36,24 @@
 #include "Player.h"
 #include "Pet.h"
 #include "Unit.h"
+#include "Creature.h"
 #include "SpellInfo.h"
 #include "Timer.h"
 #include "Random.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <vector>
 
 // Cheer active-burst windows — defined in aa_actives.cpp.
 extern bool SanctumAA_CheerOffensiveActive(uint32 guid);
 extern bool SanctumAA_CheerDefensiveActive(uint32 guid);
 extern bool SanctumAA_CheerSwiftnessActive(uint32 guid);
+
+// Ghoul Infestation disease queue — implemented in aa_class.cpp; sets a deferred entry
+// that is drained safely in the player's OnUnitUpdate tick (outside damage hooks).
+// SAFETY RULE: CastSpell must NOT be called inside ModifyMeleeDamage.
+void SanctumAA_QueueGhoulInfest(uint32 playerGuid, uint32 victimLow);  // defined in aa_class.cpp
 
 // ---------------------------------------------------------------------------
 // File-local state
@@ -168,6 +179,26 @@ namespace
                 unit->HandleStatFlatModifier(UNIT_MOD_STAT_INTELLECT, TOTAL_VALUE, player->GetStat(STAT_INTELLECT) * bonus, true);
                 unit->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT,    TOTAL_VALUE, player->GetStat(STAT_SPIRIT)    * bonus, true);
                 unit->UpdateAllStats();
+            }
+        }
+
+        // ── Alpha Pack (5610) R2+ — spirit wolves inherit +30% haste and crit ──
+        // Only applies to spirit wolf guardians (entry 29264). R1 only adds CD reduction (in OnPlayerSpellCast).
+        // Haste: Agility proxy (+30% as flat Agility boost for crit); melee haste via ApplyAttackTimePercentMod.
+        // Crit: additional Agility (same as Pack Tactics pattern).
+        {
+            Creature* cr = unit->ToCreature();
+            if (cr && cr->GetEntry() == 29264u)
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_SHA_ALPHA_PACK);
+                if (rank >= 2)
+                {
+                    // +30% melee haste approximated as ApplyAttackTimePercentMod
+                    unit->ApplyAttackTimePercentMod(BASE_ATTACK, 30.0f, true);
+                    // +30% crit approximated via Agility bonus (same rate as Pack Tactics per rank)
+                    unit->HandleStatFlatModifier(UNIT_MOD_STAT_AGILITY, TOTAL_VALUE, 173.0f * 3.0f, true); // ~3 ranks of pack tactics worth
+                    unit->UpdateAllStats();
+                }
             }
         }
     }
@@ -297,6 +328,68 @@ public:
                                 damage += damage / 2u;
                                 stamp = getMSTime();
                             }
+                        }
+                    }
+                }
+
+                // Army Commander (5523) — +10/20/30% damage for DK ghoul (entry 26125)
+                // and Army of the Dead ghoul (entry 24207). Duration extension for AotD is
+                // not feasible via AzerothCore 3.3.5a hooks — skipped (see comment).
+                {
+                    Creature* cr = attacker->ToCreature();
+                    uint8 rank = SanctumAA::GetRank(player, AA_DK_ARMY_COMMANDER);
+                    if (rank > 0 && cr)
+                    {
+                        uint32 entry = cr->GetEntry();
+                        if (entry == 26125u || entry == 24207u)
+                        {
+                            static const float bonus[] = { 0.0f, 0.10f, 0.20f, 0.30f };
+                            damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                        }
+                    }
+                }
+
+                // Ghoul Infestation (5521) — 10/20/30% chance on DK ghoul melee swing to apply
+                // a disease (Frost Fever 55095 or Blood Plague 55078) to the target.
+                // SAFETY: CastSpell must NOT be called inside ModifyMeleeDamage (re-entrant loop risk).
+                // We queue the apply into g_ghoulInfestQueue via SanctumAA_QueueGhoulInfest();
+                // it is drained in the player's OnUnitUpdate tick (aa_class.cpp).
+                {
+                    Creature* cr = attacker->ToCreature();
+                    uint8 rank = SanctumAA::GetRank(player, AA_DK_GHOUL_INFESTATION);
+                    if (rank > 0 && cr && cr->GetEntry() == 26125u && target)
+                    {
+                        static const float chance[] = { 0.0f, 10.0f, 20.0f, 30.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        {
+                            SanctumAA_QueueGhoulInfest(
+                                player->GetGUID().GetCounter(),
+                                target->GetGUID().GetCounter());
+                        }
+                    }
+                }
+
+                // Spirit Bond (5611) — PARTIAL STUB ───────────────────────────────
+                // Catalog: spirit wolves' melee 20/35/50% chance to proc your active weapon enchant.
+                // "Force-procking a weapon imbue" (Windfury/Flametongue/etc.) is not cleanly
+                // hookable in 3.3.5a — weapon enchant procs use internal probability tables that
+                // cannot be triggered programmatically from a pet melee hook without calling
+                // CastSpell with specific enchant proc IDs, which varies per equipped imbue.
+                // APPROXIMATION: on spirit wolf melee hit, chance-proc a flat Nature damage bonus
+                // as a stand-in for the weapon enchant. 20/35/50% chance → deals 60% owner AP as Nature.
+                // This captures the spirit of the AA (extra proc damage from wolf melee) without
+                // requiring imbue detection.
+                {
+                    Creature* cr = attacker->ToCreature();
+                    uint8 rank = SanctumAA::GetRank(player, AA_SHA_SPIRIT_BOND);
+                    if (rank > 0 && cr && cr->GetEntry() == 29264u && target)
+                    {
+                        static const float chance[] = { 0.0f, 20.0f, 35.0f, 50.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        {
+                            uint32 ap = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+                            uint32 procDmg = std::max(1u, (uint32)(ap * 0.60f));
+                            SanctumAA_DealVisibleDamage(player, target, procDmg, SPELL_SCHOOL_MASK_NATURE);
                         }
                     }
                 }
@@ -474,6 +567,7 @@ public:
     // -----------------------------------------------------------------------
     // OnUnitDeath — remove unit GUID from applied-stats set so a re-summon
     // of the same pet/guardian gets a fresh stat application.
+    // Also fires Detonation (5522) AoE explosion on DK ghoul death.
     // -----------------------------------------------------------------------
     void OnUnitDeath(Unit* unit, Unit* /*killer*/) override
     {
@@ -485,6 +579,36 @@ public:
         g_petStatsApplied.erase(unitGuid);
         g_sfIcd.erase(unitGuid);
         g_mendBondTick.erase(unitGuid);
+
+        // Detonation (5522) — ONE-SHOT. On DK Risen Ghoul (entry 26125) death:
+        // deal 80% of the ghoul's MAX HP as Shadow damage to all hostile units within 10 yd.
+        // SanctumAA_DealVisibleDamage is SAFE to call in OnUnitDeath (not inside a damage modifier hook).
+        {
+            Creature* cr = unit->ToCreature();
+            if (cr && cr->GetEntry() == 26125u && SanctumAA::Has(player, AA_DK_DETONATION))
+            {
+                uint32 explodeDmg = (uint32)(unit->GetMaxHealth() * 0.80f);
+                if (explodeDmg > 0)
+                {
+                    // Sweep attackers list of the owner + any hostile creature the ghoul had aggro from.
+                    // Use the owner's attacker list (most reliable in AzerothCore) plus the ghoul's
+                    // attacker list for completeness.
+                    std::unordered_set<Unit*> targets;
+                    for (Unit* atk : player->getAttackers())
+                    {
+                        if (atk && atk->IsAlive() && unit->GetDistance(atk) <= 10.0f)
+                            targets.insert(atk);
+                    }
+                    for (Unit* atk : unit->getAttackers())
+                    {
+                        if (atk && atk->IsAlive() && atk != player && unit->GetDistance(atk) <= 10.0f)
+                            targets.insert(atk);
+                    }
+                    for (Unit* t : targets)
+                        SanctumAA_DealVisibleDamage(player, t, explodeDmg, SPELL_SCHOOL_MASK_SHADOW);
+                }
+            }
+        }
     }
 };
 

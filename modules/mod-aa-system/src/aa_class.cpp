@@ -39,8 +39,18 @@
 //   5506  Necrotic Touch       — DK: 10/20/30% proc on auto: shadow DoT (AP*5%, 3 ticks, 6s, max 3 stacks)
 //   5508  Frost Rot            — Death Knight: +3/6/10% HB/FS/Obliterate when target has Frost Fever
 //   5510  Contagion Drain      — Death Knight: 1%/2%/3% max HP/s while 2+ diseased enemies nearby
-//   5513  Scourge Mastery      — Death Knight: +20% Scourge Strike damage
-//   5515  Arctic Howl          — Death Knight: +10% Howling Blast damage
+//   5505  Unholy Guard         — Death Knight: absorbs 5/8/12% melee+spell dmg via Runic Power spend
+//   5507  Iron Shell           — Death Knight: PARTIAL -10/15/20% DR while AMS/Bone Shield active; R3 CD reduction
+//   5513  Scourge Mastery      — Death Knight: +15/25/35% Scourge Strike dmg; R2+ applies both diseases on hit
+//   5514  Rune Blade Mastery   — Death Knight: PARTIAL +5/10/15% dmg while Dancing Rune Weapon active
+//   5515  Arctic Howl          — Death Knight: Howling Blast +20/35/50% dmg, guaranteed crit-magnitude, R2+ spreads FF+BP to all targets hit (AoE spike)
+//   5516  Battle Frenzy        — Death Knight: PARTIAL Hysteria CD reduction; infinite duration stubbed
+//   5517  Deathchill Mastery   — Death Knight: STUB — Deathchill spell ID not found in mod-dk-rework
+//   5518  Plague's End         — Death Knight: on kill, 15% HP heal + spread diseases to 2 nearby
+//   5519  Final Rune           — Death Knight: cheat-death, 15% HP survive + 20% HoT, 3min CD
+//   5520  Virulent Plague      — Death Knight: PARTIAL Nature DoT queued on Plague Strike, +4s rider stubbed
+//   5524  Soul Abrasion        — Death Knight: flat 5/8/12% HP heal + 10/15/20 RP on Death Strike cast
+//   5526  Improved Harm Touch  — Death Knight: +15/30/45% Death Coil damage (reframed from resist-reduce)
 //   5603  Earthen Presence     — Shaman: -10/18/25% melee dmg from attackers (approx attack-speed debuff)
 //   5602  Blood Tithe          — Shaman: Flame Shock ticks heal player 15/25/40% of damage
 //   5609  Soul Harvest         — Shaman: on kill, restore 5/10/15% max mana
@@ -157,6 +167,58 @@ namespace
     // Contagion Drain 1s tick
     std::unordered_map<uint32, uint32> g_contDrainTick;
 
+    // ── Shaman: Scorched Earth (5614) — queued Fire DoT from Lava Burst ────
+    struct ScorchedState { uint32 endMs = 0; uint32 lastTickMs = 0; uint32 tickDmg = 0; };
+    std::unordered_map<uint32, std::unordered_map<uint32, ScorchedState>> g_scorchedEarth; // playerGuid → victimLow → state
+
+    // ── Shaman: Ancestral Bulwark (5619) — Earth Shield queue ───────────────
+    // playerGuid → list of targetLow GUIDs to apply Earth Shield on next safe tick
+    std::unordered_map<uint32, std::vector<uint32>> g_earthShieldQueue; // playerGuid → {targetLows}
+
+    // ── Shaman: Ancestral Guard (5605) — post-self-heal absorb shield ───────
+    struct AncestralGuardAbsorb { int32 absorb = 0; uint32 expireMs = 0; };
+    std::unordered_map<uint32, AncestralGuardAbsorb> g_ancestralGuardAbsorb; // playerGuid → state
+
+    // ── Shaman: Ghost Strike (5617) — periodic Nature strike ────────────────
+    std::unordered_map<uint32, uint32> g_ghostStrikeTick; // playerGuid → last tick ms
+
+    // ── Shaman: Lightning Rod (5615) — post-CL periodic bounce window ───────
+    struct LightningRodState { uint32 expireMs = 0; uint32 lastFireMs = 0; uint32 targetLow = 0; uint8 rank = 0; };
+    std::unordered_map<uint32, LightningRodState> g_lightningRod; // playerGuid → state
+
+    // ── Shaman: Elemental Accord (5620) — per-5s active-totem buff tracking ─
+    // Tracks currently applied totem bonus stat amounts so we can remove them when totems drop.
+    // Stored as flat AP added; recalculated every 5s.
+    struct ElementalAccordState { int32 appliedAP = 0; uint32 lastTickMs = 0; };
+    std::unordered_map<uint32, ElementalAccordState> g_elementalAccord; // playerGuid → state
+
+    // ── Shaman: Alpha Pack (5610) — Feral Spirit CD tracking ────────────────
+    // ModifySpellCooldown on cast handles CD reduction; wolf-buff tracking done in aa_pet.cpp.
+    // (no extra state needed here)
+
+    // ── Death Knight: Virulent Plague (5520) — queued Nature DoT ───────────
+    // playerGuid → victimLow → {endMs, lastTickMs, tickDmg}
+    struct VirulentState { uint32 endMs = 0; uint32 lastTickMs = 0; uint32 tickDmg = 0; };
+    std::unordered_map<uint32, std::unordered_map<uint32, VirulentState>> g_virulentPlague;
+    // Virulent Plague pending application queue: playerGuid → victimLow (apply on next OnUnitUpdate)
+    std::unordered_map<uint32, uint32> g_virulentQueue; // playerGuid → victimLow
+
+    // ── Death Knight: Ghoul Infestation (5521) — queued disease apply ───────
+    // playerGuid → victimLow  (apply ONE alternating disease on next OnUnitUpdate)
+    std::unordered_map<uint32, uint32> g_ghoulInfestQueue; // playerGuid → victimLow
+    // Track which disease to apply next (alternates per player)
+    std::unordered_map<uint32, bool> g_ghoulInfestToggle; // false=Frost Fever, true=Blood Plague
+
+    // ── Death Knight: Scourge Mastery R2+ — apply BOTH diseases on next tick ──
+    // playerGuid → victimLow  (apply Frost Fever + Blood Plague on next safe tick)
+    std::unordered_map<uint32, uint32> g_scourgeDiseasesQueue; // playerGuid → victimLow
+
+    // ── Death Knight: Arctic Howl R2+ (5515) — AoE disease spread ─────────────
+    // Howling Blast hits multiple targets, so this is a MULTI-victim queue
+    // (one entry per target hit that tick). Drained in OnUnitUpdate → casts
+    // Frost Fever + Blood Plague on each. playerGuid → list of victimLow.
+    std::unordered_map<uint32, std::vector<uint32>> g_howlSpreadQueue;
+
     static void ClearPlayerState(uint32 guid, Player* player = nullptr)
     {
         // Restore Frenzy speed modifier before clearing state
@@ -191,6 +253,21 @@ namespace
         g_roguePoison.erase(guid);
         g_poisonAppliedMs.erase(guid);
         g_invigorTick.erase(guid);
+        // Death Knight
+        g_virulentPlague.erase(guid);
+        g_virulentQueue.erase(guid);
+        g_ghoulInfestQueue.erase(guid);
+        g_ghoulInfestToggle.erase(guid);
+        g_scourgeDiseasesQueue.erase(guid);
+        g_howlSpreadQueue.erase(guid);
+        // Shaman
+        g_scorchedEarth.erase(guid);
+        g_earthShieldQueue.erase(guid);
+        g_ancestralGuardAbsorb.erase(guid);
+        g_ghostStrikeTick.erase(guid);
+        g_lightningRod.erase(guid);
+        // Elemental Accord: remove any lingering stat bonus on death (player arg required)
+        // Done in OnUnitDeath after ClearPlayerState is called with the player pointer.
     }
 }
 
@@ -233,6 +310,39 @@ static void QueueRoguePoison(Player* player, Unit* victim, uint32 weaponCount)
 
     // Record last application time for Invigoration window
     g_poisonAppliedMs[guid] = now;
+}
+
+// ---------------------------------------------------------------------------
+// Exported helper: aa_pet.cpp calls this from ModifyMeleeDamage to schedule
+// a Ghoul Infestation disease apply (CastSpell) for the next safe OnUnitUpdate tick.
+// ---------------------------------------------------------------------------
+void SanctumAA_QueueGhoulInfest(uint32 playerGuid, uint32 victimLow)
+{
+    g_ghoulInfestQueue[playerGuid] = victimLow;
+}
+
+// ---------------------------------------------------------------------------
+// Exported helper: aa_combat_modifiers.cpp calls this from ModifyHealReceived
+// to schedule Earth Shield application (CastSpell must NOT run inside that hook).
+// Drained in aa_class_unit::OnUnitUpdate below.
+// ---------------------------------------------------------------------------
+void SanctumAA_QueueEarthShield(uint32 playerGuid, uint32 targetLow)
+{
+    g_earthShieldQueue[playerGuid].push_back(targetLow);
+}
+
+// ---------------------------------------------------------------------------
+// Exported helper: aa_combat_modifiers.cpp calls this from ModifyHealReceived
+// to set the Ancestral Guard absorb shield state.
+// The g_ancestralGuardAbsorb map is owned by aa_class.cpp and consumed in the
+// damage-taken hooks in this same file.
+// ---------------------------------------------------------------------------
+void SanctumAA_ApplyAncestralGuard(uint32 playerGuid, int32 amount, uint32 durationMs)
+{
+    auto& st = g_ancestralGuardAbsorb[playerGuid];
+    // Add new shield on top of existing (stacks up to next 8s window)
+    st.absorb    += amount;
+    st.expireMs   = getMSTime() + durationMs;
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +788,40 @@ public:
                 }
             }
 
+            // Rune Blade Mastery (5514) — PARTIAL: while Dancing Rune Weapon (49028) aura is active,
+            // +5/10/15% melee damage done.
+            // DRW duration/cost/count modifications are not cleanly moddable in 3.3.5a; stubbed.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_RUNE_BLADE);
+                if (rank > 0 && player->HasAura(49028u))
+                {
+                    static const float bonus[] = { 0.0f, 0.05f, 0.10f, 0.15f };
+                    damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Weapon Attunement (5607) — PARTIAL STUB ───────────────────────────
+            // Catalog: +5/10/15% extra chance to proc weapon enchant (MH+OH).
+            // "Force-increasing weapon imbue proc chance" requires hooking into the
+            // enchant proc probability check, which is deep in the spell proc code and
+            // not exposed as a hook in 3.3.5a without core modification.
+            // APPROXIMATION: each swing has a 5/10/15% chance to deal an extra Nature
+            // damage hit = 40% AP, simulating the feel of a weapon enchant going off.
+            // No ICD — mirrors the "extra proc chance" intent.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_SHA_WEAPON_ATTUNEMENT);
+                if (rank > 0)
+                {
+                    static const float chance[] = { 0.0f, 5.0f, 10.0f, 15.0f };
+                    if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                    {
+                        uint32 ap2 = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+                        uint32 procDmg2 = std::max(1u, (uint32)(ap2 * 0.40f));
+                        SanctumAA_DealVisibleDamage(player, target, procDmg2, SPELL_SCHOOL_MASK_NATURE);
+                    }
+                }
+            }
+
         } // end ATTACKER IS PLAYER
 
         // ── VICTIM IS PLAYER ────────────────────────────────────────────────
@@ -725,6 +869,61 @@ public:
                     damage = (uint32)(damage * (1.0f - dr[Idx<uint8>(rank)]));
                 }
             }
+
+            // Unholy Guard (DK, 5505) — absorbs 5/8/12% of incoming melee damage, spending Runic Power.
+            // NOTE: secondary/tertiary DKs get RP topped up via a hidden pool in mod-multiclass, so
+            // GetPower(POWER_RUNIC_POWER) works regardless of the character's primary power type.
+            // 1 Runic Power absorbs approximately 1 point of damage (RP pool caps absorb amount).
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_UNHOLY_GUARD);
+                if (rank > 0 && damage > 0)
+                {
+                    uint32 rpAvail = player->GetPower(POWER_RUNIC_POWER);
+                    if (rpAvail > 0)
+                    {
+                        static const float pct[] = { 0.0f, 0.05f, 0.08f, 0.12f };
+                        uint32 absorb = std::min(static_cast<uint32>(damage * pct[Idx<uint8>(rank)]),
+                                                 rpAvail);
+                        if (absorb > 0)
+                        {
+                            damage -= absorb;
+                            player->ModifyPower(POWER_RUNIC_POWER, -static_cast<int32>(absorb));
+                        }
+                    }
+                }
+            }
+
+            // Iron Shell (5507) — PARTIAL: while AMS (48707) or Bone Shield (49222) is active,
+            // apply -10/15/20% DR on incoming melee damage.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_IRON_SHELL);
+                if (rank > 0 && damage > 0 &&
+                    (player->HasAura(48707u) || player->HasAura(49222u)))
+                {
+                    static const float dr[] = { 0.0f, 0.10f, 0.15f, 0.20f };
+                    damage = (uint32)(damage * (1.0f - dr[Idx<uint8>(rank)]));
+                }
+            }
+
+            // Ancestral Guard (5605) — consume absorb shield on incoming melee hit
+            {
+                uint32 vGuid2 = player->GetGUID().GetCounter();
+                auto it = g_ancestralGuardAbsorb.find(vGuid2);
+                if (it != g_ancestralGuardAbsorb.end() && it->second.absorb > 0 && damage > 0)
+                {
+                    if (getMSTime() > it->second.expireMs)
+                    {
+                        it->second.absorb = 0;
+                    }
+                    else
+                    {
+                        uint32 absorbed = std::min((uint32)it->second.absorb, damage);
+                        damage -= absorbed;
+                        it->second.absorb -= (int32)absorbed;
+                    }
+                }
+            }
+
         } // end VICTIM IS PLAYER
     }
 
@@ -1090,24 +1289,87 @@ public:
                 }
             }
 
-            // Scourge Mastery (Death Knight) — +20% Scourge Strike damage
+            // Scourge Mastery (Death Knight) — +15/25/35% Scourge Strike damage (per-rank scaling)
+            // R2/R3 rider (queue disease on hit) is implemented via g_virulentPlague pattern below.
             {
                 static const std::unordered_set<uint32> s_scourge = {
                     55090,55265,55270,55271
                 };
                 uint8 rank = SanctumAA::GetRank(player, AA_DK_SCOURGE_MASTERY);
                 if (rank > 0 && s_scourge.count(spellInfo->Id))
-                    damage += (int32)(damage * 0.20f);
+                {
+                    static const float bonus[] = { 0.0f, 0.15f, 0.25f, 0.35f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+
+                    // R2+: queue applying BOTH Frost Fever (55095) + Blood Plague (55078) on next safe tick
+                    // Uses a dedicated queue separate from Ghoul Infestation's alternating queue.
+                    if (rank >= 2 && target)
+                    {
+                        uint32 guid = player->GetGUID().GetCounter();
+                        g_scourgeDiseasesQueue[guid] = target->GetGUID().GetCounter();
+                    }
+                }
             }
 
-            // Arctic Howl (Death Knight) — +10% Howling Blast damage
+            // Arctic Howl (Death Knight, 5515) — Howling Blast AoE-spike capstone.
+            //   Damage:  +20/35/50% per rank.
+            //   Guaranteed crit: Howling Blast always deals crit-magnitude damage.
+            //     Implemented as a +50% multiplier (the WotLK spell-crit bonus) because this
+            //     hook fires AFTER the crit roll — the number is crit-sized even if it does
+            //     not always render yellow. (Design ruling: "always crit = guaranteed crit damage".)
+            //   Disease spread (R2+): the FULL disease kit (Frost Fever + Blood Plague) is
+            //     spread to every target Howling Blast hits. R1 relies on Howling Blast's
+            //     native Frost Fever application. The hook fires once per AoE target, so each
+            //     target is pushed into a multi-victim spread queue drained in OnUnitUpdate
+            //     (CastSpell is unsafe here — re-entrancy). R3's extra +10yd spread is
+            //     approximated by Howling Blast's native AoE radius covering the pack.
             {
                 static const std::unordered_set<uint32> s_howlingBlast = {
                     49184,51411,51412
                 };
                 uint8 rank = SanctumAA::GetRank(player, AA_DK_ARCTIC_HOWL);
                 if (rank > 0 && s_howlingBlast.count(spellInfo->Id))
-                    damage += (int32)(damage * 0.10f);
+                {
+                    static const float bonus[] = { 0.0f, 0.20f, 0.35f, 0.50f };
+                    // Damage boost
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                    // Guaranteed crit-magnitude (+50%, WotLK spell crit multiplier)
+                    damage += (int32)(damage * 0.5f);
+
+                    // R2+: queue full disease spread (FF + BP) onto this target.
+                    if (rank >= 2 && target)
+                    {
+                        uint32 guid = player->GetGUID().GetCounter();
+                        g_howlSpreadQueue[guid].push_back(target->GetGUID().GetCounter());
+                    }
+                }
+            }
+
+            // Improved Harm Touch (AA_DK_IMPROVED_HARM_TOUCH, 5526) —
+            // Reframed: +15/30/45% Death Coil damage.
+            // Catalog described "resist reduction" which is not cleanly moddable in 3.3.5a;
+            // a flat damage bonus achieves the same power-increase intent.
+            {
+                static const std::unordered_set<uint32> s_deathCoil = {
+                    47541, 47632, 47633, 49892, 49894, 49895, 52375, 59134
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_IMPROVED_HARM_TOUCH);
+                if (rank > 0 && s_deathCoil.count(spellInfo->Id))
+                {
+                    static const float bonus[] = { 0.0f, 0.15f, 0.30f, 0.45f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
+            }
+
+            // Rune Blade Mastery (5514) — PARTIAL: while Dancing Rune Weapon aura is active,
+            // +5/10/15% spell damage done. DRW duration/cost/count mods are not moddable in 3.3.5a.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_RUNE_BLADE);
+                if (rank > 0 && player->HasAura(49028u))
+                {
+                    static const float bonus[] = { 0.0f, 0.05f, 0.10f, 0.15f };
+                    damage += (int32)(damage * bonus[Idx<uint8>(rank)]);
+                }
             }
 
             // Improved Drains (5802) — +10/18/30% Unstable Affliction damage
@@ -1136,6 +1398,112 @@ public:
                     extern void SanctumAA_ApplyDevastateStack(uint32 attackerGuid, uint32 victimGuid, uint8 rank);
                     uint32 attackerGuid = player->GetGUID().GetCounter();
                     SanctumAA_ApplyDevastateStack(attackerGuid, target->GetGUID().GetCounter(), rank);
+                }
+            }
+
+            // ── Elemental Overload (5616, renamed from Maelstrom Mastery) ──────────
+            // Lightning Bolt / Chain Lightning / Lava Burst 25/35/45% chance → free second hit at 50% dmg.
+            // SanctumAA_DealVisibleDamage is SAFE here (not a re-entrant recast — pure damage delivery).
+            {
+                static const std::unordered_set<uint32> s_lb = {
+                    403,529,548,915,943,6041,10391,10392,15207,15208,25448,25449,49237,49238
+                };
+                static const std::unordered_set<uint32> s_cl = {
+                    421,930,2860,10605,25439,25442,49268,49269
+                };
+                static const std::unordered_set<uint32> s_lavaburst = { 51505,60043 };
+
+                uint8 rank = SanctumAA::GetRank(player, AA_SHA_ELEMENTAL_OVERLOAD);
+                if (rank > 0 && target)
+                {
+                    bool isLBorCL   = s_lb.count(spellInfo->Id) || s_cl.count(spellInfo->Id);
+                    bool isLavaBurst = s_lavaburst.count(spellInfo->Id) > 0;
+                    if (isLBorCL || isLavaBurst)
+                    {
+                        static const float chance[] = { 0.0f, 25.0f, 35.0f, 45.0f };
+                        if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        {
+                            uint32 echoDmg = (uint32)(damage * 0.5f);
+                            if (echoDmg > 0)
+                            {
+                                uint32 school = isLavaBurst ? SPELL_SCHOOL_MASK_FIRE
+                                                            : SPELL_SCHOOL_MASK_NATURE;
+                                SanctumAA_DealVisibleDamage(player, target, echoDmg, school);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Lava Surge (5613) — Lava Lash cleave splash ──────────────────────
+            // Cleaves all enemies within rank-scaled radius. Safe: DealVisibleDamage only.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_SHA_LAVA_SURGE);
+                if (rank > 0 && spellInfo->Id == 60103u && target)
+                {
+                    static const float radius[] = { 0.0f, 6.0f, 8.0f, 10.0f };
+                    float r = radius[Idx<uint8>(rank)];
+                    uint32 splashDmg = (uint32)(damage);
+                    std::vector<Unit*> nearby;
+                    for (Unit* atk : player->getAttackers())
+                    {
+                        if (atk != target && atk->IsAlive() && target->GetDistance(atk) <= r)
+                            nearby.push_back(atk);
+                    }
+                    // Also sweep current target's area in case not in attacker list
+                    // (attackers list is the reliable source; supplemental GetVictim not needed)
+                    for (Unit* u : nearby)
+                        SanctumAA_DealVisibleDamage(player, u, splashDmg, SPELL_SCHOOL_MASK_FIRE);
+                }
+            }
+
+            // ── Scorched Earth (5614) — Lava Burst: +10% dmg + queue Fire DoT ────
+            // +10% flat Lava Burst damage at all ranks.
+            // DoT = 20/35/50% of hit over 6s (2s ticks = 3 ticks). Queued for safety.
+            {
+                static const std::unordered_set<uint32> s_lburst = { 51505,60043 };
+                uint8 rank = SanctumAA::GetRank(player, AA_SHA_SCORCHED_EARTH);
+                if (rank > 0 && s_lburst.count(spellInfo->Id) && target)
+                {
+                    // +10% LB damage (all ranks)
+                    damage += (int32)(damage * 0.10f);
+
+                    // Queue DoT: 20/35/50% of (original) hit over 6s, 3 ticks
+                    static const float dotPct[] = { 0.0f, 0.20f, 0.35f, 0.50f };
+                    uint32 totalDot = (uint32)(damage * dotPct[Idx<uint8>(rank)]);
+                    uint32 tickDmg  = std::max(1u, totalDot / 3u);
+                    uint32 victLow  = target->GetGUID().GetCounter();
+                    uint32 guid2    = player->GetGUID().GetCounter();
+                    // Store tick damage in queue for safe application on next OnUnitUpdate
+                    // Encode as a special entry: we push into g_scorchedQueue and store tickDmg
+                    // separately in g_scorchedEarth directly (safe outside damage hooks at setup time)
+                    auto& se = g_scorchedEarth[guid2][victLow];
+                    se.tickDmg   = tickDmg;
+                    se.endMs     = getMSTime() + 6000u;
+                    se.lastTickMs = getMSTime();
+                }
+            }
+
+            // ── Lightning Rod (5615) — Chain Lightning creates a 6s bounce window ─
+            // PARTIAL: after CL hits, open a window that re-fires CL at 30/50/70% every 2s.
+            // The rod fires from the player targeting the same victim for up to 3 bounces (6s).
+            // Implemented as a throttled window in OnUnitUpdate; no rod creature spawned.
+            {
+                static const std::unordered_set<uint32> s_cl2 = {
+                    421,930,2860,10605,25439,25442,49268,49269
+                };
+                uint8 rank = SanctumAA::GetRank(player, AA_SHA_LIGHTNING_ROD);
+                if (rank > 0 && s_cl2.count(spellInfo->Id) && target)
+                {
+                    // Open a 6s Lightning Rod window on this target.
+                    // Echo damage is computed in OnUnitUpdate from current SP (same as Spirit Lash pattern).
+                    // 30/50/70% of SP as Nature, re-fired every 2s for 6s (3 ticks).
+                    uint32 guid2 = player->GetGUID().GetCounter();
+                    auto& rod = g_lightningRod[guid2];
+                    rod.expireMs   = getMSTime() + 6000u;
+                    rod.lastFireMs = getMSTime();
+                    rod.targetLow  = target->GetGUID().GetCounter();
+                    rod.rank       = rank;
                 }
             }
 
@@ -1210,6 +1578,62 @@ public:
                     int32 healAmt = (int32)(player->GetMaxHealth() * pct[Idx<uint8>(rank)]);
                     if (healAmt > 0 && !player->IsFullHealth())
                         player->ModifyHealth(healAmt);
+                }
+            }
+
+            // Unholy Guard (DK, 5505) — absorbs 5/8/12% of incoming spell damage, spending Runic Power.
+            // NOTE: secondary/tertiary DKs get RP topped up via a hidden pool in mod-multiclass, so
+            // checking GetPower(POWER_RUNIC_POWER) works regardless of the character's primary power type.
+            // 1 Runic Power absorbs approximately 1 point of damage (RP pool caps the absorb amount).
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_UNHOLY_GUARD);
+                if (rank > 0 && damage > 0)
+                {
+                    uint32 rpAvail = player->GetPower(POWER_RUNIC_POWER);
+                    if (rpAvail > 0)
+                    {
+                        static const float pct[] = { 0.0f, 0.05f, 0.08f, 0.12f };
+                        int32 absorb = std::min(static_cast<int32>(damage * pct[Idx<uint8>(rank)]),
+                                                static_cast<int32>(rpAvail));
+                        if (absorb > 0)
+                        {
+                            damage -= absorb;
+                            player->ModifyPower(POWER_RUNIC_POWER, -absorb);
+                        }
+                    }
+                }
+            }
+
+            // Iron Shell (5507) — PARTIAL: while AMS (48707) or Bone Shield (49222) is active,
+            // apply -10/15/20% DR on incoming spell damage.
+            // "+25% AMS absorb cap" from catalog is approximated by this flat DR.
+            // R3 CD reduction on cast is handled in OnPlayerSpellCast.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_IRON_SHELL);
+                if (rank > 0 && damage > 0 &&
+                    (player->HasAura(48707u) || player->HasAura(49222u)))
+                {
+                    static const float dr[] = { 0.0f, 0.10f, 0.15f, 0.20f };
+                    damage = (int32)(damage * (1.0f - dr[Idx<uint8>(rank)]));
+                }
+            }
+
+            // Ancestral Guard (5605) — consume absorb shield on incoming spell damage
+            {
+                uint32 vGuid2 = player->GetGUID().GetCounter();
+                auto it = g_ancestralGuardAbsorb.find(vGuid2);
+                if (it != g_ancestralGuardAbsorb.end() && it->second.absorb > 0 && damage > 0)
+                {
+                    if (getMSTime() > it->second.expireMs)
+                    {
+                        it->second.absorb = 0;
+                    }
+                    else
+                    {
+                        int32 absorbed = std::min(it->second.absorb, damage);
+                        damage -= absorbed;
+                        it->second.absorb -= absorbed;
+                    }
                 }
             }
 
@@ -1608,6 +2032,289 @@ public:
             }
         }
 
+        // ── Ghoul Infestation (5521) — drain queue: apply disease cast deferred from pet-melee hook ──
+        // The actual queue entry is set in aa_pet.cpp's ModifyMeleeDamage via SanctumAA_QueueGhoulInfest.
+        // It is safe to CastSpell here because OnUnitUpdate is outside all damage hooks.
+        {
+            auto qit = g_ghoulInfestQueue.find(guid);
+            if (qit != g_ghoulInfestQueue.end())
+            {
+                uint32 victLow = qit->second;
+                g_ghoulInfestQueue.erase(qit);
+
+                // Locate victim by GUID counter
+                Unit* victim = nullptr;
+                for (Unit* atk : player->getAttackers())
+                    if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                if (!victim)
+                {
+                    Unit* v = player->GetVictim();
+                    if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                }
+                if (victim && victim->IsAlive())
+                {
+                    bool& toggle = g_ghoulInfestToggle[guid];
+                    // Apply Frost Fever (55095) or Blood Plague (55078), alternating each proc.
+                    uint32 diseaseId = toggle ? 55078u : 55095u;
+                    toggle = !toggle;
+                    player->CastSpell(victim, diseaseId, true);
+                }
+            }
+        }
+
+        // ── Scourge Mastery R2+ disease application — drain queue ──────────────────
+        // Queue is set in ModifySpellDamageTaken when a Scourge Strike hits.
+        // Applies BOTH Frost Fever (55095) and Blood Plague (55078) at once.
+        {
+            auto sqit = g_scourgeDiseasesQueue.find(guid);
+            if (sqit != g_scourgeDiseasesQueue.end())
+            {
+                uint32 victLow = sqit->second;
+                g_scourgeDiseasesQueue.erase(sqit);
+
+                Unit* victim = nullptr;
+                for (Unit* atk : player->getAttackers())
+                    if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                if (!victim)
+                {
+                    Unit* v = player->GetVictim();
+                    if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                }
+                if (victim && victim->IsAlive())
+                {
+                    player->CastSpell(victim, 55095u, true); // Frost Fever
+                    player->CastSpell(victim, 55078u, true); // Blood Plague
+                }
+            }
+        }
+
+        // ── Arctic Howl R2+ (5515) — drain AoE disease-spread queue ────────────────
+        // Queue is filled (one entry per Howling Blast target) in ModifySpellDamageTaken.
+        // Casts BOTH diseases on every target hit. Safe here (outside damage hooks).
+        {
+            auto hqit = g_howlSpreadQueue.find(guid);
+            if (hqit != g_howlSpreadQueue.end())
+            {
+                std::vector<uint32> victims;
+                victims.swap(hqit->second);
+                g_howlSpreadQueue.erase(hqit);
+
+                for (uint32 victLow : victims)
+                {
+                    Unit* victim = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                        if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                    if (!victim)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                    }
+                    if (victim && victim->IsAlive())
+                    {
+                        player->CastSpell(victim, 55095u, true); // Frost Fever
+                        player->CastSpell(victim, 55078u, true); // Blood Plague
+                    }
+                }
+            }
+        }
+
+        // ── Virulent Plague (5520) — ticking Nature DoT (2s ticks, 8s duration) ──
+        // Queue is set in OnPlayerSpellCast when Plague Strike IDs are detected.
+        // Drain the queue here first, then tick any active DoTs.
+        {
+            // Drain pending application
+            auto vqit = g_virulentQueue.find(guid);
+            if (vqit != g_virulentQueue.end())
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_VIRULENT_PLAGUE);
+                if (rank > 0)
+                {
+                    uint32 victLow = vqit->second;
+                    auto& vpState  = g_virulentPlague[guid][victLow];
+                    uint32 ap      = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+                    // Tick damage: AP * 6% per rank (R1=6%, R2=10%, R3=15%)
+                    static const float tickPct[] = { 0.0f, 0.06f, 0.10f, 0.15f };
+                    vpState.tickDmg   = std::max(1u, (uint32)(ap * tickPct[Idx<uint8>(rank)]));
+                    vpState.endMs     = now + 8000u;
+                    vpState.lastTickMs = now;
+                }
+                g_virulentQueue.erase(vqit);
+            }
+
+            // Tick active DoTs
+            auto vpIt = g_virulentPlague.find(guid);
+            if (vpIt != g_virulentPlague.end() && !vpIt->second.empty())
+            {
+                std::vector<uint32> toErase;
+                for (auto& [victLow, vpState] : vpIt->second)
+                {
+                    if (now > vpState.endMs) { toErase.push_back(victLow); continue; }
+                    if (GetMSTimeDiffToNow(vpState.lastTickMs) < 2000u) continue;
+                    vpState.lastTickMs = now;
+
+                    // Locate victim
+                    Unit* victim = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                        if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                    if (!victim)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                    }
+                    if (!victim || !victim->IsAlive()) continue;
+
+                    SanctumAA_DealVisibleDamage(player, victim, vpState.tickDmg, SPELL_SCHOOL_MASK_NATURE);
+                }
+                for (uint32 v : toErase) vpIt->second.erase(v);
+            }
+        }
+
+        // ── Scorched Earth (5614) — ticking Fire DoT (3 ticks, 2s each, 6s total) ──
+        // Application happens directly in ModifySpellDamageTaken (safe for struct writes).
+        // Ticking drained here (SanctumAA_DealVisibleDamage is always safe in OnUnitUpdate).
+        {
+            auto seIt = g_scorchedEarth.find(guid);
+            if (seIt != g_scorchedEarth.end() && !seIt->second.empty())
+            {
+                std::vector<uint32> toErase;
+                for (auto& [victLow, seState] : seIt->second)
+                {
+                    if (now > seState.endMs) { toErase.push_back(victLow); continue; }
+                    if (GetMSTimeDiffToNow(seState.lastTickMs) < 2000u) continue;
+                    seState.lastTickMs = now;
+
+                    Unit* victim = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                        if (atk->GetGUID().GetCounter() == victLow) { victim = atk; break; }
+                    if (!victim)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->GetGUID().GetCounter() == victLow) victim = v;
+                    }
+                    if (!victim || !victim->IsAlive()) continue;
+                    SanctumAA_DealVisibleDamage(player, victim, seState.tickDmg, SPELL_SCHOOL_MASK_FIRE);
+                }
+                for (uint32 v : toErase) seIt->second.erase(v);
+            }
+        }
+
+        // ── Ghost Strike (5617) — every 3/2/1.5s: strike random nearby enemy 60% weapon dmg as Nature ──
+        // Weapon damage approximated as AP/14.0 * 1.5 (normalized for 1.5s swing) × 0.60.
+        // The interval varies per rank: R1=3000ms, R2=2000ms, R3=1500ms.
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_SHA_GHOST_STRIKE);
+            if (rank > 0)
+            {
+                static const uint32 interval[] = { 0u, 3000u, 2000u, 1500u };
+                uint32 iv = interval[Idx<uint8>(rank)];
+                auto& stamp = g_ghostStrikeTick[guid];
+                if (GetMSTimeDiffToNow(stamp) >= iv)
+                {
+                    stamp = now;
+                    // Find a nearby enemy within 8 yards
+                    Unit* target2 = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                    {
+                        if (atk->IsAlive() && player->GetDistance(atk) <= 8.0f)
+                        {
+                            target2 = atk;
+                            break;
+                        }
+                    }
+                    if (!target2)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->IsAlive() && player->GetDistance(v) <= 8.0f)
+                            target2 = v;
+                    }
+                    if (target2)
+                    {
+                        // Weapon dmg approx: AP/14 * 1.5 * 0.60 (60% of one normalized swing)
+                        uint32 ap = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+                        uint32 strikeDmg = std::max(1u, (uint32)(ap / 14.0f * 1.5f * 0.60f));
+                        SanctumAA_DealVisibleDamage(player, target2, strikeDmg, SPELL_SCHOOL_MASK_NATURE);
+                    }
+                }
+            }
+        }
+
+        // ── Lightning Rod (5615) — re-fires CL at 30/50/70% SP every 2s for 6s ─
+        // PARTIAL: re-fires from player targeting the stored victim at SP-based damage.
+        // No rod creature; implemented as throttled OnUnitUpdate damage bursts.
+        {
+            auto rodIt = g_lightningRod.find(guid);
+            if (rodIt != g_lightningRod.end() && rodIt->second.expireMs > 0)
+            {
+                auto& rod = rodIt->second;
+                if (now > rod.expireMs)
+                {
+                    rod.expireMs = 0;
+                }
+                else if (GetMSTimeDiffToNow(rod.lastFireMs) >= 2000u)
+                {
+                    rod.lastFireMs = now;
+                    // Locate target
+                    Unit* rodTarget = nullptr;
+                    for (Unit* atk : player->getAttackers())
+                        if (atk->GetGUID().GetCounter() == rod.targetLow) { rodTarget = atk; break; }
+                    if (!rodTarget)
+                    {
+                        Unit* v = player->GetVictim();
+                        if (v && v->GetGUID().GetCounter() == rod.targetLow) rodTarget = v;
+                    }
+                    if (rodTarget && rodTarget->IsAlive())
+                    {
+                        static const float pct[] = { 0.0f, 0.30f, 0.50f, 0.70f };
+                        int32 sp = player->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_NATURE);
+                        uint32 rodDmg = std::max(1u, (uint32)(sp * pct[Idx<uint8>(rod.rank)]));
+                        SanctumAA_DealVisibleDamage(player, rodTarget, rodDmg, SPELL_SCHOOL_MASK_NATURE);
+                    }
+                }
+            }
+        }
+
+        // ── Earth Shield queue drain (Ancestral Bulwark 5619) ────────────────────
+        // Queue is filled in aa_combat_modifiers.cpp ModifyHealReceived (on Chain Heal hits).
+        // CastSpell is safe here (OnUnitUpdate, outside all damage hooks).
+        {
+            auto esIt = g_earthShieldQueue.find(guid);
+            if (esIt != g_earthShieldQueue.end() && !esIt->second.empty())
+            {
+                std::vector<uint32> targets;
+                targets.swap(esIt->second);
+                g_earthShieldQueue.erase(esIt);
+
+                uint8 rank = SanctumAA::GetRank(player, AA_SHA_ANCESTRAL_BULWARK);
+                // Per-rank Earth Shield potency: R1→32593, R2→49283, R3→49284
+                static const uint32 esId[] = { 0u, 32593u, 49283u, 49284u };
+                uint32 shieldSpell = (rank > 0) ? esId[Idx<uint8>(rank)] : 0u;
+                if (shieldSpell > 0u)
+                {
+                    for (uint32 tLow : targets)
+                    {
+                        // Try to find the target unit: self, real pet slot, or guardian pet
+                        Unit* esTarget = nullptr;
+                        if (player->GetGUID().GetCounter() == tLow)
+                        {
+                            esTarget = player;
+                        }
+                        else
+                        {
+                            Pet* pet = player->GetPet();
+                            if (pet && pet->GetGUID().GetCounter() == tLow) esTarget = pet;
+                            if (!esTarget)
+                            {
+                                Unit* guardian = player->GetGuardianPet();
+                                if (guardian && guardian->GetGUID().GetCounter() == tLow) esTarget = guardian;
+                            }
+                        }
+                        if (esTarget && esTarget->IsAlive())
+                            player->CastSpell(esTarget, shieldSpell, true);
+                    }
+                }
+            }
+        }
+
         // ── 5s TICK BLOCK ───────────────────────────────────────────────────
         auto& tick = g_classRegenTick[guid];
         if (GetMSTimeDiffToNow(tick) < 5000u)
@@ -1638,6 +2345,64 @@ public:
                     pet->ModifyHealth(amt);
             }
         }
+
+        // ── Totemic Mastery (5604) — PARTIAL STUB ────────────────────────────
+        // Effect: all totem durations +30/60/120s.
+        // 3.3.5a does not expose a "totem despawn timer" through the modding API.
+        // Totems are Creature* TempSummons summoned with a fixed duration from the spell's
+        // EFFECT_SUMMON handler; there is no clean post-spawn method to extend their lifetime
+        // without casting them again. Proper implementation would require an OnSummon hook
+        // or a hardcoded creature-script — neither is available without core modifications.
+        // STUB: effect documented here, no implementation. In-game: the AA slot is purchaseable
+        // but has no runtime effect until a proper hook is available.
+        // TODO: revisit if AzerothCore adds an OnTotemSummon / TempSummon duration hook.
+        (void)SanctumAA::GetRank(player, AA_SHA_TOTEMIC_MASTERY); // suppress unused-variable warning
+
+        // ── Elemental Accord (5620) — per-5s passive per-active-totem buff ────
+        // Each active totem type (Earth/Fire/Water/Air) gives a stacking AP bonus.
+        // Bonus: +150 AP per active totem element at base; R2/R3: ×1.5/×2.0.
+        // Totem detection: Shaman totems are TempSummons of specific creature families.
+        // We approximate by counting the player's active guardian creatures that match
+        // known totem entry IDs, which avoids a full creature-type scan.
+        // APPROXIMATION: detects active guardian count (any guardian = "totem active");
+        // full element-keyed detection would require creature-family checks per entry.
+        // Bonus recalculated each 5s tick; old bonus removed before new one applied.
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_SHA_ELEMENTAL_ACCORD);
+            if (rank > 0)
+            {
+                static const float multiplier[] = { 0.0f, 1.0f, 1.5f, 2.0f };
+                float mult = multiplier[Idx<uint8>(rank)];
+
+                // Count active guardians (proxy for active totems; max 4 = 4 elements)
+                uint8 activeCount = 0;
+                Unit* guardian = player->GetGuardianPet();
+                if (guardian && guardian->IsAlive()) activeCount++;
+                // Also check the m_Controlled list if accessible via getAttackers (indirect)
+                // Guardians in m_Controlled are the best source but no public API to iterate them.
+                // Clamp to 4 (4 totem slots max)
+                if (activeCount > 4) activeCount = 4;
+
+                // Flat AP per totem: 150 at R1 base
+                int32 newAP = (int32)(150.0f * activeCount * mult);
+
+                auto& acc = g_elementalAccord[guid];
+                // Remove old applied bonus, apply new
+                if (acc.appliedAP != 0)
+                {
+                    player->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE,
+                                                   (float)acc.appliedAP, false);
+                    player->UpdateAttackPowerAndDamage(false);
+                }
+                if (newAP != 0)
+                {
+                    player->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE,
+                                                   (float)newAP, true);
+                    player->UpdateAttackPowerAndDamage(false);
+                }
+                acc.appliedAP = newAP;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1647,7 +2412,23 @@ public:
     {
         if (!unit->IsPlayer())
             return;
-        ClearPlayerState(unit->GetGUID().GetCounter(), unit->ToPlayer());
+        Player* p = unit->ToPlayer();
+        uint32 guid = p->GetGUID().GetCounter();
+
+        // Elemental Accord: remove any lingering AP bonus before clearing state
+        {
+            auto it = g_elementalAccord.find(guid);
+            if (it != g_elementalAccord.end() && it->second.appliedAP != 0)
+            {
+                p->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE,
+                                          (float)it->second.appliedAP, false);
+                p->UpdateAttackPowerAndDamage(false);
+                it->second.appliedAP = 0;
+            }
+        }
+        g_elementalAccord.erase(guid);
+
+        ClearPlayerState(guid, p);
     }
 };
 
@@ -1753,6 +2534,168 @@ public:
                     player->ModifySpellCooldown(spellId, -reduction);
             }
         }
+
+        // ── DK: Soul Abrasion (5524) — Death Strike self-heal +15/25/40% ─────────
+        // Approach: when a Death Strike rank is cast, queue an additional flat heal
+        // equal to 5/8/12% max HP on next OnUnitUpdate. (The actual Death Strike heal
+        // fires after the cast resolves; ModifyHealReceived is the cleaner hook but
+        // Death Strike's self-heal is a hardcoded unit-heal that does not flow through
+        // UNITHOOK_MODIFY_HEAL_RECEIVED in 3.3.5a. Flat supplemental heal is cleanest.)
+        // Flat supplemental: R1 5%, R2 8%, R3 12% max HP.
+        {
+            static const std::unordered_set<uint32> s_deathStrike = {
+                49998, 49999, 50000, 45463, 49923, 49924, 66188
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_DK_SOUL_ABRASION);
+            if (rank > 0 && s_deathStrike.count(info->Id) && !player->IsFullHealth())
+            {
+                static const float pct[] = { 0.0f, 0.05f, 0.08f, 0.12f };
+                int32 healAmt = (int32)(player->GetMaxHealth() * pct[Idx<uint8>(rank)]);
+                if (healAmt > 0)
+                    player->ModifyHealth(healAmt);
+
+                // Bonus Runic Power on Death Strike cast: +10/15/20 RP
+                static const int32 rpGain[] = { 0, 10, 15, 20 };
+                int32 rp = rpGain[Idx<uint8>(rank)];
+                if (rp > 0)
+                {
+                    int32 curRP  = (int32)player->GetPower(POWER_RUNIC_POWER);
+                    int32 maxRP  = (int32)player->GetMaxPower(POWER_RUNIC_POWER);
+                    int32 newRP  = std::min(curRP + rp, maxRP);
+                    player->SetPower(POWER_RUNIC_POWER, (uint32)newRP);
+                }
+            }
+        }
+
+        // ── DK: Iron Shell (5507) — on cast of AMS (48707) or Bone Shield (49222): reduce their CD ──
+        // PARTIAL: The "+25% AMS absorb cap" rider is approximated by the -10/15/20% DR-while-shielded
+        // block in the damage hooks below. Here we only handle the CD reduction at R3.
+        // R3: -20% to AMS and Bone Shield cooldowns on cast.
+        {
+            static const std::unordered_set<uint32> s_ironShellSpells = { 48707u, 49222u };
+            if (SanctumAA::GetRank(player, AA_DK_IRON_SHELL) >= 3 && s_ironShellSpells.count(info->Id))
+            {
+                // AMS base CD = 45s (45000ms), Bone Shield = 60s (60000ms). Reduce by 20%.
+                for (uint32 spellId : s_ironShellSpells)
+                    player->ModifySpellCooldown(spellId, -(int32)(45000u * 0.20f));
+            }
+        }
+
+        // ── DK: Rune Blade Mastery (5514) — no CD to modify on DRW cast; see damage hook.
+        // No spell-cast action needed; the damage bonus while DRW is active lives in
+        // ModifySpellDamageTaken attacker-is-player section (see below).
+
+        // ── DK: Battle Frenzy (5516) — on Hysteria cast, reduce its CD by 10/20/30% ──
+        // PARTIAL: "Infinite duration at R3" is NOT implementable (can't modify running aura duration cleanly).
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_DK_BATTLE_FRENZY);
+            if (rank > 0 && info->Id == 49016u)
+            {
+                // Hysteria base CD = 3 min (180000ms). Reduce by 10/20/30%.
+                static const float cdRedPct[] = { 0.0f, 0.10f, 0.20f, 0.30f };
+                int32 reduction = (int32)(180000u * cdRedPct[Idx<uint8>(rank)]);
+                player->ModifySpellCooldown(49016u, -reduction);
+            }
+        }
+
+        // ── DK: Deathchill Mastery (5517) — STUB ──────────────────────────────────
+        // Deathchill is not a standard 3.3.5a spell and was not found in mod-dk-rework sources.
+        // If a future custom Deathchill spell ID is assigned, gate the effect here with HasSpell(id).
+        // CURRENTLY: no-op. Effect intentionally left empty with this comment.
+
+        // ── Shaman: Thunderous Strike (5612) — on Stormstrike, PARTIAL: proc Nature bonus hit ─
+        // Catalog: 15/30/50% chance to proc MH+OH weapon enchants on Stormstrike.
+        // "Force-proccing the active weapon imbue" requires knowing which imbue is on each weapon —
+        // this is not cleanly accessible via player->GetWeaponEnchantProcEvent in 3.3.5a.
+        // APPROXIMATION: on Stormstrike cast, chance-deal flat Nature bonus damage = 40% AP.
+        // MH+OH = 2 chances applied independently; proc rate 15/30/50%.
+        {
+            static const std::unordered_set<uint32> s_stormstrike = { 17364,32175,32176,51876 };
+            uint8 rank = SanctumAA::GetRank(player, AA_SHA_THUNDEROUS_STRIKE);
+            if (rank > 0 && s_stormstrike.count(info->Id))
+            {
+                Unit* ssTarget = spell->m_targets.GetUnitTarget();
+                if (!ssTarget) ssTarget = player->GetVictim();
+                if (ssTarget && ssTarget->IsAlive())
+                {
+                    static const float chance[] = { 0.0f, 15.0f, 30.0f, 50.0f };
+                    uint32 ap = (uint32)player->GetTotalAttackPowerValue(BASE_ATTACK);
+                    uint32 procDmg = std::max(1u, (uint32)(ap * 0.40f));
+                    // MH proc
+                    if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                        SanctumAA_DealVisibleDamage(player, ssTarget, procDmg, SPELL_SCHOOL_MASK_NATURE);
+                    // OH proc (if offhand weapon equipped)
+                    if (player->haveOffhandWeapon() && roll_chance_f(chance[Idx<uint8>(rank)]))
+                        SanctumAA_DealVisibleDamage(player, ssTarget, procDmg, SPELL_SCHOOL_MASK_NATURE);
+                }
+            }
+        }
+
+        // ── Shaman: Shock Resonance (5608) — on Shock cast, 10/20/30% chance to reset that shock's CD ──
+        {
+            static const std::unordered_set<uint32> s_shocks = {
+                // Earth Shock
+                8042,8044,8045,8046,10412,10413,10414,25454,49230,49231,
+                // Flame Shock
+                8050,8052,8053,10447,10448,29228,25457,49233,49234,
+                // Frost Shock
+                8056,8058,10472,10473,25464,49235,49236
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_SHA_SHOCK_RESONANCE);
+            if (rank > 0 && s_shocks.count(info->Id))
+            {
+                static const float chance[] = { 0.0f, 10.0f, 20.0f, 30.0f };
+                if (roll_chance_f(chance[Idx<uint8>(rank)]))
+                    player->RemoveSpellCooldown(info->Id, true);
+            }
+        }
+
+        // ── Shaman: Alpha Pack (5610) — Feral Spirit cast: reduce its CD ────────
+        // R1: -15s from CD on cast. R3: -30s total (-15s more).
+        // Spirit wolf haste/crit inherit is applied in aa_pet.cpp at wolf spawn.
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_SHA_ALPHA_PACK);
+            if (rank > 0 && info->Id == 51533u) // Feral Spirit
+            {
+                static const int32 cdRedMs[] = { 0, 15000, 15000, 30000 };
+                int32 reduction = cdRedMs[Idx<uint8>(rank)];
+                player->ModifySpellCooldown(51533u, -reduction);
+            }
+        }
+
+        // ── Shaman: Swift Current (5618) — STUB ──────────────────────────────────
+        // Nature's Swiftness +1 charge / GCD reduction mechanics are not cleanly moddable in 3.3.5a.
+        // HasSpell(16188) can gate the check. Effect intentionally stubbed:
+        //   - GCD manipulation: no exposed hook in 3.3.5a.
+        //   - Extra charge: NS is flagged USABLE_WHILE_DEAD/ONE_SHOT in the engine; no charge counter.
+        // STUB: if the player casts NS (16188), we simply remove its CD again — approximates "+1 charge".
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_SHA_SWIFT_CURRENT);
+            if (rank > 0 && info->Id == 16188u && player->HasSpell(16188u))
+            {
+                // R1: grant one free extra use by immediately resetting the cooldown after cast.
+                // R2/R3 GCD reduction: NOT implementable — no GCD hook in 3.3.5a.
+                // Note: ModifySpellCooldown(-1200000) removes the full 20-min CD.
+                player->ModifySpellCooldown(16188u, -1200000);
+            }
+        }
+
+        // ── DK: Virulent Plague (5520) — on Plague Strike, queue a Virulent Plague DoT ──
+        // The actual DoT ticking happens in OnUnitUpdate via the g_virulentQueue → g_virulentPlague path.
+        // Duration extension rider (+4s to all diseases) is skipped — aura duration not moddable cleanly.
+        {
+            static const std::unordered_set<uint32> s_plagueStrike = {
+                45462, 49917, 49918, 49919, 49920
+            };
+            uint8 rank = SanctumAA::GetRank(player, AA_DK_VIRULENT_PLAGUE);
+            if (rank > 0 && s_plagueStrike.count(info->Id))
+            {
+                Unit* target = spell->m_targets.GetUnitTarget();
+                if (!target) target = player->GetVictim();
+                if (target && target->IsAlive())
+                    g_virulentQueue[guid] = target->GetGUID().GetCounter();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1831,6 +2774,43 @@ public:
                         for (uint32 diseaseId : diseaseIds)
                             player->CastSpell(atk, diseaseId, true);
                         ++jumped;
+                    }
+                }
+            }
+        }
+
+        // Plague's End (5518) — ONE-SHOT. On kill: if creature had any disease cast by the player,
+        // heal player 15% max HP and spread those diseases to up to 2 nearby enemies within 15 yd.
+        // Fires independently of Blood Rite (5504) and Pestilence (5502) — both may also fire.
+        {
+            if (SanctumAA::Has(player, AA_DK_PLAGUES_END))
+            {
+                std::unordered_set<uint32> diseaseIds;
+                for (auto const& pair : creature->GetAppliedAuras())
+                {
+                    AuraApplication const* app = pair.second;
+                    if (app->GetBase()->GetCasterGUID() == player->GetGUID() &&
+                        app->GetBase()->GetSpellInfo()->Dispel == DISPEL_DISEASE)
+                    {
+                        diseaseIds.insert(pair.first);
+                    }
+                }
+                if (!diseaseIds.empty())
+                {
+                    // (a) Heal player 15% max HP
+                    int32 healAmt = (int32)(player->GetMaxHealth() * 0.15f);
+                    if (healAmt > 0 && !player->IsFullHealth())
+                        player->ModifyHealth(healAmt);
+
+                    // (b) Spread to up to 2 nearby attackers within 15 yd
+                    uint8 spread = 0;
+                    for (Unit* atk : player->getAttackers())
+                    {
+                        if (spread >= 2) break;
+                        if (atk == creature || player->GetDistance(atk) > 15.0f) continue;
+                        for (uint32 diseaseId : diseaseIds)
+                            player->CastSpell(atk, diseaseId, true);
+                        ++spread;
                     }
                 }
             }

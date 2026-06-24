@@ -352,14 +352,14 @@ enum SanctumAAId : uint32
     AA_DK_PESTILENCE          = 5502,
     AA_DK_LIFEBURN            = 5503,
     AA_DK_BLOOD_RITE          = 5504,
-    AA_DK_UNHOLY_GUARD        = 5505,  // PENDING: RP-spend requires DK as first class
+    AA_DK_UNHOLY_GUARD        = 5505,  // Absorbs 5/8/12% incoming damage, draining RP. Secondary DKs get RP topped up via mod-multiclass hidden pool.
     AA_DK_NECROTIC_TOUCH      = 5506,
     AA_DK_IRON_SHELL          = 5507,
     AA_DK_FROST_ROT           = 5508,
     AA_DK_DEATH_PACT          = 5509,
     AA_DK_CONTAGION_DRAIN     = 5510,
-    AA_DK_RUNE_AWAKENING      = 5511,
-    AA_DK_DEATHS_HUNGER       = 5512,
+    AA_DK_RUNE_AWAKENING      = 5511,  // SCRAPPED — requires rune-cooldown hooks not exposed in 3.3.5a
+    AA_DK_DEATHS_HUNGER       = 5512,  // SCRAPPED — requires rune-type conversion hooks not exposed in 3.3.5a
     AA_DK_SCOURGE_MASTERY     = 5513,
     AA_DK_RUNE_BLADE          = 5514,
     AA_DK_ARCTIC_HOWL         = 5515,
@@ -391,10 +391,10 @@ enum SanctumAAId : uint32
     AA_SHA_LAVA_SURGE        = 5613,
     AA_SHA_SCORCHED_EARTH    = 5614,
     AA_SHA_LIGHTNING_ROD     = 5615,
-    AA_SHA_MAELSTROM_MASTERY = 5616,
+    AA_SHA_ELEMENTAL_OVERLOAD = 5616,  // RENAMED from AA_SHA_MAELSTROM_MASTERY — LB/CL/Lava Burst 25/35/45% free second hit at 50% dmg
     AA_SHA_GHOST_STRIKE      = 5617,
     AA_SHA_SWIFT_CURRENT     = 5618,
-    AA_SHA_LIVING_CURRENT    = 5619,
+    AA_SHA_ANCESTRAL_BULWARK = 5619,  // RENAMED from AA_SHA_LIVING_CURRENT — Chain Heal grants Earth Shield to every target it heals
     AA_SHA_ELEMENTAL_ACCORD  = 5620,
     AA_SHA_ELEMENTAL_FURY    = 5621,
 

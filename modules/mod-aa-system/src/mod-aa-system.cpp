@@ -45,6 +45,7 @@
 #include "DatabaseEnv.h"
 #include "CommandScript.h"
 #include "ObjectMgr.h"
+#include "ObjectAccessor.h"
 #include "Log.h"
 #include "Unit.h"
 #include "SharedDefines.h"
@@ -392,6 +393,16 @@ static void ApplyAAStat(Player* player, uint32 aaId, uint8 rankDelta, bool apply
             // ~1% hit at L80 per 32.8 hit rating; 30 ≈ ~0.9% per rank, ×3 ranks ≈ +2.7% hit total.
             // The off-hand damage reduction is handled in aa_class.cpp ModifyMeleeDamage.
             player->ApplyRatingMod(CR_HIT_MELEE, 30 * (int32)rankDelta, apply);
+            break;
+        }
+        case AA_SHA_WINDLORD:           // +10/20% Attack Power (R1=+10%, R2=+20%, R3=+20%+extra-attacks via hook)
+        {
+            // Each rankDelta step adds 10% of base AP as a flat bonus.
+            // R1: +10%, R2: +20%, R3: +20% AP + 3 extra attacks (extra attacks handled in aa_class.cpp OnPlayerSpellCast).
+            // Approximation: 300 flat AP per rank delta is a reasonable midrange bonus; on-equip recalc covers scaling.
+            float bonus = 300.0f * (float)rankDelta;
+            player->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE, bonus, apply);
+            player->UpdateAttackPowerAndDamage(false);
             break;
         }
         case AA_HUN_ENDLESS_QUIVER:     // +5%/+10%/+15% ranged attack speed (164 rating ≈ 5% at L80)
@@ -946,10 +957,10 @@ static const char* GetAAName(uint32 aaId)
         case AA_SHA_LAVA_SURGE:        return "Lava Surge";
         case AA_SHA_SCORCHED_EARTH:    return "Scorched Earth";
         case AA_SHA_LIGHTNING_ROD:     return "Lightning Rod";
-        case AA_SHA_MAELSTROM_MASTERY: return "Maelstrom Mastery";
+        case AA_SHA_ELEMENTAL_OVERLOAD: return "Elemental Overload";
         case AA_SHA_GHOST_STRIKE:      return "Ghost Strike";
         case AA_SHA_SWIFT_CURRENT:     return "Swift Current";
-        case AA_SHA_LIVING_CURRENT:    return "Living Current";
+        case AA_SHA_ANCESTRAL_BULWARK: return "Ancestral Bulwark";
         case AA_SHA_ELEMENTAL_ACCORD:  return "Elemental Accord";
         case AA_SHA_ELEMENTAL_FURY:    return "Elemental Fury";
         // Mage
@@ -1141,6 +1152,7 @@ public:
             { "use",       HandleAaUseCommand,          SEC_PLAYER,     Console::No },
             { "respec",    HandleAaRespecCommand,       SEC_PLAYER,     Console::No },
             { "grant",     HandleAaGrantCommand,        SEC_GAMEMASTER, Console::No },
+            { "testall",   HandleAaTestAllCommand,      SEC_GAMEMASTER, Console::No },
             { "addpoints", HandleAaAddPointsCommand,    SEC_GAMEMASTER, Console::No },
             { "add",      HandleAaAddPointsCommand,    SEC_GAMEMASTER, Console::No },
             { "",          HandleAaInfoCommand,         SEC_PLAYER,     Console::No },
@@ -1446,6 +1458,77 @@ public:
 
         handler->PSendSysMessage("Granted |cffffd700{}|r rank {} to {}.",
             GetAAName(aaId), (uint32)rank, player->GetName());
+        return true;
+    }
+
+    // ---------------------------------------------------------------------
+    // .aa testall  — GM: grant EVERY recognized AA at max rank to the target.
+    // Testing aid: instantly outfits a character with the entire AA catalog so
+    // its passives/procs/actives are all live. NOTE: an AA still only DOES
+    // something if the character can actually perform the trigger (cast the
+    // spell / have the pet / hold the resource) — so run this on multiclass
+    // test chars that cover the classes you want to exercise.
+    // ---------------------------------------------------------------------
+    static bool HandleAaTestAllCommand(ChatHandler* handler, std::string_view args)
+    {
+        // Optional <name>: lets a console/SOAP session target a player by name
+        // (those sessions have no "selected" player). In-game GMs can omit it
+        // and it falls back to the selected target / self.
+        Player* player = nullptr;
+        std::string name(args);
+        while (!name.empty() && (name.front() == ' ')) name.erase(name.begin());
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\r' || name.back() == '\n'))
+            name.pop_back();
+        if (!name.empty())
+            player = ObjectAccessor::FindPlayerByName(name, true);
+        if (!player)
+            player = handler->getSelectedPlayerOrSelf();
+        if (!player)
+        {
+            handler->SendSysMessage("|cffff0000[AA]|r No valid target. Usage: .aa testall [character name]");
+            return true;
+        }
+
+        uint32 guid = player->GetGUID().GetCounter();
+        AaData& data = GetAaData(guid);
+
+        // Clear current AA state cleanly, then re-grant everything at max rank.
+        RemoveAllAAStats(player);
+        DeleteAllPurchasedAA(player);
+        data.purchased.clear();
+
+        // ID ranges spanning every tree: General(2xxx), Pet(3xxx),
+        // Archetype(4xxx), Class(5xxx), misc/Temper(9xxx). GetAAName returns
+        // "Unknown AA" for gaps/scrapped IDs, which we skip — so this stays
+        // self-maintaining as the catalog changes.
+        static const std::pair<uint32, uint32> s_ranges[] = {
+            { 2000u, 2299u }, { 3000u, 3299u }, { 4000u, 4399u },
+            { 5000u, 5999u }, { 9000u, 9099u }
+        };
+
+        uint32 granted = 0;
+        for (auto const& range : s_ranges)
+        {
+            for (uint32 id = range.first; id <= range.second; ++id)
+            {
+                if (std::string(GetAAName(id)) == "Unknown AA")
+                    continue;
+                uint8 maxR = GetAAMaxRank(id);
+                data.purchased[id] = maxR;
+                ApplyAAStat(player, id, maxR, true);
+                SavePurchasedAA(player, id, maxR);
+                ++granted;
+            }
+        }
+
+        SaveAAPoints(player);
+        PushAADataToClient(player);
+
+        handler->PSendSysMessage(
+            "|cff00ff00[AA]|r TESTALL: granted |cffffd700{}|r AAs at max rank to {}.",
+            granted, player->GetName());
+        handler->PSendSysMessage(
+            "|cffffff00Note:|r each AA only fires for spells/pets this character's classes can use.");
         return true;
     }
 

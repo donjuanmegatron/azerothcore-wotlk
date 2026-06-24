@@ -29,6 +29,7 @@
 //   3203  Pack Leader         — pet attacks heal owner 2/4/6% of damage dealt
 //   4203  Mortal Strike       — damage applies 30% healing reduction debuff (via WoW aura, ICD 5s)
 //   4206  Twincast            — 5/10/15% chance spells fire twice at full effectiveness
+//   5519  Final Rune (DK)     — cheat-death: survive at 15% HP + 20% HP HoT; 3min wall-clock CD
 //
 // MOVED TO aa_archetype.cpp (single canonical implementation):
 //   4102  Iron Resolve, 4104  Last Stand, 4204  Apex Predator
@@ -112,6 +113,15 @@ namespace
     // but keyed separately so it doesn't conflict
     struct BEHotState { int32 pool = 0; uint32 lastTickMs = 0; };
     std::unordered_map<uint32, BEHotState> g_beHot;
+
+    // Final Rune (5519) — one-shot cheat death (DK, rank 1 only).
+    // cdUntilMs = 0 means available; non-zero = CD running.
+    struct FinalRuneState { uint32 cdUntilMs = 0; };
+    std::unordered_map<uint32, FinalRuneState> g_finalRune;
+
+    // Final Rune HoT pool: 20% max HP over 4s (1s ticks), same mechanics as g_beHot.
+    struct FRHotState { int32 pool = 0; uint32 lastTickMs = 0; };
+    std::unordered_map<uint32, FRHotState> g_frHot;
 
     // Thousand Cuts: attacker low → victim low → stack entry
     std::unordered_map<uint32, std::unordered_map<uint32, CutsEntry>> g_thousandCuts;
@@ -260,6 +270,9 @@ namespace
         g_twinHealIcd.erase(guid);
         g_channelingDivine.erase(guid);
         g_giftOfMana.erase(guid);
+        // Death Knight
+        // Note: g_finalRune is NOT erased on death/logout — CD persists across combat (3min wall time).
+        g_frHot.erase(guid);
     }
 }
 
@@ -934,6 +947,32 @@ public:
                 }
             }
 
+            // Final Rune (5519) — DK one-shot cheat-death (melee).
+            // When a blow would be fatal and the 3-min CD has expired, clamp to 15% HP survival,
+            // queue a 20% max HP HoT over 4s, and start the 3-min internal cooldown.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_FINAL_RUNE);
+                if (rank > 0 && player->IsAlive() && damage >= player->GetHealth())
+                {
+                    auto& fr = g_finalRune[vGuid];
+                    uint32 nowMs = getMSTime();
+                    if (fr.cdUntilMs == 0 || nowMs >= fr.cdUntilMs)
+                    {
+                        // Set 3-minute cooldown (wall-clock, not per-combat)
+                        fr.cdUntilMs = nowMs + 180000u;
+
+                        // Clamp: survive at 15% max HP
+                        uint32 surviveHP = (uint32)(player->GetMaxHealth() * 0.15f);
+                        damage = player->GetHealth() > surviveHP ? (player->GetHealth() - surviveHP) : 0u;
+
+                        // Queue HoT: 20% max HP over 4s (1s ticks), same pattern as Battle Endurance
+                        auto& hot = g_frHot[vGuid];
+                        hot.pool        = (int32)(player->GetMaxHealth() * 0.20f);
+                        hot.lastTickMs  = nowMs;
+                    }
+                }
+            }
+
             // Retaliation (5011) — accumulate reflect amount for worldscript dispatch
             {
                 uint8 rank = SanctumAA::GetRank(player, AA_WAR_RETALIATION);
@@ -1487,6 +1526,29 @@ public:
                 }
             }
 
+            // Final Rune (5519) — DK one-shot cheat-death (spell).
+            // Same logic as the melee intercept above; uses the same g_finalRune CD map
+            // so one CD covers both melee and spell fatal hits.
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_DK_FINAL_RUNE);
+                if (rank > 0 && player->IsAlive() && damage >= (int32)player->GetHealth())
+                {
+                    auto& fr = g_finalRune[vGuid];
+                    uint32 nowMs = getMSTime();
+                    if (fr.cdUntilMs == 0 || nowMs >= fr.cdUntilMs)
+                    {
+                        fr.cdUntilMs = nowMs + 180000u;
+
+                        int32 surviveHP = (int32)(player->GetMaxHealth() * 0.15f);
+                        damage = (int32)player->GetHealth() > surviveHP ? ((int32)player->GetHealth() - surviveHP) : 0;
+
+                        auto& hot = g_frHot[vGuid];
+                        hot.pool        = (int32)(player->GetMaxHealth() * 0.20f);
+                        hot.lastTickMs  = nowMs;
+                    }
+                }
+            }
+
             // Retaliation (5011) R2: also reflects spell/ability damage
             {
                 uint8 rank = SanctumAA::GetRank(player, AA_WAR_RETALIATION);
@@ -1731,6 +1793,54 @@ public:
                 }
             }
 
+            // ── Ancestral Guard (5605) — after self-heal: absorb shield = 10/20/30% of heal for 8s ──
+            // Only triggers when healer == target (self-heal). Stored in g_ancestralGuardAbsorb,
+            // consumed in aa_class.cpp's melee + spell damage-taken VICTIM IS PLAYER hooks.
+            // NOTE: g_ancestralGuardAbsorb is declared in aa_class.cpp; we access it via extern.
+            // SAFETY: ModifyHealReceived is NOT a damage hook — storing to state here is safe.
+            if (healer == target)
+            {
+                uint8 rank = SanctumAA::GetRank(hPlayer, AA_SHA_ANCESTRAL_GUARD);
+                if (rank > 0)
+                {
+                    static const float pct[] = { 0.0f, 0.10f, 0.20f, 0.30f };
+                    int32 shieldAmt = (int32)(heal * pct[Idx<uint8>(rank)]);
+                    if (shieldAmt > 0)
+                    {
+                        extern void SanctumAA_ApplyAncestralGuard(uint32 playerGuid, int32 amount, uint32 durationMs);
+                        SanctumAA_ApplyAncestralGuard(hGuid, shieldAmt, 8000u);
+                    }
+                }
+            }
+
+            // ── Ancestral Bulwark (5619, renamed from Living Current) ─────────────
+            // Chain Heal: grant Earth Shield to every target it heals (caster, pet, guardians).
+            // ModifyHealReceived fires once per Chain Heal bounce (once per healed unit).
+            // We QUEUE the shield apply — do NOT call CastSpell here (unsafe in heal hook).
+            {
+                static const std::unordered_set<uint32> s_chainHeal = {
+                    1064,10622,10623,25422,25423,55458,55459
+                };
+                uint8 rank = SanctumAA::GetRank(hPlayer, AA_SHA_ANCESTRAL_BULWARK);
+                if (rank > 0 && s_chainHeal.count(spellInfo->Id))
+                {
+                    // Queue Earth Shield for 'target' (the specific unit healed this bounce)
+                    // Check: target is either the healer themselves, OR a unit owned by the healer.
+                    bool eligible = (target == healer);
+                    if (!eligible && target)
+                    {
+                        Unit* owner = target->GetOwner();
+                        if (owner && owner == healer)
+                            eligible = true;
+                    }
+                    if (eligible && target)
+                    {
+                        extern void SanctumAA_QueueEarthShield(uint32 playerGuid, uint32 targetLow);
+                        SanctumAA_QueueEarthShield(hGuid, target->GetGUID().GetCounter());
+                    }
+                }
+            }
+
         } // end HEALER IS PLAYER
 
         // ── TARGET IS PLAYER — incoming heal buffs ─────────────────────────
@@ -1825,6 +1935,24 @@ public:
         {
             auto it = g_beHot.find(guid);
             if (it != g_beHot.end() && it->second.pool > 0)
+            {
+                auto& h = it->second;
+                if (GetMSTimeDiffToNow(h.lastTickMs) >= 1000u)
+                {
+                    int32 tickHeal = std::max(1, h.pool / 4);
+                    player->ModifyHealth(tickHeal);
+                    h.pool -= tickHeal;
+                    if (h.pool < 0) h.pool = 0;
+                    h.lastTickMs = now;
+                }
+            }
+        }
+
+        // Final Rune (5519) HoT — 20% max HP healed back over 4s (1s ticks)
+        // Same tick pattern as Battle Endurance HoT; uses separate g_frHot map.
+        {
+            auto it = g_frHot.find(guid);
+            if (it != g_frHot.end() && it->second.pool > 0)
             {
                 auto& h = it->second;
                 if (GetMSTimeDiffToNow(h.lastTickMs) >= 1000u)
