@@ -2867,6 +2867,12 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Druid: Healing Gift (5919) — +3/6/10% heal crit chance (Tree form only)
+// Applied as a stat passive via ApplyAAStat in mod-aa-system.cpp.
+// NO class hook needed — the rating mod is applied on buy/login via ApplyAAStat.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 void AddSC_aa_class()

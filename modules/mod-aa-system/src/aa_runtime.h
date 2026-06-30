@@ -21,6 +21,24 @@ class Unit;
 // aa_combat_modifiers.cpp. schoolMask is a SpellSchoolMask value.
 void SanctumAA_DealVisibleDamage(Player* attacker, Unit* victim, uint32 damage, uint32 schoolMask);
 
+// Druid: Survival Instincts (5930) DR window setter — called from aa_actives.cpp
+void SanctumAA_SetSurvivalInstinctsWindow(uint32 playerGuid, float drPct, uint32 durationMs);
+
+// Druid: Living Seed (5921) — per-target seed store. Stored in aa_combat_modifiers.cpp.
+// SetLivingSeed: called from ModifyHealReceived when player casts a direct heal.
+// BloomLivingSeed: called from damage-taken hooks to heal the target from seed.
+void SanctumAA_SetLivingSeed(uint32 healerGuid, uint32 targetLow, uint32 seedAmount);
+
+// Druid: Heart of the Wild (5932) window — set from OnShapeshift (PlayerScript).
+void SanctumAA_SetHeartOfTheWildWindow(uint32 playerGuid, uint8 rank, uint32 untilMs);
+
+// Druid: Feral Charge window — set from OnPlayerSpellCast in aa_combat_player.
+void SanctumAA_SetFeralChargeWindow(uint32 playerGuid, uint8 rank, uint32 durationMs);
+
+// Druid: Stampeding Roar — speed buff application to guardians (called from aa_actives).
+// Implemented in aa_pet.cpp.
+void SanctumAA_ApplyRoarSpeed(Player* player, float speedPct, uint32 durationMs);
+
 // ---------------------------------------------------------------------------
 // Master ID enum — all approved AAs.
 // Source: sanctum_aa_master_list.txt v2.0 (2026-05-09)
@@ -147,7 +165,7 @@ enum SanctumAAId : uint32
     AA_H_OVERFLOWING       = 4306,  // Excess healing converts to absorb cap 5%/8%/10% max HP
     AA_H_CHAIN_HEALING     = 4307,  // Heal bounces to lowest HP pet/guardian for 30%/50%/70%
 
-    // ── CLASS — WARRIOR (5001–5018) ────────────────────────
+    // ── CLASS — WARRIOR (5001–5019) ────────────────────────
     AA_WAR_RAMPAGE            = 5001,
     AA_WAR_WARCRY             = 5002,
     AA_WAR_TACTICAL_MASTERY   = 5003,
@@ -166,6 +184,7 @@ enum SanctumAAId : uint32
     AA_WAR_TITANS_GRIP        = 5016,
     AA_WAR_IMPROVED_DEVASTATE = 5017,
     AA_WAR_UNENDING_FURY      = 5018,
+    AA_WAR_VENGEFUL_BULWARK   = 5019,  // Burn-tank: reflect physical AP% to all attackers, +2% dmg/stack
 
     // ── CLASS — PALADIN (5100–5126) ────────────────────────
     AA_PAL_CRUSADERS_MIGHT         = 5100,
@@ -347,7 +366,7 @@ enum SanctumAAId : uint32
     AA_PRI_IMP_SHIELD            = 5445,
     AA_PRI_PENANCE_MASTERY       = 5446,
 
-    // ── CLASS — DEATH KNIGHT (5501–5526) ───────────────────
+    // ── CLASS — DEATH KNIGHT (5501–5527) ───────────────────
     AA_DK_PLAGUE_LORD         = 5501,
     AA_DK_PESTILENCE          = 5502,
     AA_DK_LIFEBURN            = 5503,
@@ -374,6 +393,7 @@ enum SanctumAAId : uint32
     AA_DK_SOUL_ABRASION       = 5524,
     AA_DK_LEECH_TOUCH         = 5525,
     AA_DK_IMPROVED_HARM_TOUCH = 5526,
+    AA_DK_CORRUPTED_CARAPACE  = 5527,  // Burn-tank: reflect shadow/stack disease dmg amp in Blood/Frost Presence
 
     // ── CLASS — SHAMAN (5601–5621) ──────────────────────────
     AA_SHA_CANNIBALIZE       = 5601,
@@ -420,26 +440,43 @@ enum SanctumAAId : uint32
     AA_MAG_FOCUSED_MAGIC         = 5718,
     AA_MAG_LOST_IN_TIME          = 5719,
     AA_MAG_MANA_BATTERY          = 5720,
-    AA_MAG_ARCANE_PRESENCE       = 5721,
-    AA_MAG_FLAMEBRINGER          = 5722,
-    AA_MAG_ILLUSION_OF_CHOICE    = 5723,
-    AA_MAG_SLIPPERY_SLOPE        = 5724,
+    // 5721 renamed: Arcane Presence -> Mana Adept (spell dmg scales with current mana %)
+    AA_MAG_MANA_ADEPT            = 5721,
+    // 5722 renamed: Flamebringer -> Empowered Images (Mirror Images +all-school dmg, consolidated)
+    AA_MAG_EMPOWERED_IMAGES      = 5722,
+    // 5723 renamed: Illusion of Choice -> Scorched (Scorch stacks fire-vuln debuff on target)
+    AA_MAG_SCORCHED              = 5723,
+    // 5724 renamed: Slippery Slope -> Molten Fury (fire spells +dmg to sub-35% HP targets)
+    AA_MAG_MOLTEN_FURY           = 5724,
     AA_MAG_MIRRORED_DEFENSE      = 5725,
     AA_MAG_OPTICAL_ILLUSION      = 5726,
-    AA_MAG_HIVEMIND              = 5727,
-    AA_MAG_HALLUCINATIONS        = 5728,
+    // 5727 renamed: Hivemind -> Phantasmal Assault (Mirror Image cast -> instant arcane nova AoE)
+    AA_MAG_PHANTASMAL_ASSAULT    = 5727,
+    // 5728 renamed: Hallucinations -> Mirror Ward (Mirror Image cast -> absorb shield)
+    AA_MAG_MIRROR_WARD           = 5728,
     AA_MAG_QUICK_DAMAGE          = 5729,
     AA_MAG_HARVEST_OF_DRUZZIL    = 5730,
     AA_MAG_MANABURN              = 5731,
     AA_MAG_SPELL_CASTING_SUBTLETY = 5732,
-    AA_MAG_CALL_OF_XUZL          = 5733,
+    // 5733 renamed: Call of Xuzl -> Arcane Nova (active: burst arcane AoE to all in 10yd, 1min CD)
+    AA_MAG_ARCANE_NOVA           = 5733,
     AA_MAG_IMPROVED_FAMILIAR     = 5734,
     AA_MAG_FRENZIED_BURNOUT      = 5735,
     AA_MAG_MEND_COMPANION        = 5736,
-    AA_MAG_QUICK_SUMMONING       = 5737,
+    // 5737 renamed: Quick Summoning -> Elemental Bond (WE gains bonus dmg = % of player SP)
+    AA_MAG_ELEMENTAL_BOND        = 5737,
     AA_MAG_HOST_OF_THE_ELEMENTS  = 5738,
-    AA_MAG_DESTRUCTIVE_FURY      = 5739,
-    AA_MAG_CHAOTIC_FEEDBACK      = 5740,
+    // 5739 renamed: Destructive Fury -> Spell Weaving (stacking dmg buff on spell-school switch)
+    AA_MAG_SPELL_WEAVING         = 5739,
+    // 5740 renamed: Chaotic Feedback -> Mana Reactor (below 20% mana -> refund on next dmg cast)
+    AA_MAG_MANA_REACTOR          = 5740,
+    // New additions 5741-5746
+    AA_MAG_PYROBLAST_OVERLOAD    = 5741,   // Pyroblast +15/25/40% dmg + burning DoT
+    AA_MAG_FIRE_BLAST_CASCADE    = 5742,   // Fire Blast splashes 40/60/80% to all in 8yd
+    AA_MAG_MOLTEN_SHELL          = 5743,   // Heat Engine: melee reflect+DR+burn ramp+Flare at cap
+    AA_MAG_COMBUSTION_MASTERY    = 5744,   // Combustion spreads+extends your fire DoTs
+    AA_MAG_BLIZZARD              = 5745,   // Blizzard ticks +15/25/40% dmg; stronger chill
+    AA_MAG_HEATING_UP            = 5746,   // Fire spells 10/20/30% chance to proc Hot Streak
 
     // ── CLASS — WARLOCK (5800–5835) ─────────────────────────
     AA_WRL_THREADS_OF_DESPAIR    = 5800,
@@ -479,42 +516,43 @@ enum SanctumAAId : uint32
     AA_WRL_FEIGNED_MINION        = 5834,
     AA_WRL_SPELL_CASTING_SUBTLETY = 5835,
 
-    // ── CLASS — DRUID (5900–5934) — ALL DEFERRED (mod-druid-essence required) ──
-    AA_DRU_IMP_LACERATE_RAKE         = 5900,
-    AA_DRU_RIP_AND_TEAR              = 5901,
-    AA_DRU_BEAST_WITHIN              = 5902,
-    AA_DRU_IMPROVED_BEAST_FORM       = 5903,
-    AA_DRU_AUGMENTED_BEAST_FORM      = 5904,
-    AA_DRU_IMPROVED_BERSERK          = 5905,
-    AA_DRU_IMPROVED_FAERIE_FIRE      = 5906,
-    AA_DRU_WRATH_OF_THE_WILD         = 5907,
-    AA_DRU_NATURES_TENACITY          = 5908,
-    AA_DRU_NATURES_ALACRITY          = 5909,
-    AA_DRU_CELESTIAL_IMPACT          = 5910,
-    AA_DRU_CELESTIAL_WRATH           = 5911,
-    AA_DRU_ANCESTRAL_SPIRITS         = 5912,
-    AA_DRU_IMPROVED_TYPHOON          = 5913,
-    AA_DRU_QUICK_DAMAGE              = 5914,
-    AA_DRU_DESTRUCTIVE_FURY          = 5915,
-    AA_DRU_NATURES_CHOSEN            = 5916,
-    AA_DRU_SPIRIT_OF_THE_WOOD        = 5917,
-    AA_DRU_HEALING_ADEPT             = 5918,
-    AA_DRU_HEALING_GIFT              = 5919,
-    AA_DRU_NATURES_REMEDY            = 5920,
-    AA_DRU_SPELL_CASTING_REINFORCEMENT = 5921,
-    AA_DRU_PACK_CHLOROPLAST          = 5922,
-    AA_DRU_SWIFTMEND_MASTERY         = 5923,
-    AA_DRU_RADIANT_CURE              = 5924,
-    AA_DRU_DIRE_CHARM                = 5925,
-    AA_DRU_INNATE_CAMOUFLAGE         = 5926,
-    AA_DRU_ENHANCED_ROOT             = 5927,
-    AA_DRU_IMPROVED_THORNS           = 5928,
-    AA_DRU_AUGMENTED_THORNS          = 5929,
-    AA_DRU_GROVE_TRAP_SPORE_BLOOM    = 5930,
-    AA_DRU_GROVE_TRAP_BURST_BLOOM    = 5931,
-    AA_DRU_GROVE_TRAP_LIGHTNING_BLOOM = 5932,
-    AA_DRU_GROVE_TRAP_THORN_FLAYER   = 5933,
-    AA_DRU_CHAOTIC_STAB              = 5934,
+    // ── CLASS — DRUID (5900–5934) ──────────────────────────
+    // BUILT 2026-06-26 (Druid AA pass)
+    AA_DRU_IMP_LACERATE_RAKE         = 5900,  // Bear: Lacerate stacks +dmg-taken. Cat: Rake restores energy
+    AA_DRU_RIP_AND_TEAR              = 5901,  // Swipe spreads DoTs to nearby (Bear: Lacerate / Cat: Rake+Rip)
+    AA_DRU_BEAST_WITHIN              = 5902,  // +10/18/28% melee ability dmg per 1% haste (both forms)
+    AA_DRU_IMPROVED_BEAST_FORM       = 5903,  // Bear: -3/5/8% dmg taken. Cat: +3/5/8% dmg done
+    AA_DRU_AUGMENTED_BEAST_FORM      = 5904,  // +1.5/2.5/4% melee dmg per 1% dodge (both forms)
+    AA_DRU_IMPROVED_BERSERK          = 5905,  // While Berserk: -5/8/12% dmg taken, +5/8/12% dmg done
+    AA_DRU_IMPROVED_FAERIE_FIRE      = 5906,  // Faerie Fire +20/35/50% dmg, generates energy or rage
+    AA_DRU_WRATH_OF_THE_WILD         = 5907,  // Absorb ward = 5/8/12% max HP, refreshes 90/70/50s OOC
+    AA_DRU_NATURES_TENACITY          = 5908,  // MERGED 5908+5909: Moonfire+IS dmg up; Eclipse tick-spread
+    AA_DRU_SAVAGE_SWIPE              = 5909,  // RENAMED from Nature's Alacrity: Swipe +dmg + hits extra targets
+    AA_DRU_CELESTIAL_IMPACT          = 5910,  // Starfall +15/25/40% dmg (CD reduction stripped)
+    AA_DRU_CELESTIAL_WRATH           = 5911,  // Starfall fires extra stars via DealVisibleDamage
+    AA_DRU_ANCESTRAL_SPIRITS         = 5912,  // Every 8/6/4s in combat: arcane hit = 40% SP to nearest enemy
+    AA_DRU_IMPROVED_TYPHOON          = 5913,  // Typhoon/Hurricane +15/25/40% dmg (CD reduction stripped)
+    AA_DRU_SUNFIRE                   = 5914,  // RENAMED from Quick Damage: Moonfire queues nature DoT rider
+    AA_DRU_ECLIPSE_MASTERY           = 5915,  // RENAMED from Destructive Fury: +10/18/28% spell dmg in Eclipse
+    AA_DRU_NATURES_CHOSEN            = 5916,  // Moonkin Essence entry: next nature/arcane spell instant (ICD)
+    AA_DRU_SPIRIT_OF_THE_WOOD        = 5917,  // Active: HoT + armor + shield for self+pet 30s. 5min CD
+    AA_DRU_HEALING_ADEPT             = 5918,  // Direct heals +5/10/18% (Tree form only)
+    AA_DRU_HEALING_GIFT              = 5919,  // +3/6/10% heal crit chance (Tree form only)
+    AA_DRU_NATURES_REMEDY            = 5920,  // Druid HoTs +8/15/25% per tick
+    AA_DRU_LIVING_SEED               = 5921,  // RENAMED from Spell Casting Reinforcement: direct heals plant seed
+    AA_DRU_PACK_CHLOROPLAST          = 5922,  // Rejuv 25/50/75% chance: half-copy to lowest HP guardian
+    AA_DRU_SWIFTMEND_MASTERY         = 5923,  // Swiftmend +15/25/40% healing (CD reduction stripped)
+    AA_DRU_RADIANT_CURE              = 5924,  // Remove Corruption removes +1/2/3 extra effects; R3 AoE
+    AA_DRU_CALL_OF_THE_WILD         = 5925,  // RENAMED from Dire Charm: active summon temp beast 30/45/60s
+    AA_DRU_INNATE_CAMOUFLAGE         = 5926,  // Prowl instant any time, duration +30/60/90s (partial)
+    AA_DRU_STAMPEDING_ROAR           = 5927,  // RENAMED from Enhanced Root: active +30/50/70% move speed for self+pets 8s
+    AA_DRU_IMPROVED_THORNS           = 5928,  // Thorns +20/35/50% dmg; Eclipse adds Thorns proc
+    AA_DRU_AUGMENTED_THORNS          = 5929,  // Thorns gains 30/50/75% Nature SP; triggers on dodge/parry
+    AA_DRU_SURVIVAL_INSTINCTS        = 5930,  // RENAMED from Grove Trap: Spore Bloom: Bear active -20/30/40% dmg taken 12s
+    AA_DRU_IRONFUR                   = 5931,  // RENAMED from Grove Trap: Burst Bloom: Bear burn-tank heat engine
+    AA_DRU_HEART_OF_THE_WILD        = 5932,  // RENAMED from Grove Trap: Lightning Bloom: essence-switch +10/15/20% dmg+heal 8s
+    AA_DRU_FERAL_CHARGE_MASTERY      = 5933,  // RENAMED from Grove Trap: Thorn Flayer: after Feral Charge next ability +15/25/40%
+    AA_DRU_CHAOTIC_STAB              = 5934,  // Cat: Shred/Ravage any position, 75/88/100% dmg when not behind
 
     // ── LEGACY / STARTER ────────────────────────────────────
     AA_TEMPER = 9001,               // Free at creation — enables .armoryslot temper

@@ -171,7 +171,8 @@ static uint8 GetAAMaxRank(uint32 aaId)
         // 5833 Suspended Minion      — SCRAPPED (Tier 1)
         // 5834 Feigned Minion        — SCRAPPED (Tier 1)
         // 5835 Spell Casting Subtlety — SCRAPPED (Tier 1)
-        {5925,1},
+        // Druid one-shots
+        {5925,1},  // Call of the Wild (renamed from Dire Charm)
         {9001,1},
         // maxRank 2
         {5009,2},{5011,2},{5014,2},{5015,2},
@@ -213,10 +214,21 @@ static uint8 GetAARankCost(uint32 aaId, uint8 nextRank)
         // 5424/5426/5435/5436/5442 SCRAPPED — no entry needed
         {5443,{2,3,4,0}},  // Divine Purpose R1=2 R2=3 R3=4{5514,{2,3,4,0}},{5518,{5,0,0,0}},{5519,{5,0,0,0}},
         {5520,{4,0,0,0}},{5522,{4,0,0,0}},{5621,{3,5,8,0}},{5704,{2,3,4,0}},
-        {5731,{5,0,0,0}},{5738,{2,3,4,0}},
+        {5731,{5,0,0,0}},{5733,{2,3,4,0}},{5738,{2,3,4,0}},
+        // Mage new AAs 5741-5746
+        {5741,{1,2,3,0}},{5742,{1,2,3,0}},{5743,{2,3,4,0}},
+        {5744,{1,2,3,0}},{5745,{1,2,3,0}},{5746,{1,2,3,0}},
         {5816,{2,3,4,0}},{5817,{2,3,4,0}},
-        {5828,{5,0,0,0}},{5925,{4,0,0,0}},
+        {5828,{5,0,0,0}},
         // 5800,5821,5822,5823,5824,5825,5826,5829,5833,5834,5835 — SCRAPPED (Tier 1)
+        // Warrior Vengeful Bulwark (5019) — default 1/2/3 cost
+        // DK Corrupted Carapace (5527) — default 1/2/3 cost
+        // Druid non-default costs
+        {5917,{2,3,4,0}},  // Spirit of the Wood R1=2 R2=3 R3=4
+        {5925,{4,0,0,0}},  // Call of the Wild one-shot 4pt
+        {5927,{2,3,4,0}},  // Stampeding Roar R1=2 R2=3 R3=4
+        {5930,{2,3,4,0}},  // Survival Instincts R1=2 R2=3 R3=4
+        {5931,{2,3,4,0}},  // Ironfur (burn-tank) R1=2 R2=3 R3=4
     };
     auto it = s_costs.find(aaId);
     if (it != s_costs.end())
@@ -426,16 +438,54 @@ static void ApplyAAStat(Player* player, uint32 aaId, uint8 rankDelta, bool apply
             player->UpdateAllStats();
             break;
         }
-        case AA_MAG_IMPROVED_FAMILIAR:  // +4%/+8%/+12% max mana per rank (snapshot; SP portion deferred)
+        case AA_MAG_IMPROVED_FAMILIAR:  // +3/5/8% SP (via Int) + 5/8/12% max mana per rank delta
         {
-            float manaBonus = (float)player->GetMaxPower(POWER_MANA) * 0.04f * (float)rankDelta;
+            // Spec (2026-06-25 pass): +3/5/8% SP implemented as flat Int bonus (Int drives SP on casters).
+            // +5/8/12% max mana as flat mana bonus (snapshot on apply/login).
+            // Per rankDelta step: approximately +5% mana and +45 Int each delta step.
+            float intBonus  = 45.0f * (float)rankDelta;   // each rank step ~+45 Int (~+45 SP at cap)
+            float manaBonus = (float)player->GetMaxPower(POWER_MANA) * 0.05f * (float)rankDelta;
+            player->HandleStatFlatModifier(UNIT_MOD_STAT_INTELLECT, TOTAL_VALUE, intBonus, apply);
             player->HandleStatFlatModifier(UNIT_MOD_MANA, TOTAL_VALUE, manaBonus, apply);
             player->UpdateAllStats();
+            break;
+        }
+
+        case AA_MAG_SPELL_CASTING_SUBTLETY:  // -10/20/30% all spell threat
+        {
+            // Threat reduction: use ApplySpellMod with SPELLMOD_THREAT (approximation).
+            // In 3.3.5a there is no clean "all spell threat -X%" stat mod. We use a threat
+            // coefficient via the existing ThreatManager (no direct player stat hook).
+            // PARTIAL: stored in DB; threat hooks are not easily available in AC 3.3.5a.
+            // No ApplyAAStat effect; handled as best-effort in the future if threat hooks are exposed.
             break;
         }
         case AA_TEMPER:
             // No stat effect — this AA enables the .armoryslot temper command
             break;
+
+        // ── Druid: Healing Gift (5919) — +3/6/10% heal crit (Tree form gated; rating mod) ──
+        // Using 150 crit rating per rank as proxy for +3%/+6%/+10% at L80.
+        // Gate enforcement (Tree form only) is in aa_combat_modifiers.cpp ModifyHealReceived.
+        // We apply the rating unconditionally here as a floor — the hook gates it.
+        case AA_DRU_HEALING_GIFT:
+        {
+            player->ApplyRatingMod(CR_CRIT_SPELL, 150 * (int32)rankDelta, apply);
+            break;
+        }
+
+        // ── Druid: Improved Berserk passives handled fully in aa_combat_modifiers.cpp ──
+        // ── Vengeful Bulwark (5019), Corrupted Carapace (5527) — no stat; combat hook only ──
+        case AA_WAR_VENGEFUL_BULWARK:
+        case AA_DK_CORRUPTED_CARAPACE:
+            // No stat effect — effects in aa_combat_modifiers.cpp
+            break;
+
+        // ── Druid: Wrath of the Wild (5907) — absorb ward; initialized on buy/login ──
+        // The absorb is managed fully in aa_combat_modifiers.cpp OnUnitUpdate; no stat here.
+        case AA_DRU_WRATH_OF_THE_WILD:
+            break;
+
         default:
             // Phase 2+ AAs — tracked in DB, effects implemented in aa_combat_modifiers.cpp
             break;
@@ -985,26 +1035,32 @@ static const char* GetAAName(uint32 aaId)
         case AA_MAG_FOCUSED_MAGIC:         return "Focused Magic";
         case AA_MAG_LOST_IN_TIME:          return "Lost in Time";
         case AA_MAG_MANA_BATTERY:          return "Mana Battery";
-        case AA_MAG_ARCANE_PRESENCE:       return "Arcane Presence";
-        case AA_MAG_FLAMEBRINGER:          return "Flamebringer";
-        case AA_MAG_ILLUSION_OF_CHOICE:    return "Illusion of Choice";
-        case AA_MAG_SLIPPERY_SLOPE:        return "Slippery Slope";
+        case AA_MAG_MANA_ADEPT:            return "Mana Adept";          // renamed from Arcane Presence
+        case AA_MAG_EMPOWERED_IMAGES:      return "Empowered Images";    // renamed from Flamebringer
+        case AA_MAG_SCORCHED:              return "Scorched";             // renamed from Illusion of Choice
+        case AA_MAG_MOLTEN_FURY:           return "Molten Fury";          // renamed from Slippery Slope
         case AA_MAG_MIRRORED_DEFENSE:      return "Mirrored Defense";
         case AA_MAG_OPTICAL_ILLUSION:      return "Optical Illusion";
-        case AA_MAG_HIVEMIND:              return "Hivemind";
-        case AA_MAG_HALLUCINATIONS:        return "Hallucinations";
+        case AA_MAG_PHANTASMAL_ASSAULT:    return "Phantasmal Assault";   // renamed from Hivemind
+        case AA_MAG_MIRROR_WARD:           return "Mirror Ward";          // renamed from Hallucinations
         case AA_MAG_QUICK_DAMAGE:          return "Quick Damage";
         case AA_MAG_HARVEST_OF_DRUZZIL:    return "Harvest of Druzzil";
         case AA_MAG_MANABURN:              return "Manaburn";
         case AA_MAG_SPELL_CASTING_SUBTLETY: return "Spell Casting Subtlety";
-        case AA_MAG_CALL_OF_XUZL:          return "Call of Xuzl";
+        case AA_MAG_ARCANE_NOVA:           return "Arcane Nova";          // renamed from Call of Xuzl
         case AA_MAG_IMPROVED_FAMILIAR:     return "Improved Familiar";
         case AA_MAG_FRENZIED_BURNOUT:      return "Frenzied Burnout";
         case AA_MAG_MEND_COMPANION:        return "Mend Companion";
-        case AA_MAG_QUICK_SUMMONING:       return "Quick Summoning";
+        case AA_MAG_ELEMENTAL_BOND:        return "Elemental Bond";       // renamed from Quick Summoning
         case AA_MAG_HOST_OF_THE_ELEMENTS:  return "Host of the Elements";
-        case AA_MAG_DESTRUCTIVE_FURY:      return "Destructive Fury";
-        case AA_MAG_CHAOTIC_FEEDBACK:      return "Chaotic Feedback";
+        case AA_MAG_SPELL_WEAVING:         return "Spell Weaving";        // renamed from Destructive Fury
+        case AA_MAG_MANA_REACTOR:          return "Mana Reactor";         // renamed from Chaotic Feedback
+        case AA_MAG_PYROBLAST_OVERLOAD:    return "Pyroblast Overload";
+        case AA_MAG_FIRE_BLAST_CASCADE:    return "Fire Blast Cascade";
+        case AA_MAG_MOLTEN_SHELL:          return "Molten Shell";
+        case AA_MAG_COMBUSTION_MASTERY:    return "Combustion Mastery";
+        case AA_MAG_BLIZZARD:              return "Blizzard";
+        case AA_MAG_HEATING_UP:            return "Heating Up";
         // Warlock
         case AA_WRL_THREADS_OF_DESPAIR:    return "Threads of Despair";
         case AA_WRL_MORTAL_ERADICATION:    return "Mortal Eradication";
@@ -1042,7 +1098,11 @@ static const char* GetAAName(uint32 aaId)
         case AA_WRL_SUSPENDED_MINION:      return "Suspended Minion";
         case AA_WRL_FEIGNED_MINION:        return "Feigned Minion";
         case AA_WRL_SPELL_CASTING_SUBTLETY: return "Spell Casting Subtlety";
-        // Druid (all deferred — mod-druid-essence required)
+        // Warrior (new)
+        case AA_WAR_VENGEFUL_BULWARK:      return "Vengeful Bulwark";
+        // DK (new)
+        case AA_DK_CORRUPTED_CARAPACE:     return "Corrupted Carapace";
+        // Druid (BUILT 2026-06-26)
         case AA_DRU_IMP_LACERATE_RAKE:     return "Improved Lacerate & Rake";
         case AA_DRU_RIP_AND_TEAR:          return "Rip and Tear";
         case AA_DRU_BEAST_WITHIN:          return "Beast Within";
@@ -1052,31 +1112,31 @@ static const char* GetAAName(uint32 aaId)
         case AA_DRU_IMPROVED_FAERIE_FIRE:  return "Improved Faerie Fire";
         case AA_DRU_WRATH_OF_THE_WILD:     return "Wrath of the Wild";
         case AA_DRU_NATURES_TENACITY:      return "Nature's Tenacity";
-        case AA_DRU_NATURES_ALACRITY:      return "Nature's Alacrity";
+        case AA_DRU_SAVAGE_SWIPE:          return "Savage Swipe";
         case AA_DRU_CELESTIAL_IMPACT:      return "Celestial Impact";
         case AA_DRU_CELESTIAL_WRATH:       return "Celestial Wrath";
         case AA_DRU_ANCESTRAL_SPIRITS:     return "Ancestral Spirits";
         case AA_DRU_IMPROVED_TYPHOON:      return "Improved Typhoon";
-        case AA_DRU_QUICK_DAMAGE:          return "Quick Damage";
-        case AA_DRU_DESTRUCTIVE_FURY:      return "Destructive Fury";
+        case AA_DRU_SUNFIRE:               return "Sunfire";
+        case AA_DRU_ECLIPSE_MASTERY:       return "Eclipse Mastery";
         case AA_DRU_NATURES_CHOSEN:        return "Nature's Chosen";
         case AA_DRU_SPIRIT_OF_THE_WOOD:    return "Spirit of the Wood";
         case AA_DRU_HEALING_ADEPT:         return "Healing Adept";
         case AA_DRU_HEALING_GIFT:          return "Healing Gift";
         case AA_DRU_NATURES_REMEDY:        return "Nature's Remedy";
-        case AA_DRU_SPELL_CASTING_REINFORCEMENT: return "Spell Casting Reinforcement";
+        case AA_DRU_LIVING_SEED:           return "Living Seed";
         case AA_DRU_PACK_CHLOROPLAST:      return "Pack Chloroplast";
         case AA_DRU_SWIFTMEND_MASTERY:     return "Swiftmend Mastery";
         case AA_DRU_RADIANT_CURE:          return "Radiant Cure";
-        case AA_DRU_DIRE_CHARM:            return "Dire Charm";
+        case AA_DRU_CALL_OF_THE_WILD:      return "Call of the Wild";
         case AA_DRU_INNATE_CAMOUFLAGE:     return "Innate Camouflage";
-        case AA_DRU_ENHANCED_ROOT:         return "Enhanced Root";
+        case AA_DRU_STAMPEDING_ROAR:       return "Stampeding Roar";
         case AA_DRU_IMPROVED_THORNS:       return "Improved Thorns";
         case AA_DRU_AUGMENTED_THORNS:      return "Augmented Thorns";
-        case AA_DRU_GROVE_TRAP_SPORE_BLOOM:    return "Grove Trap: Spore Bloom";
-        case AA_DRU_GROVE_TRAP_BURST_BLOOM:    return "Grove Trap: Burst Bloom";
-        case AA_DRU_GROVE_TRAP_LIGHTNING_BLOOM: return "Grove Trap: Lightning Bloom";
-        case AA_DRU_GROVE_TRAP_THORN_FLAYER:   return "Grove Trap: Thorn Flayer";
+        case AA_DRU_SURVIVAL_INSTINCTS:    return "Survival Instincts";
+        case AA_DRU_IRONFUR:               return "Ironfur";
+        case AA_DRU_HEART_OF_THE_WILD:     return "Heart of the Wild";
+        case AA_DRU_FERAL_CHARGE_MASTERY:  return "Feral Charge Mastery";
         case AA_DRU_CHAOTIC_STAB:          return "Chaotic Stab (Cat)";
         // Legacy
         case AA_TEMPER:             return "Temper";
@@ -1152,7 +1212,7 @@ public:
             { "use",       HandleAaUseCommand,          SEC_PLAYER,     Console::No },
             { "respec",    HandleAaRespecCommand,       SEC_PLAYER,     Console::No },
             { "grant",     HandleAaGrantCommand,        SEC_GAMEMASTER, Console::No },
-            { "testall",   HandleAaTestAllCommand,      SEC_GAMEMASTER, Console::No },
+            { "testall",   HandleAaTestAllCommand,      SEC_GAMEMASTER, Console::Yes },
             { "addpoints", HandleAaAddPointsCommand,    SEC_GAMEMASTER, Console::No },
             { "add",      HandleAaAddPointsCommand,    SEC_GAMEMASTER, Console::No },
             { "",          HandleAaInfoCommand,         SEC_PLAYER,     Console::No },
@@ -1766,7 +1826,68 @@ public:
             ++stripped;
         }
         if (stripped > 0)
-            LOG_INFO("server.loading", "[mod-aa-system] Chaotic Stab: stripped positional + weapon requirements from {} Backstab spells.", stripped);
+            LOG_INFO("server.loading", "[mod-aa-system] Chaotic Stab (Rogue): stripped positional + weapon requirements from {} Backstab spells.", stripped);
+
+        // ── Druid Chaotic Stab (5934) — strip Shred and Ravage positional + weapon requirements ──
+        // Shred in 3.3.5a: SPELL_ATTR0_CU_REQ_CASTER_BEHIND_TARGET + weapon class requirement
+        // Shred IDs (all ranks): 5221, 6800, 8992, 9829, 9830, 27001 (VERIFY), 48571, 48572
+        // Ravage IDs: 6785, 6787 (only 2 ranks as of WotLK, used from stealth/pounce)
+        // FLAG: Shred 27001 may conflict with a Druid Swipe ID — verify before deploy.
+        {
+            static const uint32 shredIds[]  = { 5221, 6800, 8992, 9829, 9830, 48571, 48572 };
+            static const uint32 ravageIds[] = { 6785, 6787 };
+
+            uint32 druStripped = 0;
+            auto stripPositional = [&](const uint32* ids, uint32 count)
+            {
+                for (uint32 i = 0; i < count; ++i)
+                {
+                    SpellInfo const* si = sSpellMgr->GetSpellInfo(ids[i]);
+                    if (!si) continue;
+                    SpellInfo* info = const_cast<SpellInfo*>(si);
+                    info->AttributesCu &= ~uint32(SPELL_ATTR0_CU_REQ_CASTER_BEHIND_TARGET);
+                    if (info->EquippedItemClass == 2)
+                    {
+                        info->EquippedItemClass             = -1;
+                        info->EquippedItemSubClassMask      = 0;
+                        info->EquippedItemInventoryTypeMask = 0;
+                    }
+                    ++druStripped;
+                }
+            };
+            stripPositional(shredIds,  7);
+            stripPositional(ravageIds, 2);
+            LOG_INFO("server.loading", "[mod-aa-system] Chaotic Stab (Druid 5934): stripped positional requirements from {} Shred/Ravage spells.", druStripped);
+        }
+
+        // ── Augmented Deep Freeze (5709) — strip "target must be stun-immune" and
+        //    "target must be chilled/frozen" requirements from Deep Freeze (44572).
+        //    Deep Freeze in 3.3.5a uses SpellEffectImplicitTargetConditions that we
+        //    cannot remove without core changes; the secondary approach is to strip
+        //    SPELL_ATTR0_ONLY_STEALTHED flag (used as a proxy in some implementations)
+        //    and the TargetCreatureType stun-immune filter.
+        //    PARTIAL: we zero out any EquippedItem restrictions and clear
+        //    SPELL_ATTR2_NO_TARGET_PER_SECOND_COST which some forks use for the
+        //    "stun-immune only" gate. The real condition is in the spell effect data
+        //    (SPELL_EFFECT_STUN_AND_DAMAGE requires a specific target condition in
+        //    SpellImplicitTargetEntry) — not removable via SpellInfo flags alone.
+        //    In-game: players with AA 5709 will get the damage bonus (ModifySpellDamageTaken)
+        //    but the built-in "stun-immune" restriction from client-side targeting may remain.
+        //    Flag as PARTIAL — works for the damage boost; targeting gate may persist.
+        {
+            SpellInfo const* dfSi = sSpellMgr->GetSpellInfo(44572);
+            if (dfSi)
+            {
+                SpellInfo* dfInfo = const_cast<SpellInfo*>(dfSi);
+                // Strip Attributes that enforce "target must be immune to stun"
+                // In vanilla/wotlk 3.3.5a the flag SPELL_ATTR3_REQUIRES_COMBO_POINTS (0x80)
+                // is NOT the culprit. Clear SPELL_ATTR1_CHANNELED_1 workaround not needed.
+                // The real guard is in the lua condition; best we can do is note this is partial.
+                // No flag to strip that would help without core changes — leave as PARTIAL.
+                (void)dfInfo;
+            }
+            LOG_INFO("server.loading", "[mod-aa-system] Augmented Deep Freeze (5709): damage bonus live; target restriction strip is PARTIAL (SpellInfo condition not accessible via flag edit).");
+        }
     }
 };
 

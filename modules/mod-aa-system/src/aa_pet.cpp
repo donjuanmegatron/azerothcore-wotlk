@@ -182,6 +182,48 @@ namespace
             }
         }
 
+        // ── Elemental Bond (5737) — Water Elemental/guardian: bonus dmg = % of owner SP ──
+        // Applied at spawn as flat AP bonus (SP proxy for elemental damage).
+        // R1=+15%, R2=+30%, R3=+50% of player's arcane SP as flat AP on the pet.
+        {
+            uint8 rank = SanctumAA::GetRank(player, AA_MAG_ELEMENTAL_BOND);
+            if (rank > 0)
+            {
+                static const float pct[] = { 0.0f, 0.15f, 0.30f, 0.50f };
+                int32 sp = (int32)player->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_ARCANE);
+                if (sp < 0) sp = 0;
+                float bonusAP = (float)sp * pct[Idx<uint8>(rank)];
+                if (bonusAP > 0.0f)
+                {
+                    unit->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE, bonusAP, true);
+                    unit->UpdateAttackPowerAndDamage(false);
+                }
+            }
+        }
+
+        // ── Mirrored Defense (5725) — Mirror Images inherit Stamina/armor ────────────
+        // Note: Mirror Images are temporary pets (entry 31216). We apply at spawn time.
+        {
+            Creature* cr = unit->ToCreature();
+            if (cr && (cr->GetEntry() == 31216u))  // Mirror Image creature entry (VERIFY)
+            {
+                uint8 rank = SanctumAA::GetRank(player, AA_MAG_MIRRORED_DEFENSE);
+                if (rank > 0)
+                {
+                    static const float pct[] = { 0.0f, 0.20f, 0.35f, 0.50f };
+                    float bonus = pct[Idx<uint8>(rank)];
+                    // Stamina inheritance
+                    unit->HandleStatFlatModifier(UNIT_MOD_STAT_STAMINA, TOTAL_VALUE,
+                        player->GetStat(STAT_STAMINA) * bonus, true);
+                    // Armor (approximate: flat armor bonus)
+                    unit->HandleStatFlatModifier(UNIT_MOD_ARMOR, TOTAL_VALUE,
+                        player->GetArmor() * bonus, true);
+                    unit->UpdateAllStats();
+                    unit->UpdateArmor();
+                }
+            }
+        }
+
         // ── Alpha Pack (5610) R2+ — spirit wolves inherit +30% haste and crit ──
         // Only applies to spirit wolf guardians (entry 29264). R1 only adds CD reduction (in OnPlayerSpellCast).
         // Haste: Agility proxy (+30% as flat Agility boost for crit); melee haste via ApplyAttackTimePercentMod.
@@ -313,6 +355,24 @@ public:
                     }
                 }
 
+                // Empowered Images (Mage 5722) — Mirror Images +20/35/50% all-school dmg ──
+                // Mirror Image creature entry: 31216 (VERIFY — this is the standard WotLK Mirror Image clone)
+                {
+                    Creature* cr = attacker->ToCreature();
+                    if (cr && (cr->GetEntry() == 31216u))
+                    {
+                        uint8 rank = SanctumAA::GetRank(player, AA_MAG_EMPOWERED_IMAGES);
+                        if (rank > 0)
+                        {
+                            static const float bonus[] = { 0.0f, 0.20f, 0.35f, 0.50f };
+                            damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
+                        }
+                    }
+                }
+
+                // Optical Illusion (Mage 5726) — Mirror Images take -10/20/30% damage (flat survivability) ──
+                // Applied in victim section below. Listed here for completeness.
+
                 // Savage Flurry — 5/10/15% chance: add 50% extra dmg (third hit). 200ms ICD.
                 {
                     uint8 rank = SanctumAA::GetRank(player, AA_P_SAVAGE_FLURRY);
@@ -434,6 +494,21 @@ public:
                             dr += burst[Idx<uint8>(rank)];
                         }
                         damage = (uint32)(damage * (1.0f - dr));
+                    }
+                }
+
+                // Optical Illusion (Mage 5726) — Mirror Images take -10/20/30% damage ─────
+                // Reframed from "per AA owned" to flat per rank. Mirror Image entry: 31216
+                {
+                    Creature* cr = target->ToCreature();
+                    if (cr && (cr->GetEntry() == 31216u))
+                    {
+                        uint8 rank = SanctumAA::GetRank(player, AA_MAG_OPTICAL_ILLUSION);
+                        if (rank > 0)
+                        {
+                            static const float dr[] = { 0.0f, 0.10f, 0.20f, 0.30f };
+                            damage = (uint32)(damage * (1.0f - dr[Idx<uint8>(rank)]));
+                        }
                     }
                 }
             }
@@ -611,6 +686,30 @@ public:
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// SanctumAA_ApplyRoarSpeed — exported for aa_actives.cpp (Stampeding Roar 5927)
+// Applies a flat run-speed boost to all pets and guardians owned by the player.
+// Speed boost is additive; PARTIAL — auto-reversal not implemented (persistent).
+// ---------------------------------------------------------------------------
+void SanctumAA_ApplyRoarSpeed(Player* player, float speedPct, uint32 /*durationMs*/)
+{
+    if (!player || speedPct <= 0.0f) return;
+
+    // Real pet slot
+    if (Pet* pet = player->GetPet())
+    {
+        float cur = pet->GetSpeedRate(MOVE_RUN);
+        pet->SetSpeedRate(MOVE_RUN, cur + speedPct);
+    }
+
+    // Guardian controlled units
+    for (Unit* ctrl : player->m_Controlled)
+    {
+        if (!ctrl || ctrl->IsPlayer()) continue;
+        ctrl->SetSpeedRate(MOVE_RUN, ctrl->GetSpeedRate(MOVE_RUN) + speedPct);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Registration

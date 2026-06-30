@@ -662,7 +662,8 @@ public:
             { "status",     HandleStatus,     SEC_PLAYER,      Console::No  },
             { "roll",         HandleGearRoll,     SEC_PLAYER,      Console::No  },
             { "prepraids",    HandlePrepRaids,    SEC_GAMEMASTER,  Console::Yes },
-            { "prepdungeons", HandlePrepDungeons, SEC_GAMEMASTER,  Console::Yes }
+            { "prepdungeons", HandlePrepDungeons, SEC_GAMEMASTER,  Console::Yes },
+            { "prepall",      HandlePrepAll,      SEC_GAMEMASTER,  Console::Yes }
         };
         static ChatCommandTable commandTable =
         {
@@ -967,6 +968,68 @@ public:
         LOG_INFO("module",
             "[mod-gear-tiers] HandlePrepRaids: {} raid maps, {} items found, {} variants created, {} already existed. Restart required.",
             static_cast<uint32>(raidMaps.size()), totalFound, newlyCreated, alreadyExisted);
+
+        return true;
+    }
+
+    // .armoryslot prepall — GM-only, console-safe.
+    // COMPREHENSIVE variant generation: creates Enchanted/Epic variants for EVERY
+    // equippable base item in item_template (class weapon/armor, equippable,
+    // quality 2-4, base entry < SANCTUM_ENTRY_MIN). Replaces the narrow raid/dungeon
+    // loot-table scans (which only covered ~27% of gear) so EVERY slot of EVERY class
+    // can roll/receive an Epic tier. Run once; RESTART required to load variants into
+    // memory; then re-run tools/patch_item_dbc.py so the client has icons.
+    static bool HandlePrepAll(ChatHandler* handler)
+    {
+        // Direct item_template scan — no loot-table joins, so nothing is missed.
+        std::ostringstream querySS;
+        querySS <<
+            "SELECT entry FROM item_template "
+            "WHERE class IN (2,4) "
+            "  AND InventoryType > 0 "
+            "  AND Quality BETWEEN 2 AND 4 "
+            "  AND entry < " << SANCTUM_ENTRY_MIN;
+
+        QueryResult result = WorldDatabase.Query(querySS.str());
+        if (!result)
+        {
+            handler->SendSysMessage("[Gear Prep] No equippable base items found. Nothing to create.");
+            return true;
+        }
+
+        uint32 totalFound     = 0;
+        uint32 newlyCreated   = 0;
+        uint32 alreadyExisted = 0;
+
+        do
+        {
+            uint32 baseEntry = (*result)[0].Get<uint32>();
+            ++totalFound;
+
+            QueryResult existing = WorldDatabase.Query(
+                "SELECT enchanted_entry, epic_entry FROM sanctum_item_variants WHERE base_entry = {}",
+                baseEntry);
+            if (existing)
+            {
+                ++alreadyExisted;
+                continue;
+            }
+
+            ItemVariants v = GetOrCreateVariants(baseEntry);
+            if (v.valid)
+                ++newlyCreated;
+
+        } while (result->NextRow());
+
+        handler->PSendSysMessage(
+            "[Gear Prep] FULL gear scan complete. "
+            "Items found: {}  |  Variants created: {}  |  Already existed: {}. "
+            "RESTART REQUIRED to load new variants; then re-run tools/patch_item_dbc.py for client icons.",
+            totalFound, newlyCreated, alreadyExisted);
+
+        LOG_INFO("module",
+            "[mod-gear-tiers] HandlePrepAll: {} items found, {} variants created, {} already existed. Restart + Item.dbc re-patch required.",
+            totalFound, newlyCreated, alreadyExisted);
 
         return true;
     }

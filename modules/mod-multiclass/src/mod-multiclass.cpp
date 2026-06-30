@@ -572,73 +572,49 @@ static void StripShapeshiftRequirements()
         if (!spellId) return;
         SpellInfo* info = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(spellId));
         if (!info) return;
+        bool changed = false;
         if (info->Stances || info->StancesNot)
         {
             info->Stances    = 0;
             info->StancesNot = 0;
-            ++stripped;
+            changed = true;
         }
+        // Clear SPELL_ATTR0_NOT_SHAPESHIFTED (0x00010000) so the spell is castable
+        // while in any shapeshift form (e.g. Warlock Metamorphosis 47241).
+        if (info->Attributes & SPELL_ATTR0_NOT_SHAPESHIFTED)
+        {
+            info->Attributes &= ~SPELL_ATTR0_NOT_SHAPESHIFTED;
+            changed = true;
+        }
+        if (changed) ++stripped;
     };
 
-    // Pass 1: iterate every spell by family — catches spells not in trainer table
-    static const uint32 targetFamilies[] = {
-        (uint32)SPELLFAMILY_WARRIOR, (uint32)SPELLFAMILY_ROGUE, (uint32)SPELLFAMILY_DRUID
-    };
+    // Pass 1: iterate EVERY spell in sSpellMgr — all classes, all families.
+    // Sanctum design: no ability is stance- or form-gated for any class.
     uint32 maxId = sSpellMgr->GetSpellInfoStoreSize();
     for (uint32 spellId = 1; spellId < maxId; ++spellId)
-    {
-        SpellInfo* info = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(spellId));
-        if (!info) continue;
-        for (uint32 fam : targetFamilies)
-            if (info->SpellFamilyName == fam) { stripSpell(spellId); break; }
-    }
-
-    // Pass 2: trainer table for all three classes — catches spells whose SpellFamilyName
-    // is SPELLFAMILY_GENERIC (0) despite being class abilities (e.g. Warrior Charge).
-    static const uint8 trainerClasses[] = { WOW_CLASS_WARRIOR, WOW_CLASS_ROGUE, WOW_CLASS_DRUID };
-    for (uint8 classId : trainerClasses)
-    {
-        QueryResult trainerSpells = WorldDatabase.Query(
-            "SELECT DISTINCT ts.SpellId FROM trainer_spell ts "
-            "INNER JOIN trainer t ON t.Id = ts.TrainerId "
-            "WHERE t.Requirement = {} AND t.Type = 0 AND ts.SpellId > 0", classId);
-        if (trainerSpells)
-            do { stripSpell((*trainerSpells)[0].Get<uint32>()); } while (trainerSpells->NextRow());
-
-        uint32 classMask = (1u << (classId - 1));
-        QueryResult startSpells = WorldDatabase.Query(
-            "SELECT DISTINCT Spell FROM playercreateinfo_spell_custom "
-            "WHERE (classmask & {}) AND classmask != 0", classMask);
-        if (startSpells)
-            do { stripSpell((*startSpells)[0].Get<uint32>()); } while (startSpells->NextRow());
-    }
-
-    // Pass 3: explicit list of spells whose SpellFamilyName is SPELLFAMILY_GENERIC
-    // but still have form requirements that must be cleared.
-    // 62606 = Savage Defense — passive proc that requires FORM_BEAR/FORM_DIREBEAR.
-    static const uint32 extraSpells[] = { 62606, 0 };
-    for (int i = 0; extraSpells[i]; ++i)
-        stripSpell(extraSpells[i]);
+        stripSpell(spellId);
 
     LOG_INFO("module",
-        "[mod-multiclass] Stripped stance/form requirements from {} spell(s) (Warrior, Rogue, Druid).",
+        "[mod-multiclass] Stripped stance/form/shapeshift requirements from {} spell(s) (all classes).",
         stripped);
 }
 
 // ============================================================
-// Shield requirement stripping — Warrior only
+// Shield requirement stripping — all classes
 //
-// Spells like Shield Bash, Shield Block, Shield Slam require a
-// shield (ItemClass=4 Armor, SubClassMask bit 6 = 64, or
+// Spells like Shield Bash, Shield Block, Shield Slam, Holy Shield,
+// Spell Reflection, Revenge, etc. require a shield
+// (ItemClass=4 Armor, SubClassMask bit 6 = 64, or
 // InventoryTypeMask bit 14 = INVTYPE_SHIELD).
 // Setting EquippedItemClass = -1 removes the equipment gate.
-// Uses spell-family iteration to catch every affected spell.
+// Sanctum design: any class can use any ability without a shield.
 // ============================================================
 
 static void StripShieldRequirements()
 {
     constexpr int32 ITEM_CLASS_ARMOR      = 4;
-    constexpr int32 ARMOR_SUBCLASS_SHIELD = 64;    // 1 << 6
+    constexpr int32 ARMOR_SUBCLASS_SHIELD = 64;    // 1 << ITEM_SUBCLASS_ARMOR_SHIELD (6)
     constexpr int32 INVTYPE_SHIELD_BIT    = 16384; // 1 << 14
 
     uint32 stripped = 0;
@@ -647,8 +623,10 @@ static void StripShieldRequirements()
     for (uint32 spellId = 1; spellId < maxId; ++spellId)
     {
         SpellInfo* info = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(spellId));
-        if (!info || info->SpellFamilyName != (uint32)SPELLFAMILY_WARRIOR) continue;
+        if (!info) continue;
 
+        // Only touch spells whose gear requirement is specifically a shield —
+        // either via the Armor/shield-subclass path or the inventory-type path.
         bool needsShield =
             (info->EquippedItemClass == ITEM_CLASS_ARMOR &&
              (info->EquippedItemSubClassMask & ARMOR_SUBCLASS_SHIELD)) ||
@@ -664,45 +642,100 @@ static void StripShieldRequirements()
     }
 
     LOG_INFO("module",
-        "[mod-multiclass] Removed shield requirements from {} Warrior spell(s).", stripped);
+        "[mod-multiclass] Removed shield requirements from {} spell(s) (all classes).", stripped);
 }
 
 // ============================================================
-// Warrior weapon requirement stripping
+// Weapon requirement broadening — all classes
 //
-// Warrior combat spells (Heroic Strike, Rend, Cleave, etc.) require
-// a specific weapon type/subclass.  In Sanctum starter weapons may
-// not match the exact subclass the DBC demands (e.g. a 2H sword vs
-// "2H sword" subclass bit).  Rather than fight item_template subclass
-// matching, we simply zero the SubClassMask and InventoryTypeMask on
-// every Warrior spell that requires a weapon (EquippedItemClass == 2).
-// EquippedItemClass stays 2 so the "must have SOME weapon" gate remains;
-// only the "must be THIS exact weapon type" gate is removed.
+// Sanctum design: melee weapon requirements are BROADENED (any melee
+// weapon works, not just the originally-required type) but a weapon
+// is still REQUIRED (no unarmed).
+//
+// Ranged weapon requirements (bow/gun/crossbow/thrown/wand) are kept
+// UNTOUCHED — Auto Shot and similar ranged abilities must still need
+// a ranged weapon equipped.
+//
+// MELEE_MASK covers every close-combat weapon subclass (bits 0-1, 4-8,
+// 10-17, 20).  RANGED_MASK covers bow(2), gun(3), thrown(16),
+// crossbow(18), wand(19) — matching the engine's own
+// ITEM_SUBCLASS_MASK_WEAPON_RANGED plus wand.
+//
+// If a spell has ONLY ranged bits set, it is left untouched.
+// If a spell has any melee bits (or mixed), its SubClassMask is
+// replaced with MELEE_MASK so any melee weapon satisfies it.
+// EquippedItemClass stays ITEM_CLASS_WEAPON — unarmed still fails.
+// EquippedItemInventoryTypeMask is zeroed for melee spells so that
+// off-hand-only inventory-type gates (e.g. Lava Lash) are relaxed.
 // ============================================================
 
 static void StripWeaponRequirements()
 {
     constexpr int32 ITEM_CLASS_WEAPON = 2;
 
-    uint32 stripped = 0;
-    uint32 maxId    = sSpellMgr->GetSpellInfoStoreSize();
+    // Melee weapon subclass bits (values from ItemTemplate.h ItemSubclassWeapon enum):
+    //   0=AXE, 1=AXE2, 4=MACE, 5=MACE2, 6=POLEARM, 7=SWORD, 8=SWORD2,
+    //   10=STAFF, 11=EXOTIC, 12=EXOTIC2, 13=FIST, 14=MISC, 15=DAGGER,
+    //   17=SPEAR, 20=FISHING_POLE
+    // NOTE: ITEM_SUBCLASS_WEAPON_obsolete (9) is intentionally excluded.
+    constexpr uint32 MELEE_MASK =
+        (1u << ITEM_SUBCLASS_WEAPON_AXE)          |
+        (1u << ITEM_SUBCLASS_WEAPON_AXE2)         |
+        (1u << ITEM_SUBCLASS_WEAPON_MACE)         |
+        (1u << ITEM_SUBCLASS_WEAPON_MACE2)        |
+        (1u << ITEM_SUBCLASS_WEAPON_POLEARM)      |
+        (1u << ITEM_SUBCLASS_WEAPON_SWORD)        |
+        (1u << ITEM_SUBCLASS_WEAPON_SWORD2)       |
+        (1u << ITEM_SUBCLASS_WEAPON_STAFF)        |
+        (1u << ITEM_SUBCLASS_WEAPON_EXOTIC)       |
+        (1u << ITEM_SUBCLASS_WEAPON_EXOTIC2)      |
+        (1u << ITEM_SUBCLASS_WEAPON_FIST)         |
+        (1u << ITEM_SUBCLASS_WEAPON_MISC)         |
+        (1u << ITEM_SUBCLASS_WEAPON_DAGGER)       |
+        (1u << ITEM_SUBCLASS_WEAPON_SPEAR)        |
+        (1u << ITEM_SUBCLASS_WEAPON_FISHING_POLE);
+
+    // Ranged weapon subclass bits — kept untouched:
+    //   2=BOW, 3=GUN, 16=THROWN, 18=CROSSBOW, 19=WAND
+    constexpr uint32 RANGED_MASK =
+        (1u << ITEM_SUBCLASS_WEAPON_BOW)          |
+        (1u << ITEM_SUBCLASS_WEAPON_GUN)          |
+        (1u << ITEM_SUBCLASS_WEAPON_THROWN)       |
+        (1u << ITEM_SUBCLASS_WEAPON_CROSSBOW)     |
+        (1u << ITEM_SUBCLASS_WEAPON_WAND);
+
+    uint32 broadened = 0;
+    uint32 maxId     = sSpellMgr->GetSpellInfoStoreSize();
 
     for (uint32 spellId = 1; spellId < maxId; ++spellId)
     {
         SpellInfo* info = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(spellId));
-        if (!info || info->SpellFamilyName != (uint32)SPELLFAMILY_WARRIOR) continue;
+        if (!info || info->EquippedItemClass != ITEM_CLASS_WEAPON) continue;
 
-        if (info->EquippedItemClass == ITEM_CLASS_WEAPON &&
-            (info->EquippedItemSubClassMask != 0 || info->EquippedItemInventoryTypeMask != 0))
-        {
-            info->EquippedItemSubClassMask      = 0;
-            info->EquippedItemInventoryTypeMask = 0;
-            ++stripped;
-        }
+        // No subclass mask set — nothing to broaden (already accepts any weapon).
+        if (info->EquippedItemSubClassMask == 0 && info->EquippedItemInventoryTypeMask == 0)
+            continue;
+
+        uint32 mask = static_cast<uint32>(info->EquippedItemSubClassMask);
+
+        // If the spell requires ONLY ranged bits (and no melee bits) → skip.
+        // This preserves Auto Shot, Shoot (wand), Aimed Shot, etc.
+        bool hasRanged = (mask & RANGED_MASK) != 0;
+        bool hasMelee  = (mask & MELEE_MASK)  != 0;
+        if (hasRanged && !hasMelee)
+            continue;
+
+        // Melee requirement (possibly mixed) — broaden to all melee types.
+        // EquippedItemClass stays ITEM_CLASS_WEAPON (a weapon is still required).
+        // EquippedItemInventoryTypeMask is zeroed to remove off-hand-only gates.
+        info->EquippedItemSubClassMask      = static_cast<int32>(MELEE_MASK);
+        info->EquippedItemInventoryTypeMask = 0;
+        ++broadened;
     }
 
     LOG_INFO("module",
-        "[mod-multiclass] Stripped weapon-type requirements from {} Warrior spell(s).", stripped);
+        "[mod-multiclass] Broadened melee weapon requirements on {} spell(s) to all-melee (all classes; ranged kept).",
+        broadened);
 }
 
 // ============================================================
@@ -1245,6 +1278,20 @@ public:
             }
         }
 
+        // Remove wand Shoot (5019) from every character on every login.
+        // Wand Shoot uses the same autorepeat slot as Hunter Auto Shot (75).
+        // When both are in the spellbook the client's autorepeat system can
+        // queue Shoot instead of Auto Shot, silencing Hunter ranged DPS.
+        // We never want wands in Sanctum; permanently strip the spell here
+        // AFTER all class-spell grants so any re-grant from the trainer table
+        // is immediately wiped. Wand proficiency (5009) is intentionally kept.
+        player->removeSpell(5019, SPEC_MASK_ALL, false);
+        // removeSpell alone doesn't stick — wand Shoot (5019) is auto-granted by the
+        // Wands skill, which re-adds it. Remove the skill itself (228 = SKILL_WANDS) so
+        // Shoot is gone for good (reflects client-side too). Wands become un-equippable;
+        // intended per Sanctum design ("we never want wands").
+        player->SetSkill(228, 0, 0, 0);
+
         // Remind player if they haven't finished selecting.
         if (data.step == 0)
             Notify(player, "|cffFF8000[Sanctum]|r You have not chosen your additional classes. Find the Class Weaver NPC!");
@@ -1273,6 +1320,16 @@ public:
         // Grant any newly unlocked class1 spells for the new level.
         if (data.class1)
             GrantClassSpells(player, data.class1, false);
+
+        // Strip wand Shoot (5019) on every level-up, mirroring OnPlayerLogin.
+        // The trainer table grants 5019 to Priest/Mage/Warlock at level 1;
+        // level-up re-grant paths can restore it if we only remove it at login.
+        player->removeSpell(5019, SPEC_MASK_ALL, false);
+        // removeSpell alone doesn't stick — wand Shoot (5019) is auto-granted by the
+        // Wands skill, which re-adds it. Remove the skill itself (228 = SKILL_WANDS) so
+        // Shoot is gone for good (reflects client-side too). Wands become un-equippable;
+        // intended per Sanctum design ("we never want wands").
+        player->SetSkill(228, 0, 0, 0);
 
         // Re-max all weapon/armor skills on every level-up.
         GrantAllEquipSkills(player);
