@@ -84,6 +84,10 @@
 #include <algorithm>
 #include <vector>
 
+// ---- extern display-buff helpers (defined in aa_combat_modifiers.cpp) -----
+extern void SanctumAA_ShowBuff(Player*, uint32, uint32, uint8, bool);
+extern void SanctumAA_RemoveBuff(Player*, uint32, bool);
+
 // ---------------------------------------------------------------------------
 // File-local state
 // ---------------------------------------------------------------------------
@@ -2402,6 +2406,30 @@ public:
                 }
                 acc.appliedAP = newAP;
             }
+        }
+
+        // ── Display buff syncs (safe: OnUnitUpdate is outside all damage hooks) ──
+
+        // Paladin Celestial Regen (5121) 720008 — show buff icon for 30s after last proc
+        {
+            auto stampIt = g_celRegenIcd.find(guid);
+            if (stampIt != g_celRegenIcd.end() && stampIt->second != 0)
+            {
+                if (GetMSTimeDiffToNow(stampIt->second) < 30000u)
+                    SanctumAA_ShowBuff(player, 720008, (uint32)(30000u - GetMSTimeDiffToNow(stampIt->second)), 0, false);
+                else
+                    SanctumAA_RemoveBuff(player, 720008, false);
+            }
+        }
+
+        // Inspire (5440) 720012 — sync pet buff when window is active
+        {
+            uint8 insRankOut = 0;
+            extern bool SanctumAA_InspireActive(uint32 guid, uint8& outRank);
+            if (SanctumAA_InspireActive(guid, insRankOut))
+                SanctumAA_ShowBuff(player, 720012, 0, 0, true);
+            else
+                SanctumAA_RemoveBuff(player, 720012, true);
         }
     }
 

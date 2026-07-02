@@ -39,6 +39,10 @@
 #include <unordered_set>
 #include <vector>
 
+// ---- extern display-buff helpers (defined in aa_combat_modifiers.cpp) -----
+extern void SanctumAA_ShowBuff(Player*, uint32, uint32, uint8, bool);
+extern void SanctumAA_RemoveBuff(Player*, uint32, bool);
+
 // ---- cooldown state -------------------------------------------------------
 
 // [playerGuid][aaId] = getMSTime() at last use
@@ -317,6 +321,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         if (usesRage)
             player->SetPower(POWER_RAGE, player->GetPower(POWER_RAGE) - 200);
         g_rampageUntil[guid] = getMSTime() + dur;
+        SanctumAA_ShowBuff(player, 720001, dur, 0, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Rampage! Cleaving for {} sec.", dur / 1000u);
         return true;
@@ -343,6 +348,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             extern void SanctumAA_SetIronWarriorAbsorb(uint32 guid, int32 amount, uint32 durationMs);
             SanctumAA_SetIronWarriorAbsorb(guid, shieldAmt, 15000u);
         }
+        SanctumAA_ShowBuff(player, 720002, 15000u, 0, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Iron Warrior — absorb shield of {} (30%% armor) for 15 seconds!", shieldAmt);
         return true;
@@ -920,6 +926,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         static const uint32 durMs[] = { 0, 12000, 18000, 24000 };
         uint32 dur = durMs[std::min<uint8>(rank, 3)];
         g_weaponFuryUntil[guid] = getMSTime() + dur;
+        SanctumAA_ShowBuff(player, 720030, dur, 0, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Weapon Fury — your swings unleash weapon effects for {} sec!", dur / 1000u);
         return true;
@@ -1002,6 +1009,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             return true;
         }
         g_cheerOffUntil[guid] = getMSTime() + 15000u;
+        SanctumAA_ShowBuff(player, 720027, 15000u, 0, true);
         SetCD(guid, aaId);
         handler->SendSysMessage("|cff00ff00[AA]|r Cheer: Offensive — your pets surge with offense for 15 sec!");
         return true;
@@ -1016,6 +1024,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             return true;
         }
         g_cheerDefUntil[guid] = getMSTime() + 15000u;
+        SanctumAA_ShowBuff(player, 720028, 15000u, 0, true);
         SetCD(guid, aaId);
         handler->SendSysMessage("|cff00ff00[AA]|r Cheer: Defensive — your pets brace against harm for 15 sec!");
         return true;
@@ -1030,6 +1039,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             return true;
         }
         g_cheerSwiftUntil[guid] = getMSTime() + 15000u;
+        SanctumAA_ShowBuff(player, 720029, 15000u, 0, true);
         SetCD(guid, aaId);
         handler->SendSysMessage("|cff00ff00[AA]|r Cheer: Swiftness — your pets race ahead for 15 sec!");
         return true;
@@ -1040,10 +1050,9 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
     // =======================================================================
 
     case AA_PAL_YAULP:
-    // Activate: grants Heroism (spell 32182) for 30s — already provides haste.
-    // Additionally grants +6/10/14 mp5 equivalent as a flat mana restore over duration
-    // (10 ticks of 3s each, divided over the 30s). 90s CD.
-    // CastSpell is safe here (active handler, NOT a damage hook).
+    // Activate: spell 720000 is a functional +20% melee haste aura for 30s — provides
+    // both the mechanical effect and the buff icon. No need for ApplyAttackTimePercentMod.
+    // Additionally grants +6/10/14 mp5 equivalent as flat mana restore. 90s CD.
     {
         static const uint32 CD_MS = 90000u;
         if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
@@ -1051,44 +1060,26 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             handler->PSendSysMessage("|cffff0000[AA]|r Yaulp on cooldown ({} sec).", rem / 1000u);
             return true;
         }
-        // Use Adrenaline Rush (73) — 15% haste for 15s (shorter but widely available aura in 3.3.5a).
-        // Use spell 26635 (Blood Fury — not ideal) or hand-pick a simpler haste aura.
-        // Best safe approach: use Slice and Dice (5171 rank 3) which is an attack speed buff,
-        // but for a Paladin theme use the correct haste aura if available.
-        // We'll use 32182 (Heroism — already in SanctumPetBars) but it has side-effects.
-        // Instead: apply a direct melee speed mod for the duration via the worldscript approach.
-        // For simplicity: CastSpell spell 26635 (Blood Fury: +melee attack power briefly)
-        // is not ideal. The cleanest approach: use player->ApplyAttackTimePercentMod for 30s.
-        // Since we can't easily un-apply timed, we'll cast spell 49818 (Intervene — no, wrong).
-        // Final decision: cast the Warcry haste aura (spell 6673, Battle Shout) which gives
-        // AP, or use spell 2825 (Bloodlust R1 = Heroism) if available.
-        // SAFEST: use spell 6673 (Battle Shout) for a quick AP buff representing Yaulp.
-        // For a cleaner haste buff: spell 57723 (Exhaustion removal) is wrong.
-        // Use 73 (Bladestorm) no. Use IncreaseMeleeAttackSpeed available aura.
-        // Best: apply ApplyAttackTimePercentMod immediately and queue reverse via g_yaulp map.
-        static const float hastePct[] = { 0.0f, 10.0f, 15.0f, 20.0f };
-        static const uint32 mp5Ticks[] = { 0, 6, 10, 14 }; // mp5 value → over 30s (10 ticks of 3s)
-        float haste = hastePct[std::min<uint8>(rank, 3)];
+        static const uint32 mp5Ticks[] = { 0, 6, 10, 14 }; // mp5 value → over 30s
 
-        // Apply melee speed bonus
-        if (haste > 0.0f)
-            player->ApplyAttackTimePercentMod(BASE_ATTACK, haste, true);
+        // Apply the functional haste aura (720000 = +20% melee haste, 30s).
+        // This replaces the old ApplyAttackTimePercentMod approach; no g_yaulpUntil entry needed
+        // for haste reversal since the aura expires automatically.
+        SanctumAA_ShowBuff(player, 720000, 30000u, 0, false);
 
-        // Restore flat mana over duration: mp5 value × 6 ticks of 5s = 30s total
-        // (6 × mp5 total mana). Award immediately as lump sum for simplicity.
+        // Restore flat mana (lump sum)
         if (player->GetMaxPower(POWER_MANA) > 0)
         {
-            uint32 totalMana = mp5Ticks[std::min<uint8>(rank, 3)] * 6u; // 6 five-second ticks
+            uint32 totalMana = mp5Ticks[std::min<uint8>(rank, 3)] * 6u;
             int32 newMana = std::min(player->GetPower(POWER_MANA) + (int32)totalMana,
                                      player->GetMaxPower(POWER_MANA));
             player->SetPower(POWER_MANA, newMana);
         }
 
-        // Queue haste reversal after 30s via the existing g_yaulpUntil map
-        // aaId = AA_PAL_YAULP so the class hook can distinguish Paladin vs Priest Yaulp.
-        g_yaulpUntil[guid] = { getMSTime() + 30000u, haste, AA_PAL_YAULP, rank };
+        // Store entry WITHOUT haste (hastePct=0) so the worldscript doesn't reverse speed mod.
+        g_yaulpUntil[guid] = { getMSTime() + 30000u, 0.0f, AA_PAL_YAULP, rank };
         SetCD(guid, aaId);
-        handler->PSendSysMessage("|cff00ff00[AA]|r Yaulp! +{}% attack speed for 30 sec.", (uint32)haste);
+        handler->SendSysMessage("|cff00ff00[AA]|r Yaulp! +20% attack speed for 30 sec.");
         return true;
     }
 
@@ -1175,6 +1166,8 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             extern void SanctumAA_SetChannelingDivineCharges(uint32 guid, uint8 charges);
             SanctumAA_SetChannelingDivineCharges(guid, ch);
         }
+        // Show charge buff (dur=0 → no countdown, icon shows until charges exhausted)
+        SanctumAA_ShowBuff(player, 720009, 0, ch, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Channeling the Divine — next {} heal(s) will fire twice!", (uint32)ch);
         return true;
@@ -1197,9 +1190,10 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
     }
 
     case AA_PRI_YAULP:
-    // Activate: +15/25/40% melee attack speed and +10/20/30% melee damage for 30s. 2min CD.
+    // Activate: +20% melee attack speed (via functional aura 720000, 30s) and
+    // +10/20/30% melee damage for 30s. 2min CD.
     // Melee damage bonus stored in g_priYaulpDmgPct, read in aa_class.cpp ModifyMeleeDamage.
-    // Speed reversed on expiry by the existing worldscript Yaulp-expiry path (g_yaulpUntil).
+    // Haste is now provided by the functional aura 720000 — no ApplyAttackTimePercentMod needed.
     {
         static const uint32 CD_MS = 120000u;
         if (uint32 rem = CDRemaining(guid, aaId, CD_MS))
@@ -1207,15 +1201,13 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             handler->PSendSysMessage("|cffff0000[AA]|r Yaulp on cooldown ({} sec).", rem / 1000u);
             return true;
         }
-        static const float hastePct[]  = { 0.0f, 15.0f, 25.0f, 40.0f };
-        float haste = hastePct[std::min<uint8>(rank, 3)];
-        if (haste > 0.0f)
-            player->ApplyAttackTimePercentMod(BASE_ATTACK, haste, true);
-        // Store Yaulp window for expiry reversal; aaId = AA_PRI_YAULP so
-        // aa_class.cpp can identify this as Priest Yaulp and apply the dmg bonus.
-        g_yaulpUntil[guid] = { getMSTime() + 30000u, haste, AA_PRI_YAULP, rank };
+        // Apply the functional haste aura (720000 = +20% melee haste, 30s).
+        // Keep the damage-window in g_yaulpUntil so aa_class.cpp can still read rank.
+        // hastePct stored as 0 so the worldscript expiry path does NOT reverse speed mod.
+        SanctumAA_ShowBuff(player, 720000, 30000u, 0, false);
+        g_yaulpUntil[guid] = { getMSTime() + 30000u, 0.0f, AA_PRI_YAULP, rank };
         SetCD(guid, aaId);
-        handler->PSendSysMessage("|cff00ff00[AA]|r Yaulp! +{}%% attack speed for 30 sec.", (uint32)haste);
+        handler->SendSysMessage("|cff00ff00[AA]|r Yaulp! +20% attack speed for 30 sec.");
         return true;
     }
 
@@ -1257,6 +1249,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         static const float pct[] = { 0.0f, 0.05f, 0.08f, 0.12f };
         uint32 healPerTick = std::max(1u, (uint32)(player->GetMaxHealth() * pct[std::min<uint8>(rank, 3)]));
         g_celRegen[guid] = { 10, getMSTime(), healPerTick };
+        SanctumAA_ShowBuff(player, 720008, 30000u, 0, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Celestial Regeneration — +{} HP/tick for 30s.", healPerTick);
         return true;
@@ -1351,6 +1344,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             extern void SanctumAA_SetCelestialBarrier(uint32 guid, int32 amount, uint32 durationMs);
             SanctumAA_SetCelestialBarrier(guid, shieldAmt, 10000u);
         }
+        SanctumAA_ShowBuff(player, 720010, 10000u, 0, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Celestial Barrier — absorb shield of {} for 10s!", shieldAmt);
         return true;
@@ -1383,11 +1377,12 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         // Use a huge absorb (10× max HP effectively = invuln)
         int32 bigAbsorb = (int32)(tgt->GetMaxHealth() * 100u);
         if (bigAbsorb < 1) bigAbsorb = 999999999;
-        // If target is self, use Celestial Barrier map
+        // If target is self, use Celestial Barrier map + show display buff
         if (tgt == player)
         {
             extern void SanctumAA_SetCelestialBarrier(uint32 guid, int32 amount, uint32 durationMs);
             SanctumAA_SetCelestialBarrier(guid, bigAbsorb, dur);
+            SanctumAA_ShowBuff(player, 720011, dur, 0, false);
         }
         // For pet/guardian targets, apply a real aura (Divine Shield 642) via CastSpell.
         // CastSpell is safe here (active handler, not inside a damage hook).
@@ -1513,6 +1508,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         // We cannot easily auto-revert after 15s without a WorldScript tick entry.
         // PARTIAL: the haste and AP remain until the pet dies/is resummoned (acceptable for solo).
         // A full implementation would need a WorldScript expiry entry like Yaulp.
+        SanctumAA_ShowBuff(player, 720016, 15000u, 0, true);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Frenzied Burnout — elemental frenzy for 15 sec (+{}%% spd, +{}%% dmg)!", (uint32)haste, (uint32)(dmgBonus * 100));
         return true;
@@ -1607,6 +1603,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
             extern void SanctumAA_SetSurvivalInstinctsWindow(uint32 playerGuid, float drPct, uint32 durationMs);
             SanctumAA_SetSurvivalInstinctsWindow(guid, dr, 12000u);
         }
+        SanctumAA_ShowBuff(player, 720019, 12000u, 0, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Survival Instincts — {}% damage reduction for 12 seconds!", (int)(dr * 100));
         return true;
@@ -1660,6 +1657,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
                 pet->ModifyHealth((int32)totalHot);
         }
 
+        SanctumAA_ShowBuff(player, 720020, 30000u, 0, false);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Spirit of the Wood — nature's embrace for 30 seconds!", 0);
         return true;
@@ -1723,6 +1721,7 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         // Using the pattern: store expiry, reverse in aa_actives_worldscript.
         // For now: direct apply + note as PARTIAL — speed modifier not auto-removed.
         // (Speed boost will persist until player dismounts / changes zone / re-uses)
+        SanctumAA_ShowBuff(player, 720021, 8000u, 0, true);
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Stampeding Roar — {}% run speed for 8 seconds!", (int)(boost * 100));
         return true;

@@ -35,6 +35,10 @@
 #include <unordered_map>
 #include <algorithm>
 
+// ---- extern display-buff helpers (defined in aa_combat_modifiers.cpp) -----
+extern void SanctumAA_ShowBuff(Player*, uint32, uint32, uint8, bool);
+extern void SanctumAA_RemoveBuff(Player*, uint32, bool);
+
 // ---------------------------------------------------------------------------
 // File-local runtime state
 // ---------------------------------------------------------------------------
@@ -235,6 +239,26 @@ public:
             player->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT,    TOTAL_VALUE, bonus, false);
             player->UpdateAllStats();
             it->second.applied = false;
+        }
+
+        // ── Display buff syncs ──────────────────────────────────────────────
+
+        // Last Stand (4104) → 720035 (while DR window is active)
+        {
+            auto lsIt = g_lastStand.find(guid);
+            if (lsIt != g_lastStand.end() && now < lsIt->second.untilMs)
+                SanctumAA_ShowBuff(player, 720035, lsIt->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720035, false);
+        }
+
+        // Apex Predator (4204) → 720032 (while stat burst is applied)
+        {
+            auto apIt = g_apex.find(guid);
+            if (apIt != g_apex.end() && apIt->second.applied && now < apIt->second.untilMs)
+                SanctumAA_ShowBuff(player, 720032, apIt->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720032, false);
         }
     }
 

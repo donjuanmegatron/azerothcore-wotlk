@@ -50,6 +50,8 @@
 #include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "SpellAuras.h"
+#include "SpellAuraEffects.h"
 #include "SharedDefines.h"
 #include "Timer.h"
 #include "Random.h"
@@ -686,6 +688,40 @@ void SanctumAA_DealVisibleDamage(Player* attacker, Unit* victim, uint32 damage, 
     dmgLog.damage = damage;
     attacker->SendSpellNonMeleeDamageLog(&dmgLog);
     attacker->DealSpellDamage(&dmgLog, true);
+}
+
+// ---------------------------------------------------------------------------
+// SanctumAA_ShowBuff / SanctumAA_RemoveBuff
+// Apply/refresh or remove a Sanctum AA display-only buff aura on player (and
+// optionally pets/guardians).  SAFE ONLY outside damage-modifier hooks.
+// ---------------------------------------------------------------------------
+void SanctumAA_ShowBuff(Player* player, uint32 spellId, uint32 durationMs, uint8 stacks, bool toPets)
+{
+    if (!player) return;
+    auto applyOne = [&](Unit* u)
+    {
+        if (!u || !u->IsInWorld() || !u->IsAlive()) return;
+        Aura* a = u->GetAura(spellId);
+        if (!a)
+            a = player->AddAura(spellId, u);
+        if (!a) return;
+        if (stacks) a->SetStackAmount(stacks);
+        if (durationMs) a->SetDuration((int32)durationMs);
+        a->SetNeedClientUpdateForTargets();
+    };
+    applyOne(player);
+    if (toPets)
+        for (Unit* c : player->m_Controlled)
+            applyOne(c);
+}
+
+void SanctumAA_RemoveBuff(Player* player, uint32 spellId, bool toPets)
+{
+    if (!player) return;
+    player->RemoveAura(spellId);
+    if (toPets)
+        for (Unit* c : player->m_Controlled)
+            if (c) c->RemoveAura(spellId);
 }
 
 // ---------------------------------------------------------------------------
@@ -3951,6 +3987,199 @@ public:
         // it to be re-primed on the next Moonkin form entry once the ICD has elapsed.
         // The form-entry detection above handles setting ready=true again.
         // No extra per-tick action needed here.
+
+        // =================================================================
+        // DISPLAY BUFF SYNCS — safe here (outside all damage hooks)
+        // ShowBuff refreshes timer/stacks every tick so the client stays accurate.
+        // =================================================================
+
+        // Channeling the Divine (5403) → 720009 (charges remaining)
+        {
+            auto it = g_channelingDivine.find(guid);
+            if (it != g_channelingDivine.end() && it->second.charges > 0)
+                SanctumAA_ShowBuff(player, 720009, 0, it->second.charges, false);
+            else
+                SanctumAA_RemoveBuff(player, 720009, false);
+        }
+
+        // Celestial Barrier (5420) → 720010 (sync removal when absorb gone or expired)
+        {
+            auto it = g_celestialBarrier.find(guid);
+            bool active = (it != g_celestialBarrier.end() && it->second.absorb > 0 && now < it->second.expireMs);
+            if (!active)
+                SanctumAA_RemoveBuff(player, 720010, false);
+        }
+
+        // Furious Charge (5012) → 720003
+        {
+            auto it = g_furiousCharge.find(guid);
+            if (it != g_furiousCharge.end() && now < it->second.untilMs)
+                SanctumAA_ShowBuff(player, 720003, it->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720003, false);
+        }
+
+        // Vengeful Bulwark (5019) → 720004 (stacks)
+        {
+            auto it = g_vengefulBulwark.find(guid);
+            if (it != g_vengefulBulwark.end() && it->second.heat > 0)
+                SanctumAA_ShowBuff(player, 720004, 6000u, it->second.heat, false);
+            else
+                SanctumAA_RemoveBuff(player, 720004, false);
+        }
+
+        // Judge (5101) → 720005 (while swingsLeft > 0 and window not expired)
+        {
+            auto it = g_judgeWindow.find(guid);
+            if (it != g_judgeWindow.end() && it->second.swingsLeft > 0 && now < it->second.untilMs)
+                SanctumAA_ShowBuff(player, 720005, it->second.untilMs - now, it->second.swingsLeft, false);
+            else
+                SanctumAA_RemoveBuff(player, 720005, false);
+        }
+
+        // Radiance / Improved Flash of Light (5114) → 720006 (stacks, charge-style no countdown)
+        {
+            auto it = g_radianceStacks.find(guid);
+            if (it != g_radianceStacks.end() && it->second > 0)
+                SanctumAA_ShowBuff(player, 720006, 0, it->second, false);
+            else
+                SanctumAA_RemoveBuff(player, 720006, false);
+        }
+
+        // Unyielding Light (5126) → 720007
+        {
+            auto it = g_unyieldingLight.find(guid);
+            if (it != g_unyieldingLight.end() && now < it->second.untilMs)
+                SanctumAA_ShowBuff(player, 720007, it->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720007, false);
+        }
+
+        // Vengeance (2005) → 720031
+        {
+            auto it = g_vengeance.find(guid);
+            if (it != g_vengeance.end() && now < it->second.untilMs)
+                SanctumAA_ShowBuff(player, 720031, it->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720031, false);
+        }
+
+        // Hardening (2107) → 720033 (stacks, resets OOC)
+        {
+            auto it = g_hardening.find(guid);
+            if (it != g_hardening.end() && it->second.stacks > 0)
+                SanctumAA_ShowBuff(player, 720033, 0, it->second.stacks, false);
+            else
+                SanctumAA_RemoveBuff(player, 720033, false);
+        }
+
+        // Hindsight (2109) → 720034 (while absorb > 0 and not expired)
+        {
+            auto it = g_hindsight.find(guid);
+            if (it != g_hindsight.end() && it->second.absorb > 0 && now < it->second.expireMs)
+                SanctumAA_ShowBuff(player, 720034, it->second.expireMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720034, false);
+        }
+
+        // Corrupted Carapace (5527) → 720013 (stacks)
+        {
+            auto it = g_corruptedCarapace.find(guid);
+            if (it != g_corruptedCarapace.end() && it->second.heat > 0)
+                SanctumAA_ShowBuff(player, 720013, 6000u, it->second.heat, false);
+            else
+                SanctumAA_RemoveBuff(player, 720013, false);
+        }
+
+        // Final Rune HoT (5519) → 720014 (while pool > 0)
+        {
+            auto it = g_frHot.find(guid);
+            if (it != g_frHot.end() && it->second.pool > 0)
+                SanctumAA_ShowBuff(player, 720014, 4000u, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720014, false);
+        }
+
+        // Battle Endurance DR window (5014) → 720015 (while shieldUntil > now)
+        {
+            auto it = g_battleEndurance.find(guid);
+            if (it != g_battleEndurance.end() && it->second.shieldUntil > 0 && now < it->second.shieldUntil)
+                SanctumAA_ShowBuff(player, 720015, it->second.shieldUntil - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720015, false);
+        }
+
+        // Molten Shell (5743) → 720017 (stacks = heat)
+        {
+            auto it = g_moltenShell.find(guid);
+            if (it != g_moltenShell.end() && it->second.heat > 0)
+                SanctumAA_ShowBuff(player, 720017, 6000u, it->second.heat, false);
+            else
+                SanctumAA_RemoveBuff(player, 720017, false);
+        }
+
+        // Spell Weaving (5739) → 720018 (stacks)
+        {
+            auto it = g_spellWeaving.find(guid);
+            if (it != g_spellWeaving.end() && it->second.stacks > 0)
+                SanctumAA_ShowBuff(player, 720018, 0, it->second.stacks, false);
+            else
+                SanctumAA_RemoveBuff(player, 720018, false);
+        }
+
+        // Wrath of the Wild (5907) → 720025 (OOC absorb present)
+        {
+            auto it = g_wotwAbsorb.find(guid);
+            if (it != g_wotwAbsorb.end() && it->second.absorb > 0)
+                SanctumAA_ShowBuff(player, 720025, 0, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720025, false);
+        }
+
+        // Ironfur (5931) → 720026 (stacks)
+        {
+            auto it = g_ironfur.find(guid);
+            if (it != g_ironfur.end() && it->second.heat > 0)
+                SanctumAA_ShowBuff(player, 720026, 6000u, it->second.heat, false);
+            else
+                SanctumAA_RemoveBuff(player, 720026, false);
+        }
+
+        // Heart of the Wild (5932) → 720022
+        {
+            auto it = g_heartOfWild.find(guid);
+            if (it != g_heartOfWild.end() && now < it->second.untilMs)
+                SanctumAA_ShowBuff(player, 720022, it->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720022, false);
+        }
+
+        // Feral Charge Mastery (5933) → 720023 (window open and not yet consumed)
+        {
+            auto it = g_feralCharge.find(guid);
+            if (it != g_feralCharge.end() && now < it->second.untilMs && !it->second.consumed)
+                SanctumAA_ShowBuff(player, 720023, it->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720023, false);
+        }
+
+        // Nature's Chosen (5916) → 720024 (instant-cast flag ready)
+        {
+            auto it = g_naturesChosen.find(guid);
+            if (it != g_naturesChosen.end() && it->second.ready)
+                SanctumAA_ShowBuff(player, 720024, 0, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720024, false);
+        }
+
+        // Survival Instincts (5930) → 720019 (synced at activation; also keep refreshed here)
+        {
+            auto it = g_survivalInstincts.find(guid);
+            if (it != g_survivalInstincts.end() && it->second.drPct > 0.0f && now < it->second.untilMs)
+                SanctumAA_ShowBuff(player, 720019, it->second.untilMs - now, 0, false);
+            else
+                SanctumAA_RemoveBuff(player, 720019, false);
+        }
     }
 
     // -----------------------------------------------------------------------
