@@ -22,6 +22,8 @@
 #include "Pet.h"
 #include "Unit.h"
 #include "Creature.h"
+#include "MotionMaster.h"
+#include "PetDefines.h"
 #include "Chat.h"
 #include "ObjectAccessor.h"
 #include "ScriptMgr.h"
@@ -1681,14 +1683,25 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         float y = player->GetPositionY() + 2.0f * std::sin(player->GetOrientation() + 1.5f);
         float z = player->GetPositionZ();
         float o = player->GetOrientation();
-        // Beast guardian entry: 32207 Armored Brown Bear (lvl 70 Beast, real combat stats).
-        uint32 beastEntry = 32207;
+        // Beast guardian entry: 24633 Rabid Brown Bear (lvl 70-71 Beast, real combat stats,
+        // clean unit_flags so it actually attacks). The old 32207 Armored Brown Bear is a
+        // rideable MOUNT npc with passive/non-attackable flags (unit_flags 0x300) — it would
+        // follow but never swing. Rabid Brown Bear has default melee AI like the working Infernal.
+        uint32 beastEntry = 24633;
         Creature* beast = player->SummonCreature(beastEntry, x, y, z, o, TEMPSUMMON_TIMED_DESPAWN, dur);
         if (beast)
         {
+            // SetOwnerGUID links the summon to the player so its AI knows who to follow/assist;
+            // without it the beast just stood at the summon point and never engaged (the reported
+            // "doesn't follow or attack" bug). Mirror the working guardian setup in mod-pet-systems.
+            beast->SetOwnerGUID(player->GetGUID());
             beast->SetFaction(player->GetFaction());
             beast->SetLevel(player->GetLevel());
             beast->SetReactState(REACT_AGGRESSIVE);
+            // Anchor home at the spawn point (not a DB waypoint) so evade AI doesn't yank it back,
+            // and start it following the player so it trails you into combat.
+            beast->SetHomePosition(x, y, z, o);
+            beast->GetMotionMaster()->MoveFollow(player, PET_FOLLOW_DIST, PET_FOLLOW_ANGLE);
         }
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Call of the Wild — a beast answers your call for {}s!", dur / 1000u);

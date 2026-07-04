@@ -407,6 +407,12 @@ void GrantClassSpells(Player* player, uint8 classId, bool skipStartSpells = fals
                 if (!player->HasSpell(31687)) player->learnSpell(31687, false);
                 // Glyph of Eternal Water (70937) — makes WE permanent in AC core
                 if (!player->HasSpell(70937)) player->learnSpell(70937, false);
+                // Molten Armor R1 (30482) — normally trainer level 62, but the Molten Shell /
+                // Heating Up burn-tank AAs are usable at the level-60 AA gate and REQUIRE Molten
+                // Armor to build Heat. Force-grant it at 60 so every Mage has it when the AA does.
+                // Ranks 2/3 (43043/43044) still come from the normal BaseLevel grant loop at 68/75.
+                if (player->GetLevel() >= 60 && !player->HasSpell(30482))
+                    player->learnSpell(30482, false);
                 break;
 
             default:
