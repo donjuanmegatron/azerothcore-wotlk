@@ -383,6 +383,13 @@ static ItemVariants FindVariants(uint32 baseEntry)
 // Tier upgrade — morphs the physical item
 // ---------------------------------------------------------------------------
 
+// Power Stones migration hook (mod-power-stones): when the Armory item tiers up
+// it is destroyed + recreated with a NEW guid; this re-keys any socketed Power
+// Stones from the old item guid onto the new item so they survive the morph
+// (and the newly-unlocked socket). Defined in mod-power-stones.cpp; extern-declared
+// here, the same cross-module pattern mod-aa-system uses for GearTiers_AddGXP.
+extern void PowerStones_OnItemMorphed(Player* player, uint32 oldItemGuidLow, Item* newItem);
+
 static void CheckTierUpgrade(Player* player, ArmoryData& data, Item* item)
 {
     if (data.tier >= TIER_EPIC)
@@ -400,6 +407,7 @@ static void CheckTierUpgrade(Player* player, ArmoryData& data, Item* item)
 
     // Capture item info now — pointer becomes dangling after DestroyItem
     std::string itemName = item ? item->GetTemplate()->Name1 : "(unknown)";
+    uint32 oldItemGuid   = item ? item->GetGUID().GetCounter() : 0;
     uint8 bagSlot        = item ? item->GetBagSlot() : NULL_BAG;
     uint8 itemSlot       = item ? item->GetSlot()    : NULL_SLOT;
     bool  wasEquipped    = (bagSlot == INVENTORY_SLOT_BAG_0 && itemSlot < EQUIPMENT_SLOT_END);
@@ -452,6 +460,9 @@ static void CheckTierUpgrade(Player* player, ArmoryData& data, Item* item)
             newItem->SetBinding(true);
             newItem->SetState(ITEM_CHANGED, player);
             player->SendNewItem(newItem, 1, false, false);
+
+            // Carry socketed Power Stones over to the new item guid (see extern above).
+            PowerStones_OnItemMorphed(player, oldItemGuid, newItem);
         }
 
         data.itemEntry = newEntry;
