@@ -258,7 +258,14 @@ struct boss_twinemperorsAI : public BossAI
             {
                 if (Creature* twin = GetTwin())
                 {
-                    if (me->IsWithinDist(twin, 60.f))
+                    // SANCTUM (solo-first): the twins heal each other while within
+                    // 60yd. Solo they are always stacked on the player, so the
+                    // mutual heal is permanent and out-paces one player's DPS,
+                    // making the shared-health pool (Twin Empathy) impossible to
+                    // burn down. Only allow Heal Brother when more than one player
+                    // is actually present — preserves the real mechanic for a
+                    // group, but lets a solo player kill them.
+                    if (me->IsWithinDist(twin, 60.f) && me->GetMap()->GetPlayersCountExceptGMs() > 1)
                         DoCast(twin, SPELL_HEAL_BROTHER, true);
                 }
 
