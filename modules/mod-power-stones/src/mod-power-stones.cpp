@@ -58,6 +58,13 @@
 #include "Creature.h"
 #include "GossipDef.h"
 #include "ScriptedGossip.h"
+#include "SharedDefines.h"
+#include "SpellMgr.h"
+#include "SpellInfo.h"
+#include "SpellDefines.h"
+#include "Spell.h"
+#include "Timer.h"
+#include "Random.h"
 #include "Log.h"
 #include <unordered_map>
 #include <unordered_set>
@@ -66,6 +73,8 @@
 #include <cstdio>
 #include <cctype>
 #include <cmath>
+#include <algorithm>
+#include <utility>
 
 using namespace Acore::ChatCommands;
 
@@ -87,18 +96,44 @@ enum SanctumStoneType : uint8
     STONE_OBSIDIAN = 2, // % Hit
     STONE_JADE     = 3, // flat Spirit
     STONE_IRON     = 4, // % Armor (+ flat % phys DR at T4/T5)
-    STONE_AMBER    = 5  // % universal power (damage + healing)
+    STONE_AMBER    = 5, // % universal power (damage + healing)
 
     // STONE_VOID (Lifesteal) is deferred per design doc — NOT buyable yet.
-    // Reserve a future value (6) for it once it's designed/approved.
+    // Reserve value 6 for it once it's designed/approved.
+
+    // PHASE 5 — WEAPON PROC STONES (ids 10..22, the locked 13-proc catalog).
+    // These grant NO passive stat (GetStoneStatValue returns 0 for them). They
+    // instead carry an on-hit proc, applied by the proc engine, and socket ONLY
+    // into a weapon's dedicated proc socket (index PROC_SOCKET_INDEX). Kept in a
+    // separate id range so every stat-stone loop (which runs STONE_TYPE_MIN..
+    // STONE_TYPE_MAX) is completely unaffected.
+    STONE_EMBER    = 10, // Fire burst           (melee)
+    STONE_RIME     = 11, // Frost dmg + snare     (melee)
+    STONE_DUSK     = 12, // Shadow bolt           (melee/spell)
+    STONE_STORM    = 13, // Nature arc            (melee)
+    STONE_QUICK    = 14, // +Agi/attack-speed self-buff (melee)
+    STONE_ZEAL     = 15, // +Str + heal self-buff (melee)
+    STONE_HEX      = 16, // +cast-haste self-buff (spell)
+    STONE_SUNDER   = 17, // +armor-pen self-buff  (melee)
+    STONE_LEECH    = 18, // drain (dmg + self-heal) (melee)
+    STONE_WARD     = 19, // absorb shield self    (melee/spell)
+    STONE_GRAVE    = 20, // 3s stun               (melee)
+    STONE_HUSH     = 21, // 3s silence            (spell)
+    STONE_RUIN     = 22  // Frost frontal-cone AoE (melee) — premium
 };
 
 static constexpr uint8 STONE_TYPE_MIN = STONE_CRIMSON;
-static constexpr uint8 STONE_TYPE_MAX = STONE_AMBER;
+static constexpr uint8 STONE_TYPE_MAX = STONE_AMBER;   // stat stones only
+static constexpr uint8 PROC_TYPE_MIN  = STONE_EMBER;   // 10
+static constexpr uint8 PROC_TYPE_MAX  = STONE_RUIN;    // 22
 static constexpr uint8 STONE_TIER_MIN = 1;
 static constexpr uint8 STONE_TIER_MAX = 5;
 static constexpr uint8 STONE_RANK_MIN = 1;
 static constexpr uint8 STONE_RANK_MAX = 3;
+
+// A proc stone is any type in the proc id range. Proc stones socket only into a
+// weapon's proc socket; stat stones only into armor sockets 1..3.
+static bool IsProcStone(uint8 type) { return type >= PROC_TYPE_MIN && type <= PROC_TYPE_MAX; }
 
 static char const* StoneTypeName(uint8 type)
 {
@@ -109,11 +144,26 @@ static char const* StoneTypeName(uint8 type)
         case STONE_JADE:     return "Jade";
         case STONE_IRON:     return "Iron";
         case STONE_AMBER:    return "Amber";
+        case STONE_EMBER:    return "Emberstone";
+        case STONE_RIME:     return "Rimestone";
+        case STONE_DUSK:     return "Duskstone";
+        case STONE_STORM:    return "Stormstone";
+        case STONE_QUICK:    return "Quickstone";
+        case STONE_ZEAL:     return "Zealstone";
+        case STONE_HEX:      return "Hexstone";
+        case STONE_SUNDER:   return "Sunderstone";
+        case STONE_LEECH:    return "Leechstone";
+        case STONE_WARD:     return "Wardstone";
+        case STONE_GRAVE:    return "Gravestone";
+        case STONE_HUSH:     return "Hushstone";
+        case STONE_RUIN:     return "Ruinstone";
         default:             return "Unknown";
     }
 }
 
 // Parses a stone type by name, case-insensitive. Returns STONE_NONE if no match.
+// Proc stones accept both the short color word and the full "-stone" name
+// (e.g. "ember" or "emberstone").
 static uint8 ParseStoneTypeByName(std::string_view argStr)
 {
     std::string s(argStr);
@@ -127,6 +177,20 @@ static uint8 ParseStoneTypeByName(std::string_view argStr)
     if (s == "jade")     return STONE_JADE;
     if (s == "iron")     return STONE_IRON;
     if (s == "amber")    return STONE_AMBER;
+
+    if (s == "ember"  || s == "emberstone")  return STONE_EMBER;
+    if (s == "rime"   || s == "rimestone")   return STONE_RIME;
+    if (s == "dusk"   || s == "duskstone")   return STONE_DUSK;
+    if (s == "storm"  || s == "stormstone")  return STONE_STORM;
+    if (s == "quick"  || s == "quickstone")  return STONE_QUICK;
+    if (s == "zeal"   || s == "zealstone")   return STONE_ZEAL;
+    if (s == "hex"    || s == "hexstone")    return STONE_HEX;
+    if (s == "sunder" || s == "sunderstone") return STONE_SUNDER;
+    if (s == "leech"  || s == "leechstone")  return STONE_LEECH;
+    if (s == "ward"   || s == "wardstone")   return STONE_WARD;
+    if (s == "grave"  || s == "gravestone")  return STONE_GRAVE;
+    if (s == "hush"   || s == "hushstone")   return STONE_HUSH;
+    if (s == "ruin"   || s == "ruinstone")   return STONE_RUIN;
     return STONE_NONE;
 }
 
@@ -260,6 +324,135 @@ static bool GetNextUpgradeStep(uint8 tier, uint8 rank, uint32& outCost, uint8& o
     return false;
 }
 
+// ===========================================================================
+// PHASE 5 — Weapon proc catalog (the locked 13-proc menu)
+// ===========================================================================
+//
+// Each proc stone wraps ONE real 3.3.5a spell (client already has its name /
+// icon / combat-log — zero DBC/MPQ work) and fires on-hit via the proc engine.
+// Magnitude for the damage/absorb procs is injected with SPELLVALUE at cast so
+// it scales by tier/rank + a slice of the player's Attack Power / Spell Power;
+// the buff/control procs just cast their real spell (fixed effect, tuned by the
+// chosen spell rank). ALL numeric values here are PLACEHOLDERS to tune at the
+// feel-test — the whole table lives in this one place, exactly like the stat
+// catalog, so tuning never needs a data migration.
+
+enum ProcTrigger : uint8
+{
+    PT_MELEE = 1, // fires from CastItemCombatSpell (white + melee/ranged specials)
+    PT_SPELL = 2, // fires when the player casts an offensive spell
+    PT_BOTH  = 3
+};
+
+enum ProcTarget : uint8
+{
+    PTG_VICTIM = 1, // cast at the thing you hit
+    PTG_SELF   = 2  // cast on yourself (buffs / shields)
+};
+
+enum ProcKind : uint8
+{
+    PK_DAMAGE,       // direct damage, SPELLVALUE = damage
+    PK_DAMAGE_SNARE, // direct damage + the wrapped spell's own snare (Frost Shock)
+    PK_CONE,         // frontal-cone AoE, SPELLVALUE = damage (Cone of Cold)
+    PK_LEECH,        // direct damage + heal self for a fraction
+    PK_SELFBUFF,     // cast a real self-buff spell (no SPELLVALUE)
+    PK_ABSORB,       // cast a self absorb-shield spell, SPELLVALUE = absorb
+    PK_STUN,         // cast a real stun on the victim
+    PK_SILENCE       // cast a real silence on the victim
+};
+
+struct ProcStoneDef
+{
+    uint8       type;
+    uint32      spellId;          // real 3.3.5a spell wrapped
+    ProcTrigger trigger;
+    ProcTarget  target;
+    ProcKind    kind;
+    uint32      schoolMask;       // combat-log school for damage kinds (0 otherwise)
+    uint32      icdMs;            // internal cooldown
+    double      chanceByTier[5];  // proc % per tier (I..V); rank does not change chance
+    double      magByTier[5];     // base magnitude at Rank 3 (damage/absorb/heal); rank-scaled
+    double      apCoeff;          // + apCoeff * AttackPower  (melee damage kinds)
+    double      spCoeff;          // + spCoeff * SpellPower   (spell/cone damage kinds)
+    char const* desc;             // short human blurb for list/catalog
+};
+
+// Standard single-target proc chance ladder (8% -> 20%); Ruinstone AoE is the
+// premium exception (6% -> 15%, longer ICD) since AoE trivializes solo farming.
+#define PS_CHANCE_STD  { 8.0, 11.0, 14.0, 17.0, 20.0 }
+#define PS_CHANCE_RUIN { 6.0,  8.0, 10.0, 12.0, 15.0 }
+
+// Spell IDs are best-judgment starting picks (all real WotLK spells); any can be
+// swapped in this table alone during the feel-test without touching the engine.
+static const ProcStoneDef g_procCatalog[] =
+{
+    // type          spellId  trigger   target      kind             school                     icd    chanceByTier      magByTier(R3)                    ap     sp     desc
+    { STONE_EMBER,   42873,   PT_MELEE, PTG_VICTIM, PK_DAMAGE,       SPELL_SCHOOL_MASK_FIRE,     3000,  PS_CHANCE_STD, { 150, 300, 500, 750, 1100 },    0.12,  0.00,  "Fire burst on melee hits." },
+    { STONE_RIME,    49236,   PT_MELEE, PTG_VICTIM, PK_DAMAGE_SNARE, SPELL_SCHOOL_MASK_FROST,    6000,  PS_CHANCE_STD, { 130, 260, 440, 660, 950 },     0.10,  0.00,  "Frost damage + 50% snare on melee hits." },
+    { STONE_DUSK,    48127,   PT_BOTH,  PTG_VICTIM, PK_DAMAGE,       SPELL_SCHOOL_MASK_SHADOW,   4000,  PS_CHANCE_STD, { 150, 300, 500, 750, 1100 },    0.10,  0.15,  "Shadow bolt on melee or spell hits." },
+    { STONE_STORM,   49231,   PT_MELEE, PTG_VICTIM, PK_DAMAGE,       SPELL_SCHOOL_MASK_NATURE,   3000,  PS_CHANCE_STD, { 150, 300, 500, 750, 1100 },    0.12,  0.00,  "Nature arc on melee hits." },
+    { STONE_QUICK,   28093,   PT_MELEE, PTG_SELF,   PK_SELFBUFF,     0,                          25000, PS_CHANCE_STD, { 0, 0, 0, 0, 0 },               0.00,  0.00,  "Agility & attack-speed surge (15s)." },
+    { STONE_ZEAL,    20007,   PT_MELEE, PTG_SELF,   PK_SELFBUFF,     0,                          25000, PS_CHANCE_STD, { 0, 0, 0, 0, 0 },               0.00,  0.00,  "Strength surge (15s)." },
+    { STONE_HEX,     23723,   PT_SPELL, PTG_SELF,   PK_SELFBUFF,     0,                          30000, PS_CHANCE_STD, { 0, 0, 0, 0, 0 },               0.00,  0.00,  "Casting-haste surge on spellcast (15s)." },
+    { STONE_SUNDER,  42976,   PT_MELEE, PTG_SELF,   PK_SELFBUFF,     0,                          25000, PS_CHANCE_STD, { 0, 0, 0, 0, 0 },               0.00,  0.00,  "Armor-penetration surge (15s)." },
+    { STONE_LEECH,   48127,   PT_MELEE, PTG_VICTIM, PK_LEECH,        SPELL_SCHOOL_MASK_SHADOW,   5000,  PS_CHANCE_STD, { 120, 240, 400, 600, 850 },     0.10,  0.00,  "Drains life on melee hits (damage + self-heal)." },
+    { STONE_WARD,    43039,   PT_BOTH,  PTG_SELF,   PK_ABSORB,       0,                          30000, PS_CHANCE_STD, { 500, 1000, 1800, 2800, 4000 }, 0.00,  0.50,  "Absorb shield on hit (self)." },
+    { STONE_GRAVE,   8983,    PT_MELEE, PTG_VICTIM, PK_STUN,         0,                          45000, PS_CHANCE_STD, { 0, 0, 0, 0, 0 },               0.00,  0.00,  "Stuns the target on melee hits." },
+    { STONE_HUSH,    15487,   PT_SPELL, PTG_VICTIM, PK_SILENCE,      0,                          45000, PS_CHANCE_STD, { 0, 0, 0, 0, 0 },               0.00,  0.00,  "Silences the target on spellcast." },
+    { STONE_RUIN,    42931,   PT_MELEE, PTG_VICTIM, PK_CONE,         SPELL_SCHOOL_MASK_FROST,    10000, PS_CHANCE_RUIN,{ 100, 200, 320, 470, 650 },     0.00,  0.20,  "Frost cone AoE, scales with Spell Power." }
+};
+
+#undef PS_CHANCE_STD
+#undef PS_CHANCE_RUIN
+
+// Returns the catalog entry for a proc stone type, or nullptr if not a proc type.
+static ProcStoneDef const* GetProcDef(uint8 type)
+{
+    for (ProcStoneDef const& d : g_procCatalog)
+        if (d.type == type)
+            return &d;
+    return nullptr;
+}
+
+// Proc chance for a (type, tier). Rank does not affect chance (magnitude scales
+// with rank instead). Out-of-range -> 0.
+static double GetProcChance(uint8 type, uint8 tier)
+{
+    ProcStoneDef const* d = GetProcDef(type);
+    if (!d || tier < STONE_TIER_MIN || tier > STONE_TIER_MAX)
+        return 0.0;
+    return d->chanceByTier[tier - 1];
+}
+
+// Forward decl — defined with the stat catalog above.
+static std::string FormatStoneValue(uint8 type, double value);
+
+// One-line effect descriptor for a stone at (type, tier, rank): the stat
+// value+unit for stat stones, or the proc blurb + proc% + ICD for proc stones.
+// Shared by list / sockets / catalog / buy so both stone families render the
+// same way (a proc stone has no passive stat, so the stat path would show "0.0").
+static std::string StoneEffectText(uint8 type, uint8 tier, uint8 rank)
+{
+    if (IsProcStone(type))
+    {
+        ProcStoneDef const* d = GetProcDef(type);
+        if (!d)
+            return "proc";
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), "%s (%.0f%% proc, %.0fs ICD)",
+            d->desc, GetProcChance(type, tier), d->icdMs / 1000.0);
+        return std::string(buf);
+    }
+
+    char const* unit; double secondary; char const* secondaryUnit;
+    double value = GetStoneStatValue(type, tier, rank, unit, secondary, secondaryUnit);
+    std::string out = FormatStoneValue(type, value) + unit;
+    if (secondary > 0.0 && *secondaryUnit)
+        out += " (+" + FormatStoneValue(STONE_NONE, secondary) + secondaryUnit + ")";
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Player collection cache
 // ---------------------------------------------------------------------------
@@ -364,6 +557,19 @@ static uint8 SocketCountForItem(Item* item)
     if (quality >= ITEM_QUALITY_RARE)
         return 2;
     return 1;
+}
+
+// PHASE 5 — the dedicated weapon proc socket. Reserved socket index (sits above
+// the 1..3 stat sockets) that ONLY a proc stone can occupy, and ONLY on a
+// weapon. Available from Normal quality (does not scale with tier), per the
+// locked design ("weapons get a dedicated 4th proc socket from Normal").
+static constexpr uint8 PROC_SOCKET_INDEX = 4;
+
+// True if the item is a weapon (CLASS_WEAPON) — the only thing that can hold a
+// proc stone.
+static bool ItemIsWeapon(Item* item)
+{
+    return item && item->GetTemplate()->Class == ITEM_CLASS_WEAPON;
 }
 
 // Parses an equip-slot name (case-insensitive) to an EQUIPMENT_SLOT_* value.
@@ -534,6 +740,25 @@ struct AppliedStoneStats
 
 static std::unordered_map<uint32, AppliedStoneStats> g_appliedStoneStats;
 
+// PHASE 5 — in-memory proc cache so the combat hot path NEVER hits the DB.
+// One entry per proc stone socketed into a currently-equipped weapon. Rebuilt
+// from scratch inside RecomputeStoneStats (which already fires on login / equip /
+// unequip / socket / unsocket / item-morph), so it always mirrors the live
+// socket state without any extra hooks.
+struct WeaponProc
+{
+    uint32 itemGuid; // equipped weapon holding this proc stone
+    uint64 stoneId;  // owned-stone id (stable key for the ICD map)
+    uint8  type;     // STONE_EMBER..STONE_RUIN
+    uint8  tier;
+    uint8  rank;
+};
+static std::unordered_map<uint32, std::vector<WeaponProc>> g_weaponProcs;
+
+// Per-stone internal-cooldown clock: stoneId -> last-fire time (ms, getMSTime()).
+// Keyed by stoneId (not player) so it survives cache rebuilds on equip/socket.
+static std::unordered_map<uint64, uint32> g_procIcd;
+
 // Recompute-from-scratch: undo whatever was previously applied for this
 // player from socketed stones, recompute totals from the stones socketed
 // into CURRENTLY EQUIPPED items, then reapply. Idempotent and safe to call
@@ -569,12 +794,21 @@ static void RecomputeStoneStats(Player* player)
     }
 
     // 3) Sum fresh totals from socketed stones on equipped items only.
+    //    Proc stones grant no stat but ARE captured here into the proc cache.
     double critPct = 0.0, hitPct = 0.0, spiritFlat = 0.0, armorPct = 0.0, amberPct = 0.0;
+    std::vector<WeaponProc> freshProcs;
     std::vector<SocketedStone> socketed = LoadSocketedStonesFromDB(lowGuid);
     for (SocketedStone const& s : socketed)
     {
         if (!equippedGuids.count(s.itemGuid))
             continue;
+
+        // Proc stone in a weapon's proc socket -> refresh the proc cache entry.
+        if (s.socketIndex == PROC_SOCKET_INDEX && IsProcStone(s.type))
+        {
+            freshProcs.push_back({ s.itemGuid, s.stoneId, s.type, s.tier, s.rank });
+            continue; // no passive stat to sum
+        }
 
         char const* unit; double secondary; char const* secondaryUnit;
         double value = GetStoneStatValue(s.type, s.tier, s.rank, unit, secondary, secondaryUnit);
@@ -636,6 +870,9 @@ static void RecomputeStoneStats(Player* player)
 
     // 6) Store for the next undo pass.
     g_appliedStoneStats[lowGuid] = fresh;
+
+    // 7) Publish the fresh weapon-proc cache (empty vector clears it).
+    g_weaponProcs[lowGuid] = std::move(freshProcs);
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +901,130 @@ void PowerStones_OnItemMorphed(Player* player, uint32 oldItemGuidLow, Item* newI
         ChatHandler(player->GetSession()).PSendSysMessage(
             "|cff9933ff[Power Stones]|r {} socketed stone(s) carried over to the upgraded item.",
             movedSockets.size());
+    }
+}
+
+// ===========================================================================
+// PHASE 5 — Weapon proc engine (Option B: native item-proc call site)
+// ===========================================================================
+//
+// Fires on-hit procs from stones socketed into equipped weapons. Melee triggers
+// arrive via OnPlayerCanCastItemCombatSpell (the native item-proc call site,
+// once per weapon per hit); spell triggers via OnPlayerSpellCast. Both read the
+// in-memory g_weaponProcs cache (zero DB in the combat hot path) and share ONE
+// re-entrancy guard so a proc that itself casts a spell can't recurse into the
+// engine. All actual spells are real 3.3.5a IDs — the client renders their
+// name/icon/combat-log with no DBC/MPQ work.
+
+static bool g_procFiring = false; // re-entrancy guard (game loop is single-threaded)
+
+// True if this stone's ICD has elapsed; stamps a fresh fire time when it has.
+static bool ProcIcdReady(uint64 stoneId, uint32 icdMs)
+{
+    uint32 now = getMSTime();
+    auto it = g_procIcd.find(stoneId);
+    if (it != g_procIcd.end() && getMSTimeDiff(it->second, now) < icdMs)
+        return false;
+    g_procIcd[stoneId] = now;
+    return true;
+}
+
+// Rolls, then (on success) fires one proc stone. The caller has already matched
+// the trigger. All failure paths (bad target, missed roll, on ICD) are silent.
+static void FireProc(Player* player, Unit* target, WeaponProc const& wp)
+{
+    ProcStoneDef const* d = GetProcDef(wp.type);
+    if (!d)
+        return;
+
+    // Roll first (cheapest gate) so a missed roll never consumes the ICD.
+    if (!roll_chance_f(static_cast<float>(GetProcChance(wp.type, wp.tier))))
+        return;
+    if (!ProcIcdReady(wp.stoneId, d->icdMs))
+        return;
+
+    Unit* castTarget = (d->target == PTG_SELF) ? static_cast<Unit*>(player) : target;
+    if (!castTarget || !castTarget->IsAlive())
+        return;
+    // Victim procs require a hostile, attackable target.
+    if (d->target == PTG_VICTIM && (castTarget == player || !player->IsValidAttackTarget(castTarget)))
+        return;
+
+    // Magnitude for the scaling kinds (damage / absorb / leech): base-by-tier,
+    // scaled by rank, plus a slice of Attack Power / Spell Power.
+    int32 amount = 0;
+    if (d->kind == PK_DAMAGE || d->kind == PK_DAMAGE_SNARE || d->kind == PK_CONE ||
+        d->kind == PK_LEECH  || d->kind == PK_ABSORB)
+    {
+        double mag = d->magByTier[wp.tier - 1] * g_rankPct[wp.rank];
+        if (d->apCoeff > 0.0)
+            mag += d->apCoeff * player->GetTotalAttackPowerValue(BASE_ATTACK);
+        if (d->spCoeff > 0.0)
+            mag += d->spCoeff * player->SpellBaseDamageBonusDone(SpellSchoolMask(d->schoolMask));
+        amount = std::max<int32>(1, static_cast<int32>(std::lround(mag)));
+    }
+
+    g_procFiring = true;
+    switch (d->kind)
+    {
+        case PK_DAMAGE:
+        case PK_DAMAGE_SNARE:
+        case PK_CONE:
+            player->CastCustomSpell(d->spellId, SPELLVALUE_BASE_POINT0, amount, castTarget, true);
+            break;
+        case PK_LEECH:
+            player->CastCustomSpell(d->spellId, SPELLVALUE_BASE_POINT0, amount, castTarget, true);
+            player->ModifyHealth(amount / 2); // drain: heal you for half the damage
+            break;
+        case PK_ABSORB:
+            player->CastCustomSpell(d->spellId, SPELLVALUE_BASE_POINT0, amount, player, true);
+            break;
+        case PK_SELFBUFF:
+            player->CastSpell(player, d->spellId, true);
+            break;
+        case PK_STUN:
+        case PK_SILENCE:
+            player->CastSpell(castTarget, d->spellId, true);
+            break;
+    }
+    g_procFiring = false;
+}
+
+// Melee/ranged trigger: `weaponGuid` is the specific weapon that just landed a
+// hit (OnPlayerCanCastItemCombatSpell scopes to one weapon per hit).
+static void PowerStones_OnWeaponHit(Player* player, Unit* target, uint32 weaponGuid)
+{
+    if (g_procFiring || !player)
+        return;
+    auto it = g_weaponProcs.find(player->GetGUID().GetCounter());
+    if (it == g_weaponProcs.end())
+        return;
+    for (WeaponProc const& wp : it->second)
+    {
+        if (wp.itemGuid != weaponGuid)
+            continue;
+        ProcStoneDef const* d = GetProcDef(wp.type);
+        if (!d || !(static_cast<uint8>(d->trigger) & static_cast<uint8>(PT_MELEE)))
+            continue;
+        FireProc(player, target, wp);
+    }
+}
+
+// Spell trigger: every equipped-weapon proc whose trigger includes spells fires
+// against the offensive spell's unit target (self-target procs hit the player).
+static void PowerStones_OnOffensiveSpell(Player* player, Unit* target)
+{
+    if (g_procFiring || !player)
+        return;
+    auto it = g_weaponProcs.find(player->GetGUID().GetCounter());
+    if (it == g_weaponProcs.end())
+        return;
+    for (WeaponProc const& wp : it->second)
+    {
+        ProcStoneDef const* d = GetProcDef(wp.type);
+        if (!d || !(static_cast<uint8>(d->trigger) & static_cast<uint8>(PT_SPELL)))
+            continue;
+        FireProc(player, target, wp);
     }
 }
 
@@ -707,6 +1068,7 @@ public:
         uint32 lowGuid = player->GetGUID().GetCounter();
         g_ownedStones.erase(lowGuid);
         g_appliedStoneStats.erase(lowGuid);
+        g_weaponProcs.erase(lowGuid);
     }
 
     // PHASE 3 — recompute on gear swap so socketing then changing gear
@@ -722,6 +1084,30 @@ public:
     void OnPlayerUnequip(Player* player, Item* /*it*/) override
     {
         RecomputeStoneStats(player);
+    }
+
+    // PHASE 5 — melee/ranged weapon proc trigger. Fires INSIDE the native
+    // CastItemCombatSpell path (once per weapon per hit). We return true always
+    // so native enchant procs keep running; the proc is a pure side effect.
+    bool OnPlayerCanCastItemCombatSpell(Player* player, Unit* target, WeaponAttackType /*attType*/,
+        uint32 /*procVictim*/, uint32 /*procEx*/, Item* item, ItemTemplate const* /*proto*/) override
+    {
+        if (player && item && target)
+            PowerStones_OnWeaponHit(player, target, item->GetGUID().GetCounter());
+        return true;
+    }
+
+    // PHASE 5 — spell-cast weapon proc trigger. Only OFFENSIVE casts arm the
+    // spell-triggered procs (Hex/Hush/Dusk-spell/Ward), so heals and buffs
+    // never proc them.
+    void OnPlayerSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
+    {
+        if (!player || !spell)
+            return;
+        SpellInfo const* si = spell->GetSpellInfo();
+        if (!si || si->IsPositive())
+            return;
+        PowerStones_OnOffensiveSpell(player, spell->m_targets.GetUnitTarget());
     }
 };
 
@@ -797,7 +1183,8 @@ public:
         if (type == STONE_NONE)
         {
             handler->SendSysMessage(
-                "|cffff0000[Power Stones]|r Usage: .stone buy <crimson|obsidian|jade|iron|amber>");
+                "|cffff0000[Power Stones]|r Usage: .stone buy <stat: crimson|obsidian|jade|iron|amber | proc: ember|"
+                "rime|dusk|storm|quick|zeal|hex|sunder|leech|ward|grave|hush|ruin>");
             return true;
         }
 
@@ -816,12 +1203,13 @@ public:
         std::vector<OwnedStone>& stones = GetCachedStones(lowGuid);
         stones.push_back({ id, type, STONE_TIER_MIN, STONE_RANK_MIN });
 
-        char const* unit; double secondary; char const* secondaryUnit;
-        double value = GetStoneStatValue(type, STONE_TIER_MIN, STONE_RANK_MIN, unit, secondary, secondaryUnit);
-
         handler->PSendSysMessage(
-            "|cff9933ff[Power Stones]|r Bought a new {} stone (#{}) — Tier I Rank 1 — {}{}.",
-            StoneTypeName(type), id, FormatStoneValue(type, value), unit);
+            "|cff9933ff[Power Stones]|r Bought a new {} stone (#{}) — Tier I Rank 1 — {}.",
+            StoneTypeName(type), id, StoneEffectText(type, STONE_TIER_MIN, STONE_RANK_MIN));
+        if (IsProcStone(type))
+            handler->PSendSysMessage(
+                "|cff9933ff[Power Stones]|r Socket it into a weapon's proc socket: .stone socket {} mainhand {}.",
+                id, static_cast<uint32>(PROC_SOCKET_INDEX));
         return true;
     }
 
@@ -932,13 +1320,6 @@ public:
         handler->SendSysMessage("|cff9933ff[Power Stones] Your Collection|r");
         for (OwnedStone const& s : stones)
         {
-            char const* unit; double secondary; char const* secondaryUnit;
-            double value = GetStoneStatValue(s.type, s.tier, s.rank, unit, secondary, secondaryUnit);
-
-            std::string extra;
-            if (secondary > 0.0 && *secondaryUnit)
-                extra = " (+" + FormatStoneValue(STONE_NONE, secondary) + secondaryUnit + ")";
-
             std::string socketTag;
             for (SocketedStone const& sock : socketed)
             {
@@ -949,9 +1330,9 @@ public:
                 }
             }
 
-            handler->PSendSysMessage("  #{} {} T{} R{} — {}{}{}{}",
+            handler->PSendSysMessage("  #{} {} T{} R{} — {}{}",
                 s.id, StoneTypeName(s.type), static_cast<uint32>(s.tier), static_cast<uint32>(s.rank),
-                FormatStoneValue(s.type, value), unit, extra, socketTag);
+                StoneEffectText(s.type, s.tier, s.rank), socketTag);
         }
         return true;
     }
@@ -962,6 +1343,7 @@ public:
         handler->SendSysMessage("|cff9933ff[Power Stones] Catalog|r (buy-in: "
             + std::to_string(STONE_BUY_IN_COST) + " shards)");
 
+        handler->SendSysMessage("|cff9933ffStat stones|r (armor sockets 1-3):");
         for (uint8 type = STONE_TYPE_MIN; type <= STONE_TYPE_MAX; ++type)
         {
             char const* unitMin; double secMin; char const* secUnitMin;
@@ -972,6 +1354,19 @@ public:
             handler->PSendSysMessage("  {} — Tier I R1: {}{}  ->  Tier V R3: {}{}",
                 StoneTypeName(type), FormatStoneValue(type, valMin), unitMin,
                 FormatStoneValue(type, valMax), unitMax);
+        }
+
+        handler->SendSysMessage("|cff9933ffWeapon proc stones|r (weapon proc socket):");
+        for (uint8 type = PROC_TYPE_MIN; type <= PROC_TYPE_MAX; ++type)
+        {
+            ProcStoneDef const* d = GetProcDef(type);
+            if (!d)
+                continue;
+            handler->PSendSysMessage("  {} — {} (T1 {}%->T5 {}% proc, {}s ICD)",
+                StoneTypeName(type), d->desc,
+                static_cast<uint32>(GetProcChance(type, STONE_TIER_MIN)),
+                static_cast<uint32>(GetProcChance(type, STONE_TIER_MAX)),
+                static_cast<uint32>(d->icdMs / 1000));
         }
 
         handler->SendSysMessage(
@@ -1076,14 +1471,37 @@ public:
             return true;
         }
 
-        // Socket index must be in range for that item's quality-derived socket count.
-        uint8 maxSockets = SocketCountForItem(item);
-        if (socketIndex < 1 || socketIndex > maxSockets)
+        // PHASE 5 — proc stones vs stat stones take DIFFERENT sockets.
+        if (IsProcStone(stone->type))
         {
-            handler->PSendSysMessage(
-                "|cffff0000[Power Stones]|r {} only has {} socket(s) (quality-based). Valid range: 1-{}.",
-                item->GetTemplate()->Name1, static_cast<uint32>(maxSockets), static_cast<uint32>(maxSockets));
-            return true;
+            // Proc stone: weapon only, and only the dedicated proc socket.
+            if (!ItemIsWeapon(item))
+            {
+                handler->PSendSysMessage(
+                    "|cffff0000[Power Stones]|r {} is a proc stone — it can only go in a WEAPON's proc socket (socket {}).",
+                    StoneTypeName(stone->type), static_cast<uint32>(PROC_SOCKET_INDEX));
+                return true;
+            }
+            if (socketIndex != PROC_SOCKET_INDEX)
+            {
+                handler->PSendSysMessage(
+                    "|cffff0000[Power Stones]|r Proc stones go in the weapon proc socket ({}). Use: .stone socket {} {} {}.",
+                    static_cast<uint32>(PROC_SOCKET_INDEX), stoneId, tokens[1], static_cast<uint32>(PROC_SOCKET_INDEX));
+                return true;
+            }
+        }
+        else
+        {
+            // Stat stone: one of the quality-derived armor sockets (1..N), never
+            // the proc socket.
+            uint8 maxSockets = SocketCountForItem(item);
+            if (socketIndex < 1 || socketIndex > maxSockets)
+            {
+                handler->PSendSysMessage(
+                    "|cffff0000[Power Stones]|r {} has {} stat socket(s) (quality-based). Valid range: 1-{}.",
+                    item->GetTemplate()->Name1, static_cast<uint32>(maxSockets), static_cast<uint32>(maxSockets));
+                return true;
+            }
         }
 
         // Socket must be empty.
@@ -1250,31 +1668,32 @@ public:
         uint8 maxSockets = SocketCountForItem(item);
         uint32 itemGuidLow = item->GetGUID().GetCounter();
         std::vector<std::pair<uint8, uint64>> existingSockets = LoadSocketsForItem(itemGuidLow);
+        bool isWeapon = ItemIsWeapon(item);
 
-        handler->PSendSysMessage("|cff9933ff[Power Stones]|r {} — {} socket(s):",
-            item->GetTemplate()->Name1, static_cast<uint32>(maxSockets));
+        handler->PSendSysMessage("|cff9933ff[Power Stones]|r {} — {} stat socket(s){}:",
+            item->GetTemplate()->Name1, static_cast<uint32>(maxSockets),
+            isWeapon ? " + 1 proc socket" : "");
 
-        for (uint8 idx = 1; idx <= maxSockets; ++idx)
+        // Prints one socket row (empty, missing-data, or the stone's descriptor).
+        // `label` overrides the numeric index for the proc socket line.
+        auto printSocket = [&](uint8 idx, char const* label)
         {
             uint64 stoneId = 0;
             for (auto const& [sIdx, sId] : existingSockets)
-            {
                 if (sIdx == idx) { stoneId = sId; break; }
-            }
 
             if (stoneId == 0)
             {
-                handler->PSendSysMessage("  Socket {}: |cff888888empty|r", static_cast<uint32>(idx));
-                continue;
+                handler->PSendSysMessage("  {}: |cff888888empty|r", label);
+                return;
             }
 
-            // Look up type/tier/rank for display.
             QueryResult result = CharacterDatabase.Query(
                 "SELECT stone_type, tier, `rank` FROM character_power_stones WHERE id = {}", stoneId);
             if (!result)
             {
-                handler->PSendSysMessage("  Socket {}: stone #{} (data missing)", static_cast<uint32>(idx), stoneId);
-                continue;
+                handler->PSendSysMessage("  {}: stone #{} (data missing)", label, stoneId);
+                return;
             }
 
             Field* fields = result->Fetch();
@@ -1282,14 +1701,20 @@ public:
             uint8 tier = fields[1].Get<uint8>();
             uint8 rank = fields[2].Get<uint8>();
 
-            char const* unit; double secondary; char const* secondaryUnit;
-            double value = GetStoneStatValue(type, tier, rank, unit, secondary, secondaryUnit);
-
-            handler->PSendSysMessage("  Socket {}: #{} {} T{} R{} — {}{}",
-                static_cast<uint32>(idx), stoneId, StoneTypeName(type),
+            handler->PSendSysMessage("  {}: #{} {} T{} R{} — {}",
+                label, stoneId, StoneTypeName(type),
                 static_cast<uint32>(tier), static_cast<uint32>(rank),
-                FormatStoneValue(type, value), unit);
+                StoneEffectText(type, tier, rank));
+        };
+
+        for (uint8 idx = 1; idx <= maxSockets; ++idx)
+        {
+            std::string label = "Socket " + std::to_string(idx);
+            printSocket(idx, label.c_str());
         }
+        if (isWeapon)
+            printSocket(PROC_SOCKET_INDEX, "Proc socket");
+
         return true;
     }
 };
@@ -1332,9 +1757,10 @@ static const uint32 BROKER_NPC_TEXT     = 700260; // created in the module SQL
 // Main-menu actions (sender == GOSSIP_SENDER_MAIN).
 enum BrokerAction
 {
-    BACT_BUY_MENU     = 1,
+    BACT_BUY_MENU     = 1, // stat stones
     BACT_UPGRADE_MENU = 2,
     BACT_COLLECTION   = 3,
+    BACT_PROCBUY_MENU = 4, // weapon proc stones
     BACT_BACK         = 8,
     BACT_CLOSE        = 9
 };
@@ -1362,8 +1788,11 @@ public:
         // Buy a specific stone type.
         if (sender == SENDER_BUY)
         {
-            DoBuy(player, static_cast<uint8>(action));
-            ShowBuyMenu(player, creature); // stay in the buy menu for more purchases
+            uint8 type = static_cast<uint8>(action);
+            DoBuy(player, type);
+            // Stay in whichever buy menu they were in.
+            if (IsProcStone(type)) ShowProcBuyMenu(player, creature);
+            else                   ShowBuyMenu(player, creature);
             return true;
         }
 
@@ -1378,6 +1807,7 @@ public:
         switch (action)
         {
             case BACT_BUY_MENU:     ShowBuyMenu(player, creature);     break;
+            case BACT_PROCBUY_MENU: ShowProcBuyMenu(player, creature); break;
             case BACT_UPGRADE_MENU: ShowUpgradeMenu(player, creature); break;
             case BACT_COLLECTION:   ShowCollection(player, creature);  break;
             case BACT_BACK:         ShowMainMenu(player, creature);    break;
@@ -1396,7 +1826,9 @@ private:
         int64 balance = Shards_GetBalance(player->GetGUID().GetCounter());
 
         AddGossipItemFor(player, GOSSIP_ICON_VENDOR,
-            "Buy a Power Stone.", GOSSIP_SENDER_MAIN, BACT_BUY_MENU);
+            "Buy a stat stone.", GOSSIP_SENDER_MAIN, BACT_BUY_MENU);
+        AddGossipItemFor(player, GOSSIP_ICON_VENDOR,
+            "Buy a weapon proc stone.", GOSSIP_SENDER_MAIN, BACT_PROCBUY_MENU);
         AddGossipItemFor(player, GOSSIP_ICON_TALK,
             "Upgrade one of my stones.", GOSSIP_SENDER_MAIN, BACT_UPGRADE_MENU);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT,
@@ -1415,11 +1847,26 @@ private:
 
         for (uint8 type = STONE_TYPE_MIN; type <= STONE_TYPE_MAX; ++type)
         {
-            char const* unit; double secondary; char const* secondaryUnit;
-            double value = GetStoneStatValue(type, STONE_TIER_MIN, STONE_RANK_MIN, unit, secondary, secondaryUnit);
+            std::string label = std::string(StoneTypeName(type)) + " — Tier I R1 ("
+                + StoneEffectText(type, STONE_TIER_MIN, STONE_RANK_MIN) + ") — "
+                + std::to_string(STONE_BUY_IN_COST) + " shards";
 
-            std::string label = std::string(StoneTypeName(type)) + " — Tier I Rank 1 ("
-                + FormatStoneValue(type, value) + unit + ") — "
+            AddGossipItemFor(player, GOSSIP_ICON_VENDOR, label, SENDER_BUY, type);
+        }
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "< Back", GOSSIP_SENDER_MAIN, BACT_BACK);
+        SendGossipMenuFor(player, BROKER_NPC_TEXT, creature->GetGUID());
+    }
+
+    // Weapon proc stones — socket into a weapon's proc socket.
+    void ShowProcBuyMenu(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        for (uint8 type = PROC_TYPE_MIN; type <= PROC_TYPE_MAX; ++type)
+        {
+            std::string label = std::string(StoneTypeName(type)) + " — "
+                + StoneEffectText(type, STONE_TIER_MIN, STONE_RANK_MIN) + " — "
                 + std::to_string(STONE_BUY_IN_COST) + " shards";
 
             AddGossipItemFor(player, GOSSIP_ICON_VENDOR, label, SENDER_BUY, type);
@@ -1472,13 +1919,9 @@ private:
         {
             ch.PSendSysMessage("|cff9933ff[Power Stones] Your Collection|r");
             for (OwnedStone const& s : stones)
-            {
-                char const* unit; double secondary; char const* secondaryUnit;
-                double value = GetStoneStatValue(s.type, s.tier, s.rank, unit, secondary, secondaryUnit);
-                ch.PSendSysMessage("  #{} {} T{} R{} — {}{}",
+                ch.PSendSysMessage("  #{} {} T{} R{} — {}",
                     s.id, StoneTypeName(s.type), static_cast<uint32>(s.tier), static_cast<uint32>(s.rank),
-                    FormatStoneValue(s.type, value), unit);
-            }
+                    StoneEffectText(s.type, s.tier, s.rank));
         }
 
         // Re-show the main menu so the window stays open.
@@ -1490,7 +1933,8 @@ private:
     static void DoBuy(Player* player, uint8 type)
     {
         ChatHandler ch(player->GetSession());
-        if (type < STONE_TYPE_MIN || type > STONE_TYPE_MAX)
+        bool isStat = (type >= STONE_TYPE_MIN && type <= STONE_TYPE_MAX);
+        if (!isStat && !IsProcStone(type))
             return;
 
         if (!Shards_TrySpend(player, STONE_BUY_IN_COST, "stone-buy-npc"))
@@ -1505,11 +1949,13 @@ private:
         uint64 id = InsertOwnedStone(lowGuid, type, STONE_TIER_MIN, STONE_RANK_MIN);
         GetCachedStones(lowGuid).push_back({ id, type, STONE_TIER_MIN, STONE_RANK_MIN });
 
-        char const* unit; double secondary; char const* secondaryUnit;
-        double value = GetStoneStatValue(type, STONE_TIER_MIN, STONE_RANK_MIN, unit, secondary, secondaryUnit);
         ch.PSendSysMessage(
-            "|cff9933ff[Power Stones]|r Bought a new {} stone (#{}) — Tier I Rank 1 — {}{}.",
-            StoneTypeName(type), id, FormatStoneValue(type, value), unit);
+            "|cff9933ff[Power Stones]|r Bought a new {} stone (#{}) — Tier I Rank 1 — {}.",
+            StoneTypeName(type), id, StoneEffectText(type, STONE_TIER_MIN, STONE_RANK_MIN));
+        if (IsProcStone(type))
+            ch.PSendSysMessage(
+                "|cff9933ff[Power Stones]|r Socket it into a weapon: .stone socket {} mainhand {}.",
+                id, static_cast<uint32>(PROC_SOCKET_INDEX));
     }
 
     static void DoUpgrade(Player* player, uint32 stoneId)
