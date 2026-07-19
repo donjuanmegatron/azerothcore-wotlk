@@ -86,6 +86,22 @@ extern int64 Shards_GetBalance(uint32 lowGuid);
 extern bool  Shards_TrySpend(Player* player, uint32 amount, char const* reason);
 
 // ---------------------------------------------------------------------------
+// PHASE 6 — SanctumStones addon transport. Identical mechanism to mod-aa-
+// system's SendToAAAddon: a CHAT_MSG_SYSTEM packet carrying a magic prefix
+// (||PS||) that the SanctumStones Lua addon filters out of the chat window and
+// parses. No addon-message prefix registration needed; works on stock 3.3.5a.
+// ---------------------------------------------------------------------------
+static void SendToStoneAddon(Player* player, std::string const& msg)
+{
+    if (!player || !player->GetSession())
+        return;
+    std::string fullMsg = "||PS||" + msg;
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_SYSTEM, LANG_UNIVERSAL, nullptr, nullptr, fullMsg);
+    player->GetSession()->SendPacket(&data);
+}
+
+// ---------------------------------------------------------------------------
 // Stone type enum
 // ---------------------------------------------------------------------------
 
@@ -1130,7 +1146,8 @@ public:
             { "catalog",  HandleStoneCatalog,  SEC_PLAYER, Console::Yes },
             { "socket",   HandleStoneSocket,   SEC_PLAYER, Console::Yes },
             { "unsocket", HandleStoneUnsocket, SEC_PLAYER, Console::Yes },
-            { "sockets",  HandleStoneSockets,  SEC_PLAYER, Console::Yes }
+            { "sockets",  HandleStoneSockets,  SEC_PLAYER, Console::Yes },
+            { "sync",     HandleStoneSync,     SEC_PLAYER, Console::No  }
         };
         static ChatCommandTable commandTable =
         {
@@ -1290,6 +1307,55 @@ public:
             "|cff9933ff[Power Stones]|r {} stone #{} upgraded to Tier {} Rank {} — {}{}{}. Spent {} shard(s).",
             StoneTypeName(stone->type), stone->id, static_cast<uint32>(newTier), static_cast<uint32>(newRank),
             FormatStoneValue(stone->type, value), unit, extra, cost);
+        return true;
+    }
+
+    // .stone sync — PHASE 6: push full stone state to the SanctumStones addon.
+    // The addon fires this after it loads and after every action it takes; the
+    // human-readable commands (.stone list etc.) are unchanged. Protocol lines
+    // (each wrapped by SendToStoneAddon with the ||PS|| prefix):
+    //   SANCTUMSTONES:INIT:<shardBalance>
+    //   SANCTUMSTONES:STONE:<id>:<type>:<tier>:<rank>:<socketItemGuid|0>:<socketIndex|0>
+    //   SANCTUMSTONES:READY
+    static bool HandleStoneSync(ChatHandler* handler)
+    {
+        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!player)
+            return true;
+
+        uint32 lowGuid = player->GetGUID().GetCounter();
+
+        SendToStoneAddon(player, "SANCTUMSTONES:INIT:" + std::to_string(Shards_GetBalance(lowGuid)));
+
+        // Map stoneId -> (itemGuid, socketIndex) so each owned stone reports where
+        // (if anywhere) it is socketed. Only equipped-item sockets are reported;
+        // the addon shows an unsocketed stone as guid 0.
+        std::vector<SocketedStone> socketed = LoadSocketedStonesFromDB(lowGuid);
+
+        for (OwnedStone const& s : GetCachedStones(lowGuid))
+        {
+            uint32 sockItemGuid = 0;
+            uint8  sockIndex     = 0;
+            for (SocketedStone const& ss : socketed)
+            {
+                if (ss.stoneId == s.id)
+                {
+                    sockItemGuid = ss.itemGuid;
+                    sockIndex    = ss.socketIndex;
+                    break;
+                }
+            }
+
+            SendToStoneAddon(player, "SANCTUMSTONES:STONE:"
+                + std::to_string(s.id) + ":"
+                + std::to_string(static_cast<uint32>(s.type)) + ":"
+                + std::to_string(static_cast<uint32>(s.tier)) + ":"
+                + std::to_string(static_cast<uint32>(s.rank)) + ":"
+                + std::to_string(sockItemGuid) + ":"
+                + std::to_string(static_cast<uint32>(sockIndex)));
+        }
+
+        SendToStoneAddon(player, "SANCTUMSTONES:READY");
         return true;
     }
 
@@ -1559,57 +1625,88 @@ public:
                 tokens.push_back(cur);
         }
 
-        if (tokens.size() != 2)
-        {
-            handler->SendSysMessage(
-                "|cffff0000[Power Stones]|r Usage: .stone unsocket <slotName> <socketIndex>");
-            return true;
-        }
-
-        int slot = ParseEquipSlotByName(tokens[0]);
-        uint32 socketIndexArg = 0;
-        if (slot < 0 || !ParseUInt32Arg(tokens[1], socketIndexArg) || socketIndexArg == 0)
-        {
-            handler->SendSysMessage(
-                "|cffff0000[Power Stones]|r Usage: .stone unsocket <slotName> <socketIndex>");
-            return true;
-        }
-        uint8 socketIndex = static_cast<uint8>(socketIndexArg);
-
-        Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, static_cast<uint8>(slot));
-        if (!item)
-        {
-            handler->PSendSysMessage(
-                "|cffff0000[Power Stones]|r You have no item equipped in slot '{}'.", tokens[0]);
-            return true;
-        }
-
-        uint32 itemGuidLow = item->GetGUID().GetCounter();
-        std::vector<std::pair<uint8, uint64>> existingSockets = LoadSocketsForItem(itemGuidLow);
-        uint64 stoneId = 0;
-        for (auto const& [idx, sId] : existingSockets)
-        {
-            if (idx == socketIndex) { stoneId = sId; break; }
-        }
-
-        if (stoneId == 0)
-        {
-            handler->PSendSysMessage(
-                "|cffff0000[Power Stones]|r Socket {} on {} is already empty.",
-                static_cast<uint32>(socketIndex), item->GetTemplate()->Name1);
-            return true;
-        }
-
-        // PHASE 4 — tiered GOLD swap fee (GDD 5g-250g by tier). Look up the
-        // stone's tier from the owned-stone cache to price the fee. If the stone
-        // isn't in the cache (shouldn't happen — it's socketed, so it's owned),
-        // tier 0 -> fee 0, i.e. fail-open to a free unsocket rather than block it.
+        // Resolve the target socket. TWO accepted forms:
+        //   .stone unsocket <stoneId>            (addon + convenience; works even
+        //                                         if the item is now UNEQUIPPED)
+        //   .stone unsocket <slotName> <index>   (original human form)
         uint32 lowGuid = player->GetGUID().GetCounter();
+        uint64 stoneId     = 0;
+        uint32 itemGuidLow = 0;
+        uint8  socketIndex = 0;
+        std::string itemName = "your item";
+
+        if (tokens.size() == 1)
+        {
+            uint32 idArg = 0;
+            if (!ParseUInt32Arg(tokens[0], idArg) || idArg == 0)
+            {
+                handler->SendSysMessage(
+                    "|cffff0000[Power Stones]|r Usage: .stone unsocket <stoneId>  (or <slotName> <socketIndex>)");
+                return true;
+            }
+            stoneId = idArg;
+
+            // Find where this stone is socketed straight from the overlay table —
+            // no equipped item required (fixes the old slot-based bug where a stone
+            // in an item you'd since unequipped couldn't be removed).
+            QueryResult r = CharacterDatabase.Query(
+                "SELECT item_guid, socket_index FROM character_socketed_stones WHERE guid = {} AND stone_id = {} LIMIT 1",
+                lowGuid, stoneId);
+            if (!r)
+            {
+                handler->PSendSysMessage("|cffff0000[Power Stones]|r Stone #{} is not socketed.", stoneId);
+                return true;
+            }
+            Field* f = r->Fetch();
+            itemGuidLow = f[0].Get<uint32>();
+            socketIndex = f[1].Get<uint8>();
+            if (Item* it = player->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuidLow)))
+                itemName = it->GetTemplate()->Name1;
+        }
+        else if (tokens.size() == 2)
+        {
+            int slot = ParseEquipSlotByName(tokens[0]);
+            uint32 socketIndexArg = 0;
+            if (slot < 0 || !ParseUInt32Arg(tokens[1], socketIndexArg) || socketIndexArg == 0)
+            {
+                handler->SendSysMessage(
+                    "|cffff0000[Power Stones]|r Usage: .stone unsocket <stoneId>  (or <slotName> <socketIndex>)");
+                return true;
+            }
+            socketIndex = static_cast<uint8>(socketIndexArg);
+
+            Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, static_cast<uint8>(slot));
+            if (!item)
+            {
+                handler->PSendSysMessage(
+                    "|cffff0000[Power Stones]|r You have no item equipped in slot '{}'.", tokens[0]);
+                return true;
+            }
+            itemGuidLow = item->GetGUID().GetCounter();
+            itemName    = item->GetTemplate()->Name1;
+
+            for (auto const& [idx, sId] : LoadSocketsForItem(itemGuidLow))
+                if (idx == socketIndex) { stoneId = sId; break; }
+            if (stoneId == 0)
+            {
+                handler->PSendSysMessage(
+                    "|cffff0000[Power Stones]|r Socket {} on {} is already empty.",
+                    static_cast<uint32>(socketIndex), itemName);
+                return true;
+            }
+        }
+        else
+        {
+            handler->SendSysMessage(
+                "|cffff0000[Power Stones]|r Usage: .stone unsocket <stoneId>  (or <slotName> <socketIndex>)");
+            return true;
+        }
+
+        // PHASE 4 — tiered GOLD swap fee (GDD 5g-250g by tier), priced off the
+        // stone's tier from the owned-stone cache. Not found -> fee 0 (fail-open).
         uint8 stoneTier = 0;
         for (OwnedStone const& os : GetCachedStones(lowGuid))
-        {
             if (os.id == stoneId) { stoneTier = os.tier; break; }
-        }
 
         uint32 feeCopper = StoneUnsocketGoldCost(stoneTier);
         if (feeCopper > 0 && !player->HasEnoughMoney(static_cast<int32>(feeCopper)))
@@ -1630,12 +1727,12 @@ public:
 
         if (feeCopper > 0)
             handler->PSendSysMessage(
-                "|cff9933ff[Power Stones]|r Stone #{} removed from {} socket {} for {}g and returned to your collection.",
-                stoneId, item->GetTemplate()->Name1, static_cast<uint32>(socketIndex), feeCopper / 10000);
+                "|cff9933ff[Power Stones]|r Stone #{} removed from {} for {}g and returned to your collection.",
+                stoneId, itemName, feeCopper / 10000);
         else
             handler->PSendSysMessage(
-                "|cff9933ff[Power Stones]|r Stone #{} removed from {} socket {} and returned to your collection.",
-                stoneId, item->GetTemplate()->Name1, static_cast<uint32>(socketIndex));
+                "|cff9933ff[Power Stones]|r Stone #{} removed from {} and returned to your collection.",
+                stoneId, itemName);
         return true;
     }
 
