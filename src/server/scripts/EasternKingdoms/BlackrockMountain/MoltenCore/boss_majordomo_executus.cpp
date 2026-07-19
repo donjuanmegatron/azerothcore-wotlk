@@ -411,9 +411,31 @@ struct boss_majordomo : public BossAI
                                 lavaSteam->Refresh();
                             }
                             Talk(SAY_RAG_SUM_2);
-                            // Next event will get triggered in MovementInform
-                            me->SetWalk(true);
-                            me->GetMotionMaster()->MovePoint(POINT_RAGNAROS_SUMMON, MajordomoMoveRagPos, FORCED_MOVEMENT_NONE, 0.f, true, false);
+
+                            // SANCTUM solo fix (2026-07-18): the retail cinematic — walk to a
+                            // ledge point, wait for MovementInform, cast SPELL_SUMMON_RAGNAROS,
+                            // then a chain of timed emerge events — fails on a solo clear, so
+                            // Ragnaros never spawned and finishing the gossip appeared to "do
+                            // nothing". Summon him DIRECTLY at his platform position and fully
+                            // activate him here so he always comes up fightable and registered.
+                            if (!instance->GetGuidData(DATA_RAGNAROS))
+                            {
+                                if (Creature* ragnaros = me->SummonCreature(NPC_RAGNAROS, RagnarosSummonPos))
+                                {
+                                    // JustSummoned() has already faded/submerged/locked him;
+                                    // undo all of it and hand off to his own combat intro.
+                                    ragnaros->RemoveAurasDueToSpell(SPELL_RAGNAROS_FADE);
+                                    ragnaros->RemoveAurasDueToSpell(SPELL_RAGNAROS_SUBMERGE_EFFECT);
+                                    ragnaros->RemoveUnitFlag(UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_NOT_SELECTABLE);
+                                    ragnaros->SetImmuneToAll(false);
+                                    ragnaros->SetControlled(false, UNIT_STATE_ROOT);
+                                    ragnaros->SetReactState(REACT_AGGRESSIVE);
+                                    ragnaros->CastSpell(ragnaros, SPELL_RAGNA_EMERGE, true);
+                                    ragnaros->AI()->DoAction(ACTION_FINISH_RAGNAROS_INTRO);
+                                }
+                            }
+                            // Majordomo's part is done (the gossip already cleared his gossip
+                            // flag); end the summon sequence — no walk / MovementInform needed.
                             break;
                         }
                         case EVENT_RAGNAROS_SUMMON_2:
