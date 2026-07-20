@@ -16,6 +16,7 @@
  */
 
 #include "CreatureScript.h"
+#include "GossipDef.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "ScriptedCreature.h"
@@ -412,30 +413,10 @@ struct boss_majordomo : public BossAI
                             }
                             Talk(SAY_RAG_SUM_2);
 
-                            // SANCTUM solo fix (2026-07-18): the retail cinematic — walk to a
-                            // ledge point, wait for MovementInform, cast SPELL_SUMMON_RAGNAROS,
-                            // then a chain of timed emerge events — fails on a solo clear, so
-                            // Ragnaros never spawned and finishing the gossip appeared to "do
-                            // nothing". Summon him DIRECTLY at his platform position and fully
-                            // activate him here so he always comes up fightable and registered.
-                            if (!instance->GetGuidData(DATA_RAGNAROS))
-                            {
-                                if (Creature* ragnaros = me->SummonCreature(NPC_RAGNAROS, RagnarosSummonPos))
-                                {
-                                    // JustSummoned() has already faded/submerged/locked him;
-                                    // undo all of it and hand off to his own combat intro.
-                                    ragnaros->RemoveAurasDueToSpell(SPELL_RAGNAROS_FADE);
-                                    ragnaros->RemoveAurasDueToSpell(SPELL_RAGNAROS_SUBMERGE_EFFECT);
-                                    ragnaros->RemoveUnitFlag(UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_NOT_SELECTABLE);
-                                    ragnaros->SetImmuneToAll(false);
-                                    ragnaros->SetControlled(false, UNIT_STATE_ROOT);
-                                    ragnaros->SetReactState(REACT_AGGRESSIVE);
-                                    ragnaros->CastSpell(ragnaros, SPELL_RAGNA_EMERGE, true);
-                                    ragnaros->AI()->DoAction(ACTION_FINISH_RAGNAROS_INTRO);
-                                }
-                            }
-                            // Majordomo's part is done (the gossip already cleared his gossip
-                            // flag); end the summon sequence — no walk / MovementInform needed.
+                            // SANCTUM solo fix: no walk / MovementInform / SPELL_SUMMON_RAGNAROS
+                            // cinematic — the direct summon already happened in the final gossip
+                            // step; this is a guarded backup in case that ever failed.
+                            SummonAndActivateRagnaros();
                             break;
                         }
                         case EVENT_RAGNAROS_SUMMON_2:
@@ -535,8 +516,19 @@ struct boss_majordomo : public BossAI
         SendGossipMenuFor(player, TEXT_ID_SUMMON_1, me->GetGUID());
     }
 
-    void sGossipSelect(Player* player, uint32 /*sender*/, uint32 action) override
+    void sGossipSelect(Player* player, uint32 /*menuId*/, uint32 gossipListId) override
     {
+        // SANCTUM ROOT-CAUSE FIX (2026-07-19): the core calls this hook as
+        // sGossipSelect(player, menuId, gossipListId) — see MiscHandler.cpp
+        // HandleGossipSelectOptionOpcode. The third argument is the clicked
+        // option's LIST INDEX (always 0 here — every menu has one option),
+        // NOT the GOSSIP_ACTION_INFO_DEF+n action this switch expects. So no
+        // case ever matched, every click fell into default/close, and the
+        // final step (which summons Ragnaros) was unreachable dead code.
+        // Translate the list index back into the action we stored when the
+        // item was added (kept as the item's OptionType) BEFORE clearing the
+        // menu — the same lookup the core itself uses for CreatureScripts.
+        uint32 const action = player->PlayerTalkClass->GetGossipOptionAction(gossipListId);
         ClearGossipMenuFor(player);
         switch (action)
         {
@@ -563,6 +555,11 @@ struct boss_majordomo : public BossAI
                 CloseGossipMenuFor(player);
                 me->RemoveNpcFlag(UNIT_NPC_FLAG_GOSSIP);
                 Talk(SAY_RAG_SUM_1, player);
+                // Summon + activate Ragnaros RIGHT HERE (guaranteed path) —
+                // then let the timed summon phase play the remaining flavor
+                // (lava visuals + SAY_RAG_SUM_2); its own summon call is a
+                // guarded no-op once Ragnaros exists.
+                SummonAndActivateRagnaros();
                 DoAction(ACTION_START_RAGNAROS_INTRO);
                 break;
             }
@@ -576,6 +573,40 @@ private:
     GuidSet static_minionsGUIDS;    // contained data should be changed on encounter completion
     GuidSet aliveMinionsGUIDS;      // used for calculations
     std::unordered_map<uint32, MajordomoAddData> majordomoSummonsData;
+
+    // SANCTUM (2026-07-19): summon Ragnaros at his platform and make him
+    // immediately fightable. Called directly from the final gossip step
+    // (the retail walk/MovementInform/spell-cast cinematic is skipped) and
+    // again — as a guarded no-op backup — from EVENT_RAGNAROS_SUMMON_1.
+    void SummonAndActivateRagnaros()
+    {
+        // Never double-summon: bail if a live Ragnaros is already up.
+        if (Creature* existing = ObjectAccessor::GetCreature(*me, instance->GetGuidData(DATA_RAGNAROS)))
+            if (existing->IsAlive())
+                return;
+
+        // Never resummon a defeated Ragnaros.
+        if (instance->GetBossState(DATA_RAGNAROS) == DONE)
+            return;
+
+        if (Creature* ragnaros = me->SummonCreature(NPC_RAGNAROS, RagnarosSummonPos))
+        {
+            // Our JustSummoned() just faded/submerged/locked him for the
+            // retail intro; undo every lock so he comes up attackable.
+            // (He stays ROOTED on purpose — Ragnaros is a stationary boss;
+            // his own Reset() roots him and the stock activation never
+            // unroots him. Root does not stop him meleeing or casting.)
+            ragnaros->RemoveAurasDueToSpell(SPELL_RAGNAROS_FADE);
+            ragnaros->RemoveAurasDueToSpell(SPELL_RAGNAROS_SUBMERGE_EFFECT);
+            ragnaros->RemoveUnitFlag(UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_NOT_SELECTABLE);
+            ragnaros->SetImmuneToAll(false);
+            ragnaros->SetReactState(REACT_AGGRESSIVE);
+            ragnaros->CastSpell(ragnaros, SPELL_RAGNA_EMERGE, true);
+            // His intro (SAY_ARRIVAL5_RAG + a second, redundant unlock pass
+            // via EVENT_INTRO_MAKE_ATTACKABLE) finishes on its own timers.
+            ragnaros->AI()->DoAction(ACTION_FINISH_RAGNAROS_INTRO);
+        }
+    }
 };
 
 // 20538 Hate to Zero (SERVERSIDE)
