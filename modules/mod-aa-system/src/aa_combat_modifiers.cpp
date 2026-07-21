@@ -1133,7 +1133,7 @@ public:
             // Attacker side: read own heat stacks for damage bonus.
             {
                 uint8 rank = SanctumAA::GetRank(player, AA_WAR_VENGEFUL_BULWARK);
-                if (rank > 0)
+                if (rank > 0 && SanctumAA::PlayerHasClass(player, CLASS_WARRIOR))
                 {
                     auto it = g_vengefulBulwark.find(guid);
                     if (it != g_vengefulBulwark.end() && it->second.heat > 0)
@@ -1576,7 +1576,7 @@ public:
             if (attacker && attacker->IsAlive() && damage > 0)
             {
                 uint8 rank = SanctumAA::GetRank(player, AA_WAR_VENGEFUL_BULWARK);
-                if (rank > 0)
+                if (rank > 0 && SanctumAA::PlayerHasClass(player, CLASS_WARRIOR))
                 {
                     static const uint8 maxHeatByRank[] = { 0, 6, 8, 10 };
                     auto& vbState = g_vengefulBulwark[vGuid];

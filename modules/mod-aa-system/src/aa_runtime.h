@@ -570,4 +570,8 @@ namespace SanctumAA
     {
         return GetRank(player, aaId) >= minRank;
     }
+
+    // True if classId (WoW class id, e.g. CLASS_WARRIOR=1) is one of the player's
+    // three multiclass classes. For class-gating combat-hook AAs. Cached at login.
+    bool PlayerHasClass(Player const* player, uint8 classId);
 }

@@ -989,9 +989,14 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         Creature* wolf = player->SummonCreature(29264, x, y, z, o, TEMPSUMMON_TIMED_DESPAWN, 60000);
         if (wolf)
         {
+            // Link to owner + follow, same fix as Call of the Wild — without SetOwnerGUID +
+            // MoveFollow the summon just stands at the spawn point and never engages.
+            wolf->SetOwnerGUID(player->GetGUID());
             wolf->SetFaction(player->GetFaction());
             wolf->SetLevel(player->GetLevel());
             wolf->SetReactState(REACT_AGGRESSIVE);
+            wolf->SetHomePosition(x, y, z, o);
+            wolf->GetMotionMaster()->MoveFollow(player, PET_FOLLOW_DIST, PET_FOLLOW_ANGLE);
         }
         SetCD(guid, aaId);
         handler->SendSysMessage("|cff00ff00[AA]|r Scout of the Wild — a spirit wolf answers your call for 60 seconds!");
@@ -1571,9 +1576,14 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
         Creature* elemental = player->SummonCreature(23919, x, y, z, o, TEMPSUMMON_TIMED_DESPAWN, dur);
         if (elemental)
         {
+            // Link to owner + follow, same fix as Call of the Wild — without SetOwnerGUID +
+            // MoveFollow the summon just stands at the spawn point and never engages.
+            elemental->SetOwnerGUID(player->GetGUID());
             elemental->SetFaction(player->GetFaction());
             elemental->SetLevel(player->GetLevel());
             elemental->SetReactState(REACT_AGGRESSIVE);
+            elemental->SetHomePosition(x, y, z, o);
+            elemental->GetMotionMaster()->MoveFollow(player, PET_FOLLOW_DIST, PET_FOLLOW_ANGLE);
         }
         SetCD(guid, aaId);
         handler->PSendSysMessage("|cff00ff00[AA]|r Host of the Elements — Ice Elemental summoned for {}s!", dur / 1000u);

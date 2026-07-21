@@ -82,6 +82,7 @@ struct AaData
     uint32 pointsEarned = 0;
     uint32 pointsSpent  = 0;
     uint8  bleedPct     = 0;    // player-controlled: 0-100 in steps of 10
+    uint8  classes[3]   = {0, 0, 0};  // multiclass class ids (character_multiclass), cached at login
 
     std::map<uint32, uint8> purchased;  // aa_id → current_rank
 
@@ -118,6 +119,20 @@ uint8 SanctumAA::GetRank(Player const* player, uint32 aaId)
         return 0;
     auto jt = it->second.purchased.find(aaId);
     return (jt != it->second.purchased.end()) ? jt->second : 0;
+}
+
+// SanctumAA::PlayerHasClass — true if classId is one of the player's three
+// multiclass classes (cached at login). Used to class-gate combat-hook AAs so a
+// wrong-class holder (e.g. via .aa testall) doesn't trigger a class-only effect.
+bool SanctumAA::PlayerHasClass(Player const* player, uint8 classId)
+{
+    if (!player)
+        return false;
+    auto it = s_aaData.find(player->GetGUID().GetCounter());
+    if (it == s_aaData.end())
+        return false;
+    AaData const& d = it->second;
+    return d.classes[0] == classId || d.classes[1] == classId || d.classes[2] == classId;
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +557,18 @@ static void LoadAAData(Player* player)
             data.purchased[f[0].Get<uint32>()] = f[1].Get<uint8>();
         } while (purchased->NextRow());
     }
+
+    // Cache the player's three multiclass class ids so combat hooks can class-gate
+    // AAs without a per-hit DB query (e.g. Vengeful Bulwark = Warrior-only).
+    QueryResult classResult = CharacterDatabase.Query(
+        "SELECT class1, class2, class3 FROM character_multiclass WHERE guid = {}", guid);
+    if (classResult)
+    {
+        Field* cf = classResult->Fetch();
+        data.classes[0] = cf[0].Get<uint8>();
+        data.classes[1] = cf[1].Get<uint8>();
+        data.classes[2] = cf[2].Get<uint8>();
+    }
 }
 
 static void SaveAAPoints(Player* player)
@@ -661,9 +688,14 @@ static void AwardAAXP(Player* player, uint64 xpAmount)
             << data.PointsAvailable() << " available)";
         ChatHandler ch(player->GetSession());
         ch.SendSysMessage(msg.str().c_str());
-        SendToAAAddon(player, Acore::StringFormat("SANCTUMAA:INIT:{}:{}:{}:{}:{}",
-            data.pointsEarned, data.pointsSpent, (uint32)data.aaXp,
-            (uint32)data.bleedPct, threshold));
+        // NOTE: do NOT send SANCTUMAA:INIT here. INIT is the heavyweight
+        // "wipe + rebuild" message: the client clears aaPurchased (and its saved
+        // copy) and rebuilds the ability bar from an empty list — which HID the
+        // Sanctum Ability Bar mid-combat every time a kill crossed a point
+        // threshold, and dropped the client's purchased-AA list until the next
+        // relog/`.aa sync`. The lightweight SANCTUMAA:XP message below already
+        // carries the updated pointsEarned + threshold, so the point-up shows up
+        // in the UI without touching the purchased list or the bar.
     }
 
     // Live progress update for the AA UI bar on EVERY award (not just on a
