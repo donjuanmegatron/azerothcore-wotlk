@@ -751,10 +751,259 @@ struct AppliedStoneStats
     int32 hitSpellRating = 0;
     int32 spirit         = 0;
     float armorFlat      = 0.0f; // flat armor we added (see note above)
-    float amberPct       = 0.0f; // stored only — NOT applied in Phase 3
+    float amberPct       = 0.0f; // Amber's base % — now APPLIED via the Identity
+                                  // Layer combat hooks below (was stored-only pre-Identity-Layer)
+
+    // IDENTITY LAYER (2026-07-21) — static Awakening stats, applied/undone the
+    // same add/remove way as everything else above.
+    int32 expertiseRating  = 0; // Obsidian Awakening "Flawless Technique"
+    int32 spellPowerFlat   = 0; // Jade Awakening "Meditation" (15% of stone Spirit)
+    int32 healingPowerFlat = 0; // Jade Awakening "Meditation" (15% of stone Spirit)
 };
 
 static std::unordered_map<uint32, AppliedStoneStats> g_appliedStoneStats;
+
+// ---------------------------------------------------------------------------
+// IDENTITY LAYER (2026-07-21) — Awakenings & Attunements
+// ---------------------------------------------------------------------------
+// AWAKENING (color)  = the player OWNS any Tier V stone of that color — pure
+//                       ownership check (GetCachedStones), NOT socket-dependent.
+// ATTUNEMENT (color) = count of that color's stones, Tier III+, SOCKETED into
+//                       currently-EQUIPPED items (same equipped-socket scan
+//                       RecomputeStoneStats already does). >=6 -> Minor active,
+//                       >=10 -> Major active (Major implies Minor also applies).
+// See memory/project_power_stones.md "IDENTITY LAYER" for the locked 15-effect
+// spec. Computed fresh every RecomputeStoneStats call (login/equip/unequip/
+// socket/unsocket/upgrade/item-morph) and cached here for the combat hooks.
+// ---------------------------------------------------------------------------
+struct StoneIdentity
+{
+    bool awakenCrimson = false, awakenObsidian = false, awakenJade = false, awakenIron = false, awakenAmber = false;
+
+    uint8 crimsonCount = 0, obsidianCount = 0, jadeCount = 0, ironCount = 0, amberCount = 0;
+
+    bool crimsonMinor = false, crimsonMajor = false;
+    bool obsidianMinor = false, obsidianMajor = false;
+    bool jadeMinor = false, jadeMajor = false;
+    bool ironMinor = false, ironMajor = false;
+    bool amberMinor = false, amberMajor = false;
+};
+
+static std::unordered_map<uint32, StoneIdentity> g_stoneIdentity;
+
+static StoneIdentity const& GetStoneIdentity(uint32 lowGuid)
+{
+    static StoneIdentity const s_empty;
+    auto it = g_stoneIdentity.find(lowGuid);
+    return it != g_stoneIdentity.end() ? it->second : s_empty;
+}
+
+static inline Player* PS_AsPlayer(Unit* u)
+{
+    return (u && u->IsPlayer()) ? u->ToPlayer() : nullptr;
+}
+
+// Flat Spell Power / Healing Power add-remove via the public Object::ApplyMod*
+// toggle API — the same mechanism the core itself uses when gear stats are
+// (un)applied. apply=true adds `amount`, apply=false removes exactly that
+// amount, so this is safe to call redundantly. Loops schools 1..6 (skips index
+// 0 = SPELL_SCHOOL_NORMAL/physical), matching how SpellBaseDamageBonusDone is
+// summed elsewhere in the core.
+static void ApplyStoneSpellPowerFlat(Player* player, int32 amount, bool apply)
+{
+    if (amount == 0)
+        return;
+    for (uint8 i = 1; i < MAX_SPELL_SCHOOL; ++i)
+        player->ApplyModInt32Value(PLAYER_FIELD_MOD_DAMAGE_DONE_POS + i, amount, apply);
+}
+static void ApplyStoneHealingPowerFlat(Player* player, int32 amount, bool apply)
+{
+    if (amount == 0)
+        return;
+    player->ApplyModUInt32Value(PLAYER_FIELD_MOD_HEALING_DONE_POS, amount, apply);
+}
+
+// Rough crit-CHANCE estimate used ONLY to approximate "on crit" triggers for
+// the Crimson identity effects (Ruthless / Killing Rush / Bloodrush). The
+// UnitScript damage-modifier hooks in this AC version do NOT expose a crit
+// flag (the same limitation documented for AA 4201 Bloodletting in
+// aa_combat_modifiers.cpp — "crit flag not exposed in damage hooks"). Base 5%
+// + the player's crit rating bonus is the closest available stand-in; it is
+// NOT the same as detecting a real crit and will over/under-fire relative to
+// the true crit rate (see the deliverable report for the flagged caveat).
+static float PS_ApproxCritChancePct(Player* player, bool isSpell)
+{
+    float pct = 5.0f + player->GetRatingBonusValue(isSpell ? CR_CRIT_SPELL : CR_CRIT_MELEE);
+    return std::clamp(pct, 0.0f, 100.0f);
+}
+
+// ---------------------------------------------------------------------------
+// IDENTITY LAYER — per-player runtime state for the DYNAMIC (timed/threshold)
+// effects. All state changes from inside a damage/heal hook are pure data
+// (no CastSpell/AddAura/heal-that-recurses) per the hook-safety rule; anything
+// that needs to actually apply an aura-like effect (Bloodrush's haste window,
+// Second Wind's heal, Punisher's shield trigger) is READ and ACTED ON in
+// OnUnitUpdate instead — exactly the pattern the proc engine and Shaman
+// Elemental Overload already use in this codebase.
+// ---------------------------------------------------------------------------
+
+// Crimson Killing Rush (Minor, 6+) — +3% all dmg for 4s, refreshed on approx-crit.
+struct KillingRushState { uint32 untilMs = 0; };
+static std::unordered_map<uint32, KillingRushState> g_killingRush;
+
+// Crimson Bloodrush (Major, 10+) — +5% attack & cast speed for 6s on approx-crit.
+// `active` tracks whether the speed mod is CURRENTLY applied so it is unapplied
+// exactly once (ApplyAttackTimePercentMod/ApplyCastTimePercentMod must be
+// paired — see the note on that API in Unit.cpp).
+struct BloodrushState { bool active = false; uint32 untilMs = 0; };
+static std::unordered_map<uint32, BloodrushState> g_bloodrush;
+
+// Iron Last Bastion (Awakening) — Iron's armor% contribution doubles (capped at
+// +40% total) while below 35% HP. `extraFlat` is the exact flat armor amount
+// added, so it can always be undone precisely.
+struct LastBastionState { bool active = false; float extraFlat = 0.0f; };
+static std::unordered_map<uint32, LastBastionState> g_lastBastion;
+
+// Iron Second Wind (Minor, 6+) — 8% maxHP heal on a <35%-HP crossing, 60s ICD.
+static std::unordered_map<uint32, uint32> g_secondWindIcd; // lowGuid -> last-fire getMSTime()
+
+// Iron Punisher (Major, 10+) — 15% maxHP absorb shield on the same crossing,
+// same-cadence 60s ICD. No expiry — a genuine absorb buffer, consumed by the
+// victim-side damage hooks below (or left unused until the next trigger).
+struct IronPunisherAbsorb { int32 absorb = 0; };
+static std::unordered_map<uint32, IronPunisherAbsorb> g_ironPunisherAbsorb;
+static std::unordered_map<uint32, uint32> g_ironPunisherIcd;
+
+// Amber Overflow (Awakening) — 30% of any overheal becomes a 10s damage-absorb
+// shield on the player.
+struct AmberOverflowAbsorb { int32 absorb = 0; uint32 expireMs = 0; };
+static std::unordered_map<uint32, AmberOverflowAbsorb> g_amberOverflow;
+
+// Amber Kindled Power (Minor, 6+) — +2% all dmg AND healing for 4s, refreshed
+// every time the player deals damage or healing.
+struct KindledPowerState { uint32 untilMs = 0; };
+static std::unordered_map<uint32, KindledPowerState> g_kindledPower;
+
+// Amber Overwhelm (Major, 10+) — +1% all dmg/heal every 2s in combat, caps at
+// +10% (10 stacks); resets to 0 the instant the player leaves combat.
+struct OverwhelmState { uint8 stacks = 0; uint32 lastTickMs = 0; };
+static std::unordered_map<uint32, OverwhelmState> g_overwhelm;
+
+// Jade Replenishment (Minor, 6+) / Wellspring (Major, 10+ doubles the tick).
+static std::unordered_map<uint32, uint32> g_jadeRegenTick;
+
+// Consumes Iron Punisher / Amber Overflow absorb pools against an incoming hit
+// (victim-side). Returns the amount actually absorbed; caller subtracts it
+// from the live damage variable. Pure arithmetic — safe inside a damage hook.
+static int32 PS_ConsumeIdentityAbsorb(Player* victim, int32 incomingDamage)
+{
+    if (incomingDamage <= 0)
+        return 0;
+
+    uint32 guid = victim->GetGUID().GetCounter();
+    uint32 now = getMSTime();
+    int32 remaining = incomingDamage;
+    int32 consumed = 0;
+
+    auto ipIt = g_ironPunisherAbsorb.find(guid);
+    if (ipIt != g_ironPunisherAbsorb.end() && ipIt->second.absorb > 0 && remaining > 0)
+    {
+        int32 c = std::min(ipIt->second.absorb, remaining);
+        ipIt->second.absorb -= c;
+        remaining -= c;
+        consumed += c;
+    }
+
+    auto aoIt = g_amberOverflow.find(guid);
+    if (aoIt != g_amberOverflow.end() && aoIt->second.absorb > 0 && now < aoIt->second.expireMs && remaining > 0)
+    {
+        int32 c = std::min(aoIt->second.absorb, remaining);
+        aoIt->second.absorb -= c;
+        remaining -= c;
+        consumed += c;
+    }
+
+    return consumed;
+}
+
+// Attacker-side Identity Layer damage-done bonus (Crimson approx-crit triggers,
+// Obsidian target-conditional bonuses, Amber's summed multiplier). Called from
+// BOTH ModifyMeleeDamage and ModifySpellDamageTaken so a melee swing and a
+// spell cast use identical logic; ONE summed percentage is returned and
+// applied ONCE by the caller (double-dip guard — see aa_combat_modifiers.cpp
+// ~line 1881 for the pattern this mirrors). No CastSpell/AddAura here.
+static float PS_IdentityAttackerDamageBonusPct(Player* attacker, Unit* victim, bool isSpell)
+{
+    uint32 guid = attacker->GetGUID().GetCounter();
+    StoneIdentity const& id = GetStoneIdentity(guid);
+
+    if (!id.awakenCrimson && !id.crimsonMinor && !id.crimsonMajor &&
+        !id.awakenObsidian && !id.obsidianMinor && !id.obsidianMajor &&
+        !id.awakenAmber && !id.amberMinor && !id.amberMajor)
+        return 0.0f;
+
+    float bonusPct = 0.0f;
+    uint32 now = getMSTime();
+
+    // ── Crimson — approximate crit trigger ──────────────────────────────
+    if (id.awakenCrimson || id.crimsonMinor || id.crimsonMajor)
+    {
+        if (roll_chance_f(PS_ApproxCritChancePct(attacker, isSpell)))
+        {
+            if (id.awakenCrimson)
+                bonusPct += 15.0f; // Ruthless: +15% critical strike damage
+            if (id.crimsonMinor)
+                g_killingRush[guid].untilMs = now + 4000;
+            if (id.crimsonMajor)
+                g_bloodrush[guid].untilMs = now + 6000; // applied/extended in OnUnitUpdate
+        }
+
+        auto krIt = g_killingRush.find(guid);
+        if (krIt != g_killingRush.end() && now < krIt->second.untilMs)
+            bonusPct += 3.0f; // Killing Rush window
+    }
+
+    // ── Obsidian — target-conditional bonuses ───────────────────────────
+    if (victim && (id.obsidianMinor || id.obsidianMajor))
+    {
+        if (id.obsidianMinor)
+        {
+            bool higherLevel = victim->GetLevel() > attacker->GetLevel();
+            bool eliteOrBoss = false;
+            if (Creature* c = victim->ToCreature())
+                eliteOrBoss = c->isElite();
+            if (higherLevel || eliteOrBoss)
+                bonusPct += 4.0f; // Sure Strike
+        }
+        if (id.obsidianMajor && victim->GetHealthPct() > 80.0f)
+            bonusPct += 8.0f; // Ambusher
+    }
+
+    // ── Amber — ONE summed multiplier (base % + Kindled Power + Overwhelm) ──
+    if (id.awakenAmber || id.amberMinor || id.amberMajor)
+    {
+        auto asIt = g_appliedStoneStats.find(guid);
+        if (asIt != g_appliedStoneStats.end())
+            bonusPct += asIt->second.amberPct;
+
+        if (id.amberMinor)
+        {
+            auto kpIt = g_kindledPower.find(guid);
+            if (kpIt != g_kindledPower.end() && now < kpIt->second.untilMs)
+                bonusPct += 2.0f; // Kindled Power window (from a PRIOR hit/heal)
+            g_kindledPower[guid].untilMs = now + 4000; // this hit refreshes it for the NEXT one
+        }
+
+        if (id.amberMajor)
+        {
+            auto owIt = g_overwhelm.find(guid);
+            if (owIt != g_overwhelm.end())
+                bonusPct += owIt->second.stacks * 1.0f; // Overwhelm stacks
+        }
+    }
+
+    return bonusPct;
+}
 
 // PHASE 5 — in-memory proc cache so the combat hot path NEVER hits the DB.
 // One entry per proc stone socketed into a currently-equipped weapon. Rebuilt
@@ -786,6 +1035,22 @@ static void RecomputeStoneStats(Player* player)
 
     uint32 lowGuid = player->GetGUID().GetCounter();
 
+    // IDENTITY LAYER — clear any active Last Bastion extra armor BEFORE the
+    // baseline armor%/flat is undone/recomputed below. OnUnitUpdate will
+    // cleanly reapply it next tick (against the NEW baseline) if the player is
+    // still under 35% HP. Without this, a gear swap or stone upgrade while
+    // Last Bastion was active would leave a stale flat-armor amount applied
+    // that nothing would ever remove.
+    {
+        auto lbIt = g_lastBastion.find(lowGuid);
+        if (lbIt != g_lastBastion.end() && lbIt->second.active)
+        {
+            player->HandleStatFlatModifier(UNIT_MOD_ARMOR, TOTAL_VALUE, -lbIt->second.extraFlat, false);
+            lbIt->second.extraFlat = 0.0f;
+            lbIt->second.active = false;
+        }
+    }
+
     // 1) UNDO previous totals, if any.
     auto prevIt = g_appliedStoneStats.find(lowGuid);
     if (prevIt != g_appliedStoneStats.end())
@@ -799,6 +1064,9 @@ static void RecomputeStoneStats(Player* player)
         player->ApplyRatingMod(CR_HIT_SPELL,   prev.hitSpellRating, false);
         player->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT, TOTAL_VALUE, (float)prev.spirit, false);
         player->HandleStatFlatModifier(UNIT_MOD_ARMOR, TOTAL_VALUE, prev.armorFlat, false);
+        player->ApplyRatingMod(CR_EXPERTISE, prev.expertiseRating, false);
+        ApplyStoneSpellPowerFlat(player, prev.spellPowerFlat, false);
+        ApplyStoneHealingPowerFlat(player, prev.healingPowerFlat, false);
     }
 
     // 2) Build the set of currently-EQUIPPED item low-guids.
@@ -814,6 +1082,7 @@ static void RecomputeStoneStats(Player* player)
     double critPct = 0.0, hitPct = 0.0, spiritFlat = 0.0, armorPct = 0.0, amberPct = 0.0;
     std::vector<WeaponProc> freshProcs;
     std::vector<SocketedStone> socketed = LoadSocketedStonesFromDB(lowGuid);
+    StoneIdentity identity; // IDENTITY LAYER — built alongside the stat totals below
     for (SocketedStone const& s : socketed)
     {
         if (!equippedGuids.count(s.itemGuid))
@@ -824,6 +1093,21 @@ static void RecomputeStoneStats(Player* player)
         {
             freshProcs.push_back({ s.itemGuid, s.stoneId, s.type, s.tier, s.rank });
             continue; // no passive stat to sum
+        }
+
+        // IDENTITY LAYER — Attunement counts Tier III+ stat stones socketed
+        // into currently-equipped gear (this loop is already scoped to that).
+        if (s.tier >= 3)
+        {
+            switch (s.type)
+            {
+                case STONE_CRIMSON:  identity.crimsonCount++;  break;
+                case STONE_OBSIDIAN: identity.obsidianCount++; break;
+                case STONE_JADE:     identity.jadeCount++;     break;
+                case STONE_IRON:     identity.ironCount++;     break;
+                case STONE_AMBER:    identity.amberCount++;    break;
+                default: break;
+            }
         }
 
         char const* unit; double secondary; char const* secondaryUnit;
@@ -863,6 +1147,40 @@ static void RecomputeStoneStats(Player* player)
     // fresh.armorFlat is computed at APPLY time below — it needs the clean
     // GetArmor() reading (after the undo step removed our previous flat).
 
+    // IDENTITY LAYER — Awakenings: ownership of any Tier V stone of that color
+    // (pure ownership, independent of socketing).
+    for (OwnedStone const& os : GetCachedStones(lowGuid))
+    {
+        if (os.tier != STONE_TIER_MAX)
+            continue;
+        switch (os.type)
+        {
+            case STONE_CRIMSON:  identity.awakenCrimson  = true; break;
+            case STONE_OBSIDIAN: identity.awakenObsidian = true; break;
+            case STONE_JADE:     identity.awakenJade     = true; break;
+            case STONE_IRON:     identity.awakenIron     = true; break;
+            case STONE_AMBER:    identity.awakenAmber    = true; break;
+            default: break;
+        }
+    }
+    identity.crimsonMinor  = identity.crimsonCount  >= 6; identity.crimsonMajor  = identity.crimsonCount  >= 10;
+    identity.obsidianMinor = identity.obsidianCount >= 6; identity.obsidianMajor = identity.obsidianCount >= 10;
+    identity.jadeMinor     = identity.jadeCount     >= 6; identity.jadeMajor     = identity.jadeCount     >= 10;
+    identity.ironMinor     = identity.ironCount     >= 6; identity.ironMajor     = identity.ironCount     >= 10;
+    identity.amberMinor    = identity.amberCount    >= 6; identity.amberMajor    = identity.amberCount    >= 10;
+
+    // IDENTITY LAYER — static Awakening stats: Obsidian Flawless Technique
+    // (flat Expertise rating, generous enough to approximate "capped vs
+    // bosses") and Jade Meditation (15% of the stone-granted Spirit added as
+    // BOTH flat Spell Power and flat healing power).
+    fresh.expertiseRating = identity.awakenObsidian ? 130 : 0;
+    if (identity.awakenJade && spiritFlat > 0.0)
+    {
+        int32 medAmt = static_cast<int32>(std::lround(spiritFlat * 0.15));
+        fresh.spellPowerFlat   = medAmt;
+        fresh.healingPowerFlat = medAmt;
+    }
+
     // 5) APPLY fresh totals.
     player->ApplyRatingMod(CR_CRIT_MELEE,  fresh.critRating, true);
     player->ApplyRatingMod(CR_CRIT_RANGED, fresh.critRating, true);
@@ -871,6 +1189,9 @@ static void RecomputeStoneStats(Player* player)
     player->ApplyRatingMod(CR_HIT_RANGED,  fresh.hitMeleeRating, true);
     player->ApplyRatingMod(CR_HIT_SPELL,   fresh.hitSpellRating, true);
     player->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT, TOTAL_VALUE, (float)fresh.spirit, true);
+    player->ApplyRatingMod(CR_EXPERTISE, fresh.expertiseRating, true);
+    ApplyStoneSpellPowerFlat(player, fresh.spellPowerFlat, true);
+    ApplyStoneHealingPowerFlat(player, fresh.healingPowerFlat, true);
 
     // Armor: convert the summed armor% into a FLAT armor add = pct% of the
     // player's CURRENT armor. GetArmor() here is "clean" — the undo step above
@@ -889,6 +1210,11 @@ static void RecomputeStoneStats(Player* player)
 
     // 7) Publish the fresh weapon-proc cache (empty vector clears it).
     g_weaponProcs[lowGuid] = std::move(freshProcs);
+
+    // 8) IDENTITY LAYER — publish the fresh Awakening/Attunement snapshot for
+    // the combat hooks (PS_IdentityAttackerDamageBonusPct, ModifyHealReceived,
+    // OnUnitUpdate) to read.
+    g_stoneIdentity[lowGuid] = identity;
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,6 +1371,295 @@ static void PowerStones_OnOffensiveSpell(Player* player, Unit* target)
 }
 
 // ===========================================================================
+// IDENTITY LAYER — combat UnitScript (dynamic/victim/healer-side effects)
+// ===========================================================================
+//
+// Everything static (Expertise, Meditation SP/heal) is applied in
+// RecomputeStoneStats above, alongside the existing stat stones. Everything
+// that depends on a live combat event (crit-approximation triggers, target HP%
+// conditions, overheal, HP-threshold flips, in-combat stacking) lives here.
+// Hook-safety rule (see aa_combat_modifiers.cpp): NEVER CastSpell/AddAura
+// inside ModifyMeleeDamage/ModifySpellDamageTaken/ModifyHealReceived — those
+// three below only do arithmetic + write to the plain state maps declared
+// with AppliedStoneStats above; anything that needs to actually apply an
+// effect (Bloodrush's haste window, Second Wind's heal, Punisher's shield)
+// happens in OnUnitUpdate, which runs in a safe (non-hook-reentrant) context.
+class PowerStonesCombatUnit : public UnitScript
+{
+public:
+    PowerStonesCombatUnit() : UnitScript("PowerStonesCombatUnit", true,
+    {
+        UNITHOOK_MODIFY_MELEE_DAMAGE,
+        UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN,
+        UNITHOOK_MODIFY_HEAL_RECEIVED,
+        UNITHOOK_ON_UNIT_UPDATE,
+    }) {}
+
+    // White auto-attacks. Attacker-side: sum Crimson/Obsidian/Amber % once and
+    // apply once. Victim-side: consume Iron Punisher / Amber Overflow absorb.
+    void ModifyMeleeDamage(Unit* target, Unit* attacker, uint32& damage) override
+    {
+        if (damage == 0)
+            return;
+
+        if (Player* atkPlayer = PS_AsPlayer(attacker))
+        {
+            float bonusPct = PS_IdentityAttackerDamageBonusPct(atkPlayer, target, false);
+            if (bonusPct > 0.0f)
+                damage = static_cast<uint32>(damage * (1.0f + bonusPct / 100.0f));
+        }
+
+        if (Player* vicPlayer = PS_AsPlayer(target))
+        {
+            int32 consumed = PS_ConsumeIdentityAbsorb(vicPlayer, static_cast<int32>(damage));
+            if (consumed > 0)
+                damage -= static_cast<uint32>(consumed);
+        }
+    }
+
+    // Ability/spell damage. Same logic as ModifyMeleeDamage, just int32 typed.
+    void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* /*spellInfo*/) override
+    {
+        if (damage <= 0 || !attacker)
+            return;
+
+        if (Player* atkPlayer = PS_AsPlayer(attacker))
+        {
+            float bonusPct = PS_IdentityAttackerDamageBonusPct(atkPlayer, target, true);
+            if (bonusPct > 0.0f)
+                damage = static_cast<int32>(damage * (1.0f + bonusPct / 100.0f));
+        }
+
+        if (Player* vicPlayer = PS_AsPlayer(target))
+        {
+            int32 consumed = PS_ConsumeIdentityAbsorb(vicPlayer, damage);
+            if (consumed > 0)
+                damage -= consumed;
+        }
+    }
+
+    // Heal modifier: healer-side % (Ruthless healing, Amber total, Kindled
+    // Power) + target-side % (Jade Wellspring received-healing) summed into
+    // ONE multiplier and applied ONCE — same double-dip discipline as the
+    // damage hooks. Also computes Amber Overflow's overheal->absorb here
+    // (target-side, pure arithmetic, no cast).
+    void ModifyHealReceived(Unit* target, Unit* healer, uint32& heal, SpellInfo const* /*spellInfo*/) override
+    {
+        if (heal == 0 || !target)
+            return;
+
+        float bonusPct = 0.0f;
+        Player* healerPlayer = PS_AsPlayer(healer);
+        Player* targetPlayer = PS_AsPlayer(target);
+        uint32 now = getMSTime();
+
+        if (healerPlayer)
+        {
+            uint32 hGuid = healerPlayer->GetGUID().GetCounter();
+            StoneIdentity const& hid = GetStoneIdentity(hGuid);
+
+            if (hid.awakenCrimson)
+                bonusPct += 15.0f; // Ruthless: +15% healing done
+
+            if (hid.awakenAmber || hid.amberMinor || hid.amberMajor)
+            {
+                auto asIt = g_appliedStoneStats.find(hGuid);
+                if (asIt != g_appliedStoneStats.end())
+                    bonusPct += asIt->second.amberPct;
+
+                if (hid.amberMinor)
+                {
+                    auto kpIt = g_kindledPower.find(hGuid);
+                    if (kpIt != g_kindledPower.end() && now < kpIt->second.untilMs)
+                        bonusPct += 2.0f;
+                    g_kindledPower[hGuid].untilMs = now + 4000; // this heal refreshes it
+                }
+
+                if (hid.amberMajor)
+                {
+                    auto owIt = g_overwhelm.find(hGuid);
+                    if (owIt != g_overwhelm.end())
+                        bonusPct += owIt->second.stacks * 1.0f;
+                }
+            }
+        }
+
+        if (targetPlayer)
+        {
+            StoneIdentity const& tid = GetStoneIdentity(targetPlayer->GetGUID().GetCounter());
+            if (tid.jadeMajor)
+                bonusPct += 18.0f; // Wellspring: healing RECEIVED +18%
+        }
+
+        if (bonusPct > 0.0f)
+            heal = static_cast<uint32>(heal * (1.0f + bonusPct / 100.0f));
+
+        // Amber Overflow (Awakening) — 30% of overheal -> 10s absorb shield.
+        if (targetPlayer)
+        {
+            StoneIdentity const& tid = GetStoneIdentity(targetPlayer->GetGUID().GetCounter());
+            if (tid.awakenAmber)
+            {
+                int32 missing = static_cast<int32>(targetPlayer->GetMaxHealth()) - static_cast<int32>(targetPlayer->GetHealth());
+                if (missing >= 0 && static_cast<int32>(heal) > missing)
+                {
+                    int32 overheal = static_cast<int32>(heal) - missing;
+                    int32 shieldAdd = static_cast<int32>(overheal * 0.30f);
+                    if (shieldAdd > 0)
+                    {
+                        auto& ao = g_amberOverflow[targetPlayer->GetGUID().GetCounter()];
+                        ao.absorb += shieldAdd;
+                        ao.expireMs = now + 10000;
+                    }
+                }
+            }
+        }
+    }
+
+    // Periodic tick — the ONLY place any of the timed/threshold Identity Layer
+    // effects actually apply/remove a real modifier (attack/cast speed, armor,
+    // ModifyHealth). Fires once per server tick per Unit; mirrors
+    // aa_combat_modifiers.cpp's OnUnitUpdate exactly.
+    void OnUnitUpdate(Unit* unit, uint32 /*diff*/) override
+    {
+        Player* player = PS_AsPlayer(unit);
+        if (!player || !player->IsAlive())
+            return;
+
+        uint32 guid = player->GetGUID().GetCounter();
+        uint32 now  = getMSTime();
+        StoneIdentity const& id = GetStoneIdentity(guid);
+
+        // Jade Replenishment (Minor 1%/3s) / Wellspring doubles it to 2%/3s (Major).
+        if (id.jadeMinor && !player->IsFullHealth())
+        {
+            auto& lastTick = g_jadeRegenTick[guid];
+            if (GetMSTimeDiffToNow(lastTick) >= 3000u)
+            {
+                float pct = id.jadeMajor ? 0.02f : 0.01f;
+                int32 healAmt = std::max(1, static_cast<int32>(player->GetMaxHealth() * pct));
+                player->ModifyHealth(healAmt);
+                lastTick = now;
+            }
+        }
+
+        // Iron Last Bastion (Awakening) — HP-threshold armor doubling, capped
+        // at +40% total armor. Also gates Second Wind (Minor) / Punisher (Major).
+        if (id.awakenIron)
+        {
+            auto& lb = g_lastBastion[guid];
+            bool shouldBeActive = player->GetHealthPct() < 35.0f;
+
+            if (shouldBeActive && !lb.active)
+            {
+                auto asIt = g_appliedStoneStats.find(guid);
+                if (asIt != g_appliedStoneStats.end() && asIt->second.armorFlat > 0.0f)
+                {
+                    AppliedStoneStats& applied = asIt->second;
+                    float cleanArmor = static_cast<float>(player->GetArmor()) - applied.armorFlat;
+                    if (cleanArmor > 0.0f)
+                    {
+                        float currentPct = (applied.armorFlat / cleanArmor) * 100.0f;
+                        float doubledPct = std::min(currentPct * 2.0f, 40.0f);
+                        float extra = cleanArmor * (doubledPct - currentPct) / 100.0f;
+                        if (extra > 0.0f)
+                        {
+                            player->HandleStatFlatModifier(UNIT_MOD_ARMOR, TOTAL_VALUE, extra, true);
+                            lb.extraFlat = extra;
+                            lb.active = true;
+                        }
+                    }
+                }
+            }
+            else if (!shouldBeActive && lb.active)
+            {
+                player->HandleStatFlatModifier(UNIT_MOD_ARMOR, TOTAL_VALUE, -lb.extraFlat, false);
+                lb.extraFlat = 0.0f;
+                lb.active = false;
+            }
+
+            // Second Wind / Punisher fire on the same <35% condition, each on
+            // its own 60s ICD (so they can retrigger if HP dips again later,
+            // not just once ever).
+            if (shouldBeActive)
+            {
+                if (id.ironMinor && GetMSTimeDiffToNow(g_secondWindIcd[guid]) >= 60000u)
+                {
+                    int32 healAmt = std::max(1, static_cast<int32>(player->GetMaxHealth() * 0.08f));
+                    player->ModifyHealth(healAmt);
+                    g_secondWindIcd[guid] = now;
+                }
+                if (id.ironMajor && GetMSTimeDiffToNow(g_ironPunisherIcd[guid]) >= 60000u)
+                {
+                    g_ironPunisherAbsorb[guid].absorb = static_cast<int32>(player->GetMaxHealth() * 0.15f);
+                    g_ironPunisherIcd[guid] = now;
+                }
+            }
+        }
+        else
+        {
+            // Identity dropped (stone sold/unsocketed) while the extra armor
+            // was still applied — clean it up so it never gets stuck.
+            auto lbIt = g_lastBastion.find(guid);
+            if (lbIt != g_lastBastion.end() && lbIt->second.active)
+            {
+                player->HandleStatFlatModifier(UNIT_MOD_ARMOR, TOTAL_VALUE, -lbIt->second.extraFlat, false);
+                lbIt->second.extraFlat = 0.0f;
+                lbIt->second.active = false;
+            }
+        }
+
+        // Crimson Bloodrush (Major) — apply/extend/expire the haste window.
+        // ApplyAttackTimePercentMod/ApplyCastTimePercentMod take a NEGATIVE
+        // value to mean "faster" (see Unit.cpp) — -5.0f == +5% speed, matching
+        // the convention every native haste aura in the core uses.
+        {
+            auto brIt = g_bloodrush.find(guid);
+            if (brIt != g_bloodrush.end())
+            {
+                BloodrushState& br = brIt->second;
+                bool shouldBeActive = now < br.untilMs;
+                if (shouldBeActive && !br.active)
+                {
+                    player->ApplyAttackTimePercentMod(BASE_ATTACK, -5.0f, true);
+                    player->ApplyAttackTimePercentMod(OFF_ATTACK, -5.0f, true);
+                    player->ApplyAttackTimePercentMod(RANGED_ATTACK, -5.0f, true);
+                    player->ApplyCastTimePercentMod(-5.0f, true);
+                    br.active = true;
+                }
+                else if (!shouldBeActive && br.active)
+                {
+                    player->ApplyAttackTimePercentMod(BASE_ATTACK, -5.0f, false);
+                    player->ApplyAttackTimePercentMod(OFF_ATTACK, -5.0f, false);
+                    player->ApplyAttackTimePercentMod(RANGED_ATTACK, -5.0f, false);
+                    player->ApplyCastTimePercentMod(-5.0f, false);
+                    br.active = false;
+                }
+            }
+        }
+
+        // Amber Overwhelm (Major) — +1% every 2s in combat, cap 10 stacks,
+        // resets the instant combat ends.
+        if (id.amberMajor)
+        {
+            auto& ow = g_overwhelm[guid];
+            if (player->IsInCombat())
+            {
+                if (ow.stacks < 10 && GetMSTimeDiffToNow(ow.lastTickMs) >= 2000u)
+                {
+                    ow.stacks++;
+                    ow.lastTickMs = now;
+                }
+            }
+            else if (ow.stacks > 0)
+            {
+                ow.stacks = 0;
+            }
+        }
+    }
+};
+
+// ===========================================================================
 // Player Script
 // ===========================================================================
 
@@ -1085,6 +1700,21 @@ public:
         g_ownedStones.erase(lowGuid);
         g_appliedStoneStats.erase(lowGuid);
         g_weaponProcs.erase(lowGuid);
+
+        // IDENTITY LAYER — drop the identity snapshot + all per-player dynamic
+        // state. The character object is going away, so nothing needs an
+        // explicit unapply pass here (matches the rest of this function).
+        g_stoneIdentity.erase(lowGuid);
+        g_killingRush.erase(lowGuid);
+        g_bloodrush.erase(lowGuid);
+        g_lastBastion.erase(lowGuid);
+        g_secondWindIcd.erase(lowGuid);
+        g_ironPunisherAbsorb.erase(lowGuid);
+        g_ironPunisherIcd.erase(lowGuid);
+        g_amberOverflow.erase(lowGuid);
+        g_kindledPower.erase(lowGuid);
+        g_overwhelm.erase(lowGuid);
+        g_jadeRegenTick.erase(lowGuid);
     }
 
     // PHASE 3 — recompute on gear swap so socketing then changing gear
@@ -1147,7 +1777,8 @@ public:
             { "socket",   HandleStoneSocket,   SEC_PLAYER, Console::Yes },
             { "unsocket", HandleStoneUnsocket, SEC_PLAYER, Console::Yes },
             { "sockets",  HandleStoneSockets,  SEC_PLAYER, Console::Yes },
-            { "sync",     HandleStoneSync,     SEC_PLAYER, Console::No  }
+            { "sync",     HandleStoneSync,     SEC_PLAYER, Console::No  },
+            { "attune",   HandleStoneAttune,   SEC_PLAYER, Console::No  }
         };
         static ChatCommandTable commandTable =
         {
@@ -1814,6 +2445,49 @@ public:
 
         return true;
     }
+
+    // .stone attune — IDENTITY LAYER feel-test command. Prints active
+    // Awakenings (own any Tier V) and, per color, the Tier III+ socketed
+    // count on EQUIPPED gear + whether that hits Minor (6+) / Major (10+).
+    static bool HandleStoneAttune(ChatHandler* handler)
+    {
+        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!player)
+        {
+            handler->SendSysMessage("|cffff0000[Power Stones]|r Must be used in-game.");
+            return true;
+        }
+
+        // Recompute first so the snapshot reflects the CURRENT equipped/owned
+        // state even if nothing has changed since the last equip/socket event.
+        RecomputeStoneStats(player);
+        StoneIdentity const& id = GetStoneIdentity(player->GetGUID().GetCounter());
+
+        handler->SendSysMessage("|cff9933ff[Power Stones] Identity|r");
+
+        auto printColor = [&](char const* name, bool awaken, uint8 count, bool minor, bool major)
+        {
+            std::string tag;
+            if (major)      tag = "|cff00ff00Major|r";
+            else if (minor) tag = "|cff00ff00Minor|r";
+            else             tag = "|cff888888none|r";
+
+            handler->PSendSysMessage("  {} — Awakening: {} | Attunement: {}/10 T3+ socketed ({})",
+                name, awaken ? "|cff00ff00ACTIVE|r" : "|cff888888inactive|r",
+                static_cast<uint32>(count), tag);
+        };
+
+        printColor("Crimson (Crit)",  id.awakenCrimson,  id.crimsonCount,  id.crimsonMinor,  id.crimsonMajor);
+        printColor("Obsidian (Hit)",  id.awakenObsidian, id.obsidianCount, id.obsidianMinor, id.obsidianMajor);
+        printColor("Jade (Spirit)",   id.awakenJade,     id.jadeCount,     id.jadeMinor,     id.jadeMajor);
+        printColor("Iron (Armor)",    id.awakenIron,     id.ironCount,     id.ironMinor,     id.ironMajor);
+        printColor("Amber (Power)",   id.awakenAmber,    id.amberCount,    id.amberMinor,    id.amberMajor);
+
+        handler->SendSysMessage(
+            "|cff9933ff[Power Stones]|r Awakening = own any Tier V stone of that color (not socket-dependent). "
+            "Attunement = Tier III+ stones of that color socketed into EQUIPPED gear (6 = Minor, 10 = Major).");
+        return true;
+    }
 };
 
 // ===========================================================================
@@ -2109,4 +2783,5 @@ void AddSC_mod_power_stones()
     new PowerStonesCommandScript();
     new PowerStonesWorldScript();
     new npc_power_stone_broker();
+    new PowerStonesCombatUnit(); // IDENTITY LAYER — Awakenings & Attunements
 }
