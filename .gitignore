@@ -20,6 +20,7 @@
 !modules/mod-pet-systems/
 !modules/mod-conquest-shards/
 !modules/mod-power-stones/
+!modules/mod-lifesteal/
 /build*/
 /var/*
 !/var/build/.gitkeep
