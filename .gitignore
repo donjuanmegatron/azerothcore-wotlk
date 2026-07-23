@@ -21,6 +21,7 @@
 !modules/mod-conquest-shards/
 !modules/mod-power-stones/
 !modules/mod-lifesteal/
+!modules/mod-companion-system/
 /build*/
 /var/*
 !/var/build/.gitkeep
