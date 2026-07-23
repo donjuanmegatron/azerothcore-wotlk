@@ -159,7 +159,7 @@ static uint8 GetAAMaxRank(uint32 aaId)
 {
     static const std::unordered_map<uint32, uint8> s_max = {
         // maxRank 1
-        {2019,1},{2110,1},{2112,1},{2113,1},{2204,1},
+        {2019,1},{2021,1},{2110,1},{2112,1},{2113,1},{2204,1},
         {3104,1},{3201,1},{3202,1},{3204,1},
         {4104,1},{4204,1},{4304,1},
         {5002,1},
@@ -204,6 +204,8 @@ static uint8 GetAARankCost(uint32 aaId, uint8 nextRank)
     static const std::unordered_map<uint32, std::array<uint8,4>> s_costs = {
         {9001,{0,0,0,0}},{2019,{5,0,0,0}},{2110,{5,0,0,0}},{2121,{2,3,4,0}},
         {2112,{15,0,0,0}},
+        // "The On-Crit Line" (2026-07-22)
+        {2021,{5,0,0,0}},  // Merciless (Tier 3, one-shot: DoTs can crit)
         {2204,{5,0,0,0}},{3002,{2,4,6,0}},{3104,{5,0,0,0}},{3105,{2,3,4,0}},
         {3201,{5,0,0,0}},{3202,{5,0,0,0}},{3204,{3,0,0,0}},{3205,{2,3,4,0}},
         {4103,{1,2,3,4}},
@@ -284,6 +286,17 @@ static void ApplyAAStat(Player* player, uint32 aaId, uint8 rankDelta, bool apply
             player->ApplyRatingMod(CR_CRIT_SPELL,  amount, apply);
             break;
         }
+        case AA_G_LETHALITY:        // +2/4/6% crit chance (melee, ranged, spell) — "The On-Crit Line"
+        {
+            // Same ~45 rating/1% conversion Critical Mass uses; 2%/rank = 90 rating/rank.
+            int32 amount = 90 * (int32)rankDelta;
+            player->ApplyRatingMod(CR_CRIT_MELEE,  amount, apply);
+            player->ApplyRatingMod(CR_CRIT_RANGED, amount, apply);
+            player->ApplyRatingMod(CR_CRIT_SPELL,  amount, apply);
+            break;
+        }
+        // AA_G_MERCILESS_DOTS (2021) — no direct stat; it's a pure gate checked by
+        // SanctumAA::Has() in aa_combat_modifiers.cpp's ModifyPeriodicDamageAurasTick.
         case AA_G_IRON_WILL:        // +200 HP per rank
         {
             float bonus = 200.0f * rankDelta;
@@ -718,6 +731,8 @@ static const char* GetAAName(uint32 aaId)
         case AA_G_DOUBLE_STRIKE:    return "Double Strike";
         case AA_G_PRECISION:        return "Precision";
         case AA_G_CRITICAL_MASS:    return "Critical Mass";
+        case AA_G_LETHALITY:        return "Lethality";
+        case AA_G_MERCILESS_DOTS:   return "Merciless";
         case AA_G_KILLING_BLOW:     return "Killing Blow";
         case AA_G_VENGEANCE:        return "Vengeance";
         case AA_G_ATTENTION:        return "Attention";
@@ -1180,6 +1195,8 @@ static const char* GetAADesc(uint32 aaId)
 {
     switch (aaId)
     {
+        case AA_G_LETHALITY:              return "+2%/+4%/+6% critical strike chance (melee, ranged, spell)";
+        case AA_G_MERCILESS_DOTS:         return "ONE-SHOT: your periodic (DoT) damage can now critically strike";
         case AA_G_IRON_WILL:              return "+200 HP per rank";
         case AA_G_SANCTUM_ESSENCE:        return "+20 to all primary stats per rank";
         case AA_T_TITANS_BLOOD:           return "+200 HP per rank (Tank archetype)";

@@ -14,15 +14,25 @@
 //   - Vital Hunger AA:   +5% per rank     (mod-aa-system)
 //   - Pet lifesteal:     pet dmg heals owner (mod-pet-systems)
 //
-// NOT in Phase 1 (flagged): "crits double lifesteal" — OnDamage carries no crit
-// flag in this AC version (same limitation the AA/identity systems hit), so the
-// crit-doubling is deferred. Phase 1 is the flat baseline + the integration API.
+// "Crits double lifesteal" (2026-07-22 "The On-Crit Line") — OnDamage still
+// carries no crit flag (Unit::DealDamage/DealSpellDamage call it before the
+// engine's own crit-notification hooks fire), so the doubling can't happen
+// INSIDE OnDamage itself. Instead: OnDamage always applies the base leech and
+// remembers the amount per player; the real-crit signal (melee/ranged via
+// PlayerScript::OnPlayerCanCastItemCombatSpell procEx, spell via the new
+// UnitScript::OnUnitSpellCrit hook — both fire synchronously, later in the
+// SAME damage-resolution call chain, no tick delay) then applies ONE matching
+// extra heal to double the total. Pure hook-safe HP restores, no CastSpell/AddAura.
 // -------------------------------------------------------------------------
 
 #include "ScriptMgr.h"
 #include "Player.h"
 #include "Unit.h"
+#include "Item.h"
+#include "Spell.h"
+#include "SpellMgr.h"
 #include "Log.h"
+#include "Timer.h"
 #include <unordered_map>
 
 // Baseline lifesteal every character gets, in percent.
@@ -56,6 +66,32 @@ float Lifesteal_GetTotalPct(Player* player)
     if (it != g_lifestealBonusPct.end())
         bonus = it->second;
     return LIFESTEAL_BASELINE_PCT + bonus;
+}
+
+// SANCTUM on-crit — pending-heal bookkeeping for "crits double lifesteal".
+// OnDamage stashes the heal amount it just applied here; the real-crit signal
+// (arriving synchronously, later in the same damage-resolution chain) consumes
+// it and applies one matching extra heal. Timestamped so a crit notification
+// can never reach across into an unrelated later hit.
+struct PendingLifestealHeal { int32 heal = 0; uint32 atMs = 0; };
+static std::unordered_map<uint32, PendingLifestealHeal> g_pendingCritHeal;
+
+static void Lifesteal_NotifyRealCrit(Player* player)
+{
+    if (!player)
+        return;
+
+    uint32 guid = player->GetGUID().GetCounter();
+    auto it = g_pendingCritHeal.find(guid);
+    if (it == g_pendingCritHeal.end())
+        return;
+
+    // Only honor it if it's from THIS hit (well within one tick — real crit
+    // notifications fire synchronously, not deferred).
+    if (GetMSTimeDiffToNow(it->second.atMs) <= 200 && it->second.heal > 0 && player->IsAlive())
+        player->ModifyHealth(it->second.heal); // doubles the base leech to 2x total
+
+    g_pendingCritHeal.erase(it);
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +130,18 @@ public:
         // Direct HP restore — NOT a heal spell, so it cannot re-enter the damage
         // path (hook-safety). ModifyHealth clamps at max HP, so no overheal.
         player->ModifyHealth(heal);
+
+        // SANCTUM on-crit hook — remember this heal in case a real-crit signal
+        // for this same hit arrives momentarily (see Lifesteal_NotifyRealCrit).
+        g_pendingCritHeal[player->GetGUID().GetCounter()] = { heal, getMSTime() };
+    }
+
+    // SANCTUM on-crit hook — real SPELL crit signal (player casters only,
+    // enforced at the Spell.cpp call site).
+    void OnUnitSpellCrit(Unit* caster, Unit* /*victim*/, uint32 /*damage*/, SpellInfo const* /*spellInfo*/) override
+    {
+        if (Player* p = caster ? caster->ToPlayer() : nullptr)
+            Lifesteal_NotifyRealCrit(p);
     }
 };
 
@@ -105,7 +153,19 @@ public:
     void OnPlayerLogout(Player* player) override
     {
         if (player)
+        {
             g_lifestealBonusPct.erase(player->GetGUID().GetCounter());
+            g_pendingCritHeal.erase(player->GetGUID().GetCounter());
+        }
+    }
+
+    // SANCTUM on-crit hook — real MELEE/RANGED crit signal.
+    bool OnPlayerCanCastItemCombatSpell(Player* player, Unit* /*target*/, WeaponAttackType /*attType*/,
+        uint32 /*procVictim*/, uint32 procEx, Item* /*item*/, ItemTemplate const* /*proto*/) override
+    {
+        if (player && (procEx & PROC_EX_CRITICAL_HIT))
+            Lifesteal_NotifyRealCrit(player);
+        return true;
     }
 };
 

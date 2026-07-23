@@ -2845,6 +2845,10 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
 
             caster->DealSpellDamage(&damageInfo, true, this);
 
+            // SANCTUM on-crit hook: notify scripts of a real spell critical strike (player casters only)
+            if ((damageInfo.HitInfo & SPELL_HIT_TYPE_CRIT) && caster->IsPlayer() && damageInfo.damage > 0)
+                sScriptMgr->OnUnitSpellCrit(caster, unitTarget, damageInfo.damage, m_spellInfo);
+
             // do procs after damage, eg healing effects
             // no need to check if target is alive, done in procdamageandspell
 

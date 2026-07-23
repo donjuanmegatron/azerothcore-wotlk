@@ -2827,6 +2827,20 @@ public:
         if (rank > 0)
             damage += (uint32)(damage * bonus[Idx<uint8>(rank)]);
 
+        // ── Merciless (2021, ONE-SHOT) — periodic (DoT) damage can now crit ──
+        // "The On-Crit Line" (2026-07-22). The native SPELL_AURA_ABILITY_PERIODIC_CRIT
+        // (286) requires AuraEffect::CalcPeriodicCritChance's IsAffectedOnSpell match
+        // (a spell-family classmask check tied to specific talent spells) — it can't be
+        // made to generically cover every class's DoTs, so this uses the sanctioned
+        // fallback: roll the caster's own periodic crit chance here and apply the same
+        // crit-damage bonus the engine uses for spell crits (Unit::SpellCriticalDamageBonus).
+        if (SanctumAA::Has(player, AA_G_MERCILESS_DOTS))
+        {
+            float critChance = player->SpellDoneCritChance(target, spellInfo, (SpellSchoolMask)schoolMask, BASE_ATTACK, true);
+            if (critChance > 0.0f && roll_chance_f(critChance))
+                damage = Unit::SpellCriticalDamageBonus(player, spellInfo, damage, target);
+        }
+
         // ── Encroaching Darkness (5433) — SW:P/VT/DP +5/10/15% per DoT tick ──
         // Placed in ModifyPeriodicDamageAurasTick (not ModifySpellDamageTaken) because
         // periodic ticks are routed through this hook, not the spell-hit hook.

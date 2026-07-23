@@ -134,6 +134,12 @@ void ScriptMgr::OnUnitSetShapeshiftForm(Unit* unit, uint8 form)
     CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_ON_UNIT_SET_SHAPESHIFT_FORM, script->OnUnitSetShapeshiftForm(unit, form));
 }
 
+// SANCTUM on-crit hook
+void ScriptMgr::OnUnitSpellCrit(Unit* caster, Unit* victim, uint32 damage, SpellInfo const* spellInfo)
+{
+    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_ON_UNIT_SPELL_CRIT, script->OnUnitSpellCrit(caster, victim, damage, spellInfo));
+}
+
 UnitScript::UnitScript(const char* name, bool addToScripts, std::vector<uint16> enabledHooks)
     : ScriptObject(name, UNITHOOK_END)
 {

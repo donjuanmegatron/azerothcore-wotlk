@@ -43,6 +43,7 @@ enum UnitHook
     UNITHOOK_ON_UNIT_ENTER_COMBAT,
     UNITHOOK_ON_UNIT_DEATH,
     UNITHOOK_ON_UNIT_SET_SHAPESHIFT_FORM,
+    UNITHOOK_ON_UNIT_SPELL_CRIT, // SANCTUM on-crit hook
     UNITHOOK_END
 };
 
@@ -93,6 +94,9 @@ public:
     [[nodiscard]] virtual bool ShouldTrackValuesUpdatePosByIndex(Unit const* /*unit*/, uint8 /*updateType*/, uint16 /*index*/) { return false; }
 
     virtual void OnPatchValuesUpdate(Unit const* /*unit*/, ByteBuffer& /*valuesUpdateBuf*/, BuildValuesCachePosPointers& /*posPointers*/, Player* /*target*/) { }
+
+    // SANCTUM on-crit hook: called when a player's SPELL damage hit lands as a real critical strike
+    virtual void OnUnitSpellCrit(Unit* /*caster*/, Unit* /*victim*/, uint32 /*damage*/, SpellInfo const* /*spellInfo*/) { }
 
     /**
      * @brief This hook runs in Unit::Update

@@ -88,6 +88,8 @@ enum SanctumAAId : uint32
     AA_G_SCHOOL_PHYSICAL  = 2017,   // +3%/+7%/+12% physical damage done
     AA_G_OUTBURST         = 2018,   // +5%/+10%/+15% AoE damage done
     AA_G_BERSERKERS_EDGE  = 2019,   // ONE-SHOT: +20% damage below 30% HP
+    AA_G_LETHALITY        = 2020,   // +2%/+4%/+6% critical strike chance (melee, ranged, spell) — "The On-Crit Line"
+    AA_G_MERCILESS_DOTS   = 2021,   // ONE-SHOT: your periodic (DoT) damage can now critically strike — "The On-Crit Line"
 
     // ── GENERAL — DEFENSIVE (2101–2122) ────────────────────
     AA_G_IRON_WILL        = 2101,   // +1%/+2%/+3% max HP

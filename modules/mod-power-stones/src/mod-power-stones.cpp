@@ -823,20 +823,6 @@ static void ApplyStoneHealingPowerFlat(Player* player, int32 amount, bool apply)
     player->ApplyModUInt32Value(PLAYER_FIELD_MOD_HEALING_DONE_POS, amount, apply);
 }
 
-// Rough crit-CHANCE estimate used ONLY to approximate "on crit" triggers for
-// the Crimson identity effects (Ruthless / Killing Rush / Bloodrush). The
-// UnitScript damage-modifier hooks in this AC version do NOT expose a crit
-// flag (the same limitation documented for AA 4201 Bloodletting in
-// aa_combat_modifiers.cpp — "crit flag not exposed in damage hooks"). Base 5%
-// + the player's crit rating bonus is the closest available stand-in; it is
-// NOT the same as detecting a real crit and will over/under-fire relative to
-// the true crit rate (see the deliverable report for the flagged caveat).
-static float PS_ApproxCritChancePct(Player* player, bool isSpell)
-{
-    float pct = 5.0f + player->GetRatingBonusValue(isSpell ? CR_CRIT_SPELL : CR_CRIT_MELEE);
-    return std::clamp(pct, 0.0f, 100.0f);
-}
-
 // ---------------------------------------------------------------------------
 // IDENTITY LAYER — per-player runtime state for the DYNAMIC (timed/threshold)
 // effects. All state changes from inside a damage/heal hook are pure data
@@ -857,6 +843,39 @@ static std::unordered_map<uint32, KillingRushState> g_killingRush;
 // paired — see the note on that API in Unit.cpp).
 struct BloodrushState { bool active = false; uint32 untilMs = 0; };
 static std::unordered_map<uint32, BloodrushState> g_bloodrush;
+
+// SANCTUM on-crit — REAL crit detection (2026-07-22 "The On-Crit Line").
+// Melee/ranged crits arrive via PowerStonesPlayerScript::OnPlayerCanCastItemCombatSpell
+// (procEx & PROC_EX_CRITICAL_HIT — no core edit needed, that hook already fires
+// post-outcome). Spell crits arrive via the new UnitScript::OnUnitSpellCrit hook
+// (added in src/server/game/Spells/Spell.cpp ~2846 + ScriptMgr/UnitScript plumbing
+// — a small core addition, additive only, no existing hook signature changed).
+// Both call sites necessarily fire AFTER the triggering hit's own damage number
+// is already finalized/sent to the client (same engine ordering that made the
+// OLD probability-roll approximation necessary in the first place), so the
+// Crimson on-crit family now windows off the NEXT hit(s) following a real crit
+// instead of guessing at the current one — same shape as Killing Rush/Bloodrush
+// already used, just driven by a real event instead of a % roll.
+static std::unordered_map<uint32, uint32> g_ruthlessWindow; // guid -> untilMs, set on real crit
+
+static void PS_NotifyRealCrit(Player* attacker, bool /*isSpell*/)
+{
+    if (!attacker)
+        return;
+
+    uint32 guid = attacker->GetGUID().GetCounter();
+    StoneIdentity const& id = GetStoneIdentity(guid);
+    if (!id.awakenCrimson && !id.crimsonMinor && !id.crimsonMajor)
+        return;
+
+    uint32 now = getMSTime();
+    if (id.awakenCrimson)
+        g_ruthlessWindow[guid] = now + 4000; // Ruthless: next hit(s) within 4s get +15% dmg
+    if (id.crimsonMinor)
+        g_killingRush[guid].untilMs = now + 4000;
+    if (id.crimsonMajor)
+        g_bloodrush[guid].untilMs = now + 6000; // applied/extended in OnUnitUpdate
+}
 
 // Iron Last Bastion (Awakening) — Iron's armor% contribution doubles (capped at
 // +40% total) while below 35% HP. `extraFlat` is the exact flat armor amount
@@ -945,17 +964,17 @@ static float PS_IdentityAttackerDamageBonusPct(Player* attacker, Unit* victim, b
     float bonusPct = 0.0f;
     uint32 now = getMSTime();
 
-    // ── Crimson — approximate crit trigger ──────────────────────────────
+    // ── Crimson — REAL crit trigger (PS_NotifyRealCrit sets these windows
+    // from the real melee procEx / spell OnUnitSpellCrit signal; see that
+    // function's comment for why this is a "next hit(s)" window rather than
+    // an instant same-hit boost). ───────────────────────────────────────
     if (id.awakenCrimson || id.crimsonMinor || id.crimsonMajor)
     {
-        if (roll_chance_f(PS_ApproxCritChancePct(attacker, isSpell)))
+        if (id.awakenCrimson)
         {
-            if (id.awakenCrimson)
-                bonusPct += 15.0f; // Ruthless: +15% critical strike damage
-            if (id.crimsonMinor)
-                g_killingRush[guid].untilMs = now + 4000;
-            if (id.crimsonMajor)
-                g_bloodrush[guid].untilMs = now + 6000; // applied/extended in OnUnitUpdate
+            auto rwIt = g_ruthlessWindow.find(guid);
+            if (rwIt != g_ruthlessWindow.end() && now < rwIt->second)
+                bonusPct += 15.0f; // Ruthless: +15% dmg on the hit(s) following a real crit
         }
 
         auto krIt = g_killingRush.find(guid);
@@ -1393,7 +1412,16 @@ public:
         UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN,
         UNITHOOK_MODIFY_HEAL_RECEIVED,
         UNITHOOK_ON_UNIT_UPDATE,
+        UNITHOOK_ON_UNIT_SPELL_CRIT, // SANCTUM on-crit hook
     }) {}
+
+    // SANCTUM on-crit hook — real SPELL crit signal (player casters only,
+    // enforced at the Spell.cpp call site). Feeds the Crimson on-crit family.
+    void OnUnitSpellCrit(Unit* caster, Unit* /*victim*/, uint32 /*damage*/, SpellInfo const* /*spellInfo*/) override
+    {
+        if (Player* p = PS_AsPlayer(caster))
+            PS_NotifyRealCrit(p, true);
+    }
 
     // White auto-attacks. Attacker-side: sum Crimson/Obsidian/Amber % once and
     // apply once. Victim-side: consume Iron Punisher / Amber Overflow absorb.
@@ -1715,6 +1743,7 @@ public:
         g_kindledPower.erase(lowGuid);
         g_overwhelm.erase(lowGuid);
         g_jadeRegenTick.erase(lowGuid);
+        g_ruthlessWindow.erase(lowGuid);
     }
 
     // PHASE 3 — recompute on gear swap so socketing then changing gear
@@ -1736,10 +1765,16 @@ public:
     // CastItemCombatSpell path (once per weapon per hit). We return true always
     // so native enchant procs keep running; the proc is a pure side effect.
     bool OnPlayerCanCastItemCombatSpell(Player* player, Unit* target, WeaponAttackType /*attType*/,
-        uint32 /*procVictim*/, uint32 /*procEx*/, Item* item, ItemTemplate const* /*proto*/) override
+        uint32 /*procVictim*/, uint32 procEx, Item* item, ItemTemplate const* /*proto*/) override
     {
         if (player && item && target)
             PowerStones_OnWeaponHit(player, target, item->GetGUID().GetCounter());
+
+        // SANCTUM on-crit hook — real MELEE/RANGED crit signal, alongside the
+        // proc engine above (does not interfere with it — pure notification).
+        if (player && (procEx & PROC_EX_CRITICAL_HIT))
+            PS_NotifyRealCrit(player, false);
+
         return true;
     }
 
