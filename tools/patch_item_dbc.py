@@ -132,6 +132,15 @@ for base, ench, epic in variant_rows:
             new_records.append(new_rec)
             variant_added += 1
 
+# 3. Custom Sanctum tabards — clone the source tabard's display record (icon+model)
+TABARDS = [(700500, 22999), (700501, 15198), (700502, 15196)]
+tabard_added = 0
+for new_e, src_e in TABARDS:
+    if new_e not in existing_id and src_e in existing_id:
+        new_records.append((new_e,) + records[existing_id[src_e]][1:])
+        tabard_added += 1
+print(f"  Tabard entries: {tabard_added}")
+
 if missing_base:
     print(f"  WARNING: {len(missing_base)} base entries not in item.dbc: {missing_base[:5]}...")
 print(f"  Pet bag entries:    {sum(1 for r in new_records if 700200 <= r[0] <= 700213)}")

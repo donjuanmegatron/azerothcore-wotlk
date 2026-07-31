@@ -31,6 +31,9 @@
 #include "SpellInfo.h"
 #include "WorldSessionMgr.h"
 #include "SharedDefines.h"
+#include "DBCEnums.h"
+#include "Map.h"
+#include "InstanceSaveMgr.h"
 #include "Timer.h"
 #include "Random.h"
 #include "GridNotifiers.h"
@@ -49,6 +52,59 @@ extern void SanctumAA_RemoveBuff(Player*, uint32, bool);
 
 // [playerGuid][aaId] = getMSTime() at last use
 static std::unordered_map<uint32, std::unordered_map<uint32, uint32>> g_activeCDs;
+
+// ---- Sanctum and Back (2114) ----------------------------------------------
+// A stored recall anchor: press once (out of combat) to travel to the Hold,
+// press again while standing in the Hold to snap back to the exact spot —
+// including inside a dungeon/raid instance. Any OTHER map change (portal,
+// entering an instance, hearthing, logout, death) severs the link.
+
+static constexpr uint32 SB_COOLDOWN_MS = 30u * 60u * 1000u;   // 30-minute cooldown on a new outbound trip
+static constexpr uint32 HOLD_MAP   = 0;
+static constexpr float   HOLD_X    = 1567.07f;
+static constexpr float   HOLD_Y    = -5611.33f;
+static constexpr float   HOLD_Z    = 114.189f;
+static constexpr float   HOLD_O    = 1.094f;
+static constexpr float   HOLD_RADIUS = 200.0f;                // how close to the keep counts as "in the Hold"
+
+struct SanctumAnchor
+{
+    bool   valid = false;
+    uint32 mapId = 0;
+    float  x = 0, y = 0, z = 0, o = 0;
+    bool   inTransit = false;  // set while our own outbound teleport crosses maps, so it doesn't self-sever
+};
+static std::unordered_map<uint32, SanctumAnchor> g_sanctumAnchor;
+
+static bool PlayerInHold(Player* player)
+{
+    if (player->GetMapId() != HOLD_MAP)
+        return false;
+    float dx = player->GetPositionX() - HOLD_X;
+    float dy = player->GetPositionY() - HOLD_Y;
+    return (dx * dx + dy * dy) <= (HOLD_RADIUS * HOLD_RADIUS);
+}
+
+// Called from the AA PlayerScript on every map change.
+void SanctumAA_OnMapChanged(Player* player)
+{
+    if (!player)
+        return;
+    uint32 guid = player->GetGUID().GetCounter();
+    auto it = g_sanctumAnchor.find(guid);
+    if (it == g_sanctumAnchor.end() || !it->second.valid)
+        return;
+    if (it->second.inTransit)          // this is our own outbound teleport landing in the Hold
+    {
+        it->second.inTransit = false;
+        return;
+    }
+    // Any other map change breaks the tether.
+    g_sanctumAnchor.erase(it);
+    if (player->GetSession())
+        ChatHandler(player->GetSession()).SendSysMessage(
+            "|cffff6060[Sanctum and Back]|r Your link to the Hold has been severed.");
+}
 
 // ---- Mortal Eradication DoT tracker ---------------------------------------
 // Each activated Mortal Eradication places a 6-tick shadow DoT on a target.
@@ -263,6 +319,7 @@ void SanctumAA_ClearActivateState(uint32 guid)
         }
     }
     g_activeCDs.erase(guid);
+    g_sanctumAnchor.erase(guid);   // Sanctum and Back: death/logout severs the link
     g_eradDots.erase(guid);
     g_weaponFuryUntil.erase(guid);
     g_rampageUntil.erase(guid);
@@ -293,6 +350,72 @@ bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler)
 
     switch (aaId)
     {
+    // =======================================================================
+    // GENERAL — Sanctum and Back (recall to the Hold and return)
+    // =======================================================================
+    case AA_G_SANCTUM_AND_BACK:
+    {
+        auto it = g_sanctumAnchor.find(guid);
+        bool haveAnchor = (it != g_sanctumAnchor.end() && it->second.valid);
+
+        // --- BACK leg: a live tether exists ---
+        if (haveAnchor)
+        {
+            if (!PlayerInHold(player))
+            {
+                handler->SendSysMessage("|cffff0000[Sanctum and Back]|r You must be at the Warden's Keep to travel back.");
+                return true;
+            }
+            SanctumAnchor dest = it->second;
+            g_sanctumAnchor.erase(it);   // clear BEFORE teleport so the map-change hook stays quiet
+            player->TeleportTo(dest.mapId, dest.x, dest.y, dest.z, dest.o);
+            handler->SendSysMessage("|cff00ff00[Sanctum and Back]|r You step back through to where you left off.");
+            return true;
+        }
+
+        // --- OUT leg: no tether yet ---
+        if (player->IsInCombat())
+        {
+            handler->SendSysMessage("|cffff0000[Sanctum and Back]|r You cannot use this in combat.");
+            return true;
+        }
+        if (uint32 rem = CDRemaining(guid, aaId, SB_COOLDOWN_MS))
+        {
+            uint32 mins = (rem / 1000u) / 60u;
+            uint32 secs = (rem / 1000u) % 60u;
+            handler->PSendSysMessage("|cffff0000[Sanctum and Back]|r Not attuned again yet ({}m {}s).", mins, secs);
+            return true;
+        }
+
+        SanctumAnchor a;
+        a.valid     = true;
+        a.mapId     = player->GetMapId();
+        a.x         = player->GetPositionX();
+        a.y         = player->GetPositionY();
+        a.z         = player->GetPositionZ();
+        a.o         = player->GetOrientation();
+        a.inTransit = (a.mapId != HOLD_MAP);   // only absorb a self-sever if the outbound trip crosses maps
+
+        // Keep the source instance alive so Back returns into the SAME one.
+        // Raids & heroics already persist via the player's own save; only NORMAL
+        // 5-man dungeons need a temporary bind.
+        if (Map* map = player->GetMap())
+        {
+            if (map->IsDungeon() && !map->IsRaid() && map->GetDifficulty() == DUNGEON_DIFFICULTY_NORMAL)
+            {
+                if (InstanceSave* save = sInstanceSaveMgr->AddInstanceSave(
+                        map->GetId(), map->GetInstanceId(), DUNGEON_DIFFICULTY_NORMAL))
+                    sInstanceSaveMgr->PlayerBindToInstance(player->GetGUID(), save, false, player);
+            }
+        }
+
+        g_sanctumAnchor[guid] = a;
+        SetCD(guid, aaId);
+        player->TeleportTo(HOLD_MAP, HOLD_X, HOLD_Y, HOLD_Z, HOLD_O);
+        handler->SendSysMessage("|cff00ff00[Sanctum and Back]|r The Warden draws you to the Hold. Use again here to return.");
+        return true;
+    }
+
     // =======================================================================
     // WARRIOR
     // =======================================================================

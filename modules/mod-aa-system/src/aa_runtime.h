@@ -319,6 +319,7 @@ enum SanctumAAId : uint32
 
     // ── GENERAL — DEFENSIVE additions ──────────────────────────
     AA_G_CLEANSE_CURSE     = 2113,  // Active: remove all curse effects. 30s CD. (Placed out-of-sequence in enum; treated as General-Defensive)
+    AA_G_SANCTUM_AND_BACK  = 2114,  // Active: OOC teleport to Sanctum Hold; use again in the Hold to return to the exact spot (incl. dungeon/raid instance). Leaving the Hold breaks the link. 30-min CD.
 
     // ── CLASS — PRIEST (5401–5446) ──────────────────────────
     AA_PRI_TWINHEAL              = 5401,

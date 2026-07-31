@@ -114,6 +114,33 @@ static const float FOLLOW_DIST_MELEE  = 1.5f;
 static const float FOLLOW_DIST_RANGED = 6.0f;
 static const float FOLLOW_ANGLE       = static_cast<float>(M_PI);
 
+// Party formation (Donnie's ask): the tank (Bigbilly) and rogue (Onusx) walk
+// ALONGSIDE the player (left/right flanks); the healer (Tumblerr) and hunter
+// (Denziel) trail BEHIND. MoveFollow's angle is relative to the player's facing
+// (M_PI = directly behind, +/-M_PI/2 = the sides).
+static float FollowAngleForEntry(uint32 entry)
+{
+    switch (entry)
+    {
+        case ENTRY_BIGBILLY: return static_cast<float>(M_PI / 2.0);       // right flank, alongside
+        case ENTRY_ONUSX:    return static_cast<float>(-M_PI / 2.0);      // left flank, alongside
+        case ENTRY_TUMBLERR: return static_cast<float>(M_PI - 0.45);      // behind, offset one way
+        case ENTRY_DENZIEL:  return static_cast<float>(M_PI + 0.45);      // behind, offset the other
+        default:             return FOLLOW_ANGLE;
+    }
+}
+static float FollowDistForEntry(uint32 entry)
+{
+    switch (entry)
+    {
+        case ENTRY_BIGBILLY: return 2.0f;   // alongside, tight
+        case ENTRY_ONUSX:    return 2.0f;
+        case ENTRY_TUMBLERR: return 3.0f;   // behind
+        case ENTRY_DENZIEL:  return 4.0f;   // behind, ranged a touch further
+        default:             return FOLLOW_DIST_MELEE;
+    }
+}
+
 // ============================================================
 // Spell IDs — functional-baseline abilities.
 // Rank tables are best-effort (Phase 1 baseline, not tuned); Phase 2 will
@@ -213,17 +240,17 @@ static void ApplyCompanionRoleStats(Player* player, Creature* c, CompanionRole r
     switch (role)
     {
         case ROLE_TANK:
-            staMul = 1.6f; strMul = 1.2f; agiMul = 0.8f; intMul = 0.4f; spiMul = 0.4f; apMul = 1.0f; armorMul = 1.5f;
+            staMul = 1.6f; strMul = 1.2f; agiMul = 0.8f; intMul = 0.4f; spiMul = 0.4f; apMul = 0.6f; armorMul = 1.5f;
             break;
         case ROLE_HEALER:
             staMul = 1.0f; strMul = 0.5f; agiMul = 0.5f; intMul = 1.4f; spiMul = 1.4f; apMul = 0.5f; armorMul = 0.3f;
             break;
         case ROLE_RANGED:
-            staMul = 0.9f; strMul = 0.6f; agiMul = 1.3f; intMul = 0.5f; spiMul = 0.5f; apMul = 1.2f; armorMul = 0.5f;
+            staMul = 0.9f; strMul = 0.6f; agiMul = 1.3f; intMul = 0.5f; spiMul = 0.5f; apMul = 0.7f; armorMul = 0.5f;
             break;
         case ROLE_MELEE:
         default:
-            staMul = 0.9f; strMul = 1.0f; agiMul = 1.3f; intMul = 0.4f; spiMul = 0.4f; apMul = 1.3f; armorMul = 0.5f;
+            staMul = 0.9f; strMul = 1.0f; agiMul = 1.3f; intMul = 0.4f; spiMul = 0.4f; apMul = 0.7f; armorMul = 0.5f;
             break;
     }
 
@@ -267,11 +294,13 @@ static void ApplyCompanionWeaponScaling(Player* player, Creature* c, CompanionRo
     float minPct, maxPct;
     switch (role)
     {
-        case ROLE_TANK:   minPct = 0.020f; maxPct = 0.035f; break;
-        case ROLE_MELEE:  minPct = 0.035f; maxPct = 0.060f; break;
-        case ROLE_RANGED: minPct = 0.030f; maxPct = 0.055f; break;
+        // Tuned DOWN (2026-07-23) — companions were meleeing too hard / carrying
+        // the fight. They should help, not trivialize. ~half the prior values.
+        case ROLE_TANK:   minPct = 0.010f; maxPct = 0.018f; break;
+        case ROLE_MELEE:  minPct = 0.018f; maxPct = 0.030f; break;
+        case ROLE_RANGED: minPct = 0.016f; maxPct = 0.028f; break;
         case ROLE_HEALER:
-        default:          minPct = 0.015f; maxPct = 0.025f; break;
+        default:          minPct = 0.008f; maxPct = 0.014f; break;
     }
 
     float minDmg = std::max(hp * minPct, 1.0f);
@@ -352,9 +381,12 @@ static Creature* SummonCompanion(Player* player, uint32 entry)
     ApplyCompanionRoleStats(player, c, role);
     ApplyCompanionWeaponScaling(player, c, role);
 
-    float followDist = (role == ROLE_RANGED) ? FOLLOW_DIST_RANGED : FOLLOW_DIST_MELEE;
+    // Denziel carries a bow so he looks — and fights — like the hunter he is.
+    if (entry == ENTRY_DENZIEL)
+        c->SetVirtualItem(2, 2508); // 2 = ranged slot; 2508 = Large Recurve Bow
+
     c->SetHomePosition(x, y, z, o);
-    c->GetMotionMaster()->MoveFollow(player, followDist, FOLLOW_ANGLE);
+    c->GetMotionMaster()->MoveFollow(player, FollowDistForEntry(entry), FollowAngleForEntry(entry));
 
     s_companionGuids[lguid][entry] = c->GetGUID();
 
@@ -539,8 +571,7 @@ static void RunCompanionCombatTick(Player* player, Creature* c, CompanionRole ro
         if (!c->IsInCombat())
         {
             c->GetMotionMaster()->Clear();
-            float followDist = (role == ROLE_RANGED) ? FOLLOW_DIST_RANGED : FOLLOW_DIST_MELEE;
-            c->GetMotionMaster()->MoveFollow(player, followDist, FOLLOW_ANGLE);
+            c->GetMotionMaster()->MoveFollow(player, FollowDistForEntry(c->GetEntry()), FollowAngleForEntry(c->GetEntry()));
         }
         return;
     }
@@ -571,12 +602,19 @@ static void RunCompanionCombatTick(Player* player, Creature* c, CompanionRole ro
             break;
 
         case ROLE_RANGED:
+            // Denziel is a HUNTER — hold at range and shoot, never melee-charge.
             if (c->GetVictim() != target)
             {
-                c->GetMotionMaster()->Clear();
-                c->AI()->AttackStart(target);
+                c->SetTarget(target->GetGUID());
+                c->Attack(target, false);   // false = RANGED auto-attack (uses his bow)
             }
-            if (AbilityReady(cguid) && c->IsWithinDistInMap(target, 30.0f))
+            {
+                float dist = c->GetDistance(target);
+                if (dist < 15.0f || dist > 30.0f)
+                    c->GetMotionMaster()->MoveChase(target, 22.0f); // maintain ~22yd
+            }
+            c->SetFacingToObject(target);
+            if (AbilityReady(cguid) && c->IsWithinDistInMap(target, 35.0f))
             {
                 c->CastSpell(target, SPELL_ARCANE_SHOT, false);
                 SetAbilityCooldown(cguid, 3000);

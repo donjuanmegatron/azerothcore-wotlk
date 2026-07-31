@@ -63,6 +63,7 @@ extern void GearTiers_AddGXP(Player* player, uint32 amount);
 // Cross-module API from aa_actives.cpp (same binary)
 extern bool SanctumAA_HandleActivate(Player* player, uint32 aaId, ChatHandler* handler);
 extern void SanctumAA_ClearActivateState(uint32 guid);
+extern void SanctumAA_OnMapChanged(Player* player);
 
 using namespace Acore::ChatCommands;
 
@@ -159,7 +160,7 @@ static uint8 GetAAMaxRank(uint32 aaId)
 {
     static const std::unordered_map<uint32, uint8> s_max = {
         // maxRank 1
-        {2019,1},{2021,1},{2110,1},{2112,1},{2113,1},{2204,1},
+        {2019,1},{2021,1},{2110,1},{2112,1},{2113,1},{2114,1},{2204,1},
         {3104,1},{3201,1},{3202,1},{3204,1},
         {4104,1},{4204,1},{4304,1},
         {5002,1},
@@ -204,6 +205,7 @@ static uint8 GetAARankCost(uint32 aaId, uint8 nextRank)
     static const std::unordered_map<uint32, std::array<uint8,4>> s_costs = {
         {9001,{0,0,0,0}},{2019,{5,0,0,0}},{2110,{5,0,0,0}},{2121,{2,3,4,0}},
         {2112,{15,0,0,0}},
+        {2114,{10,0,0,0}},  // Sanctum and Back (General active, one-shot 10pt)
         // "The On-Crit Line" (2026-07-22)
         {2021,{5,0,0,0}},  // Merciless (Tier 3, one-shot: DoTs can crit)
         {2204,{5,0,0,0}},{3002,{2,4,6,0}},{3104,{5,0,0,0}},{3105,{2,3,4,0}},
@@ -762,6 +764,7 @@ static const char* GetAAName(uint32 aaId)
         case AA_G_FREE_WILL:        return "Free Will";
         case AA_G_RECOVERY:         return "Recovery";
         case AA_G_INDOMITABLE:      return "Indomitable";
+        case AA_G_SANCTUM_AND_BACK: return "Sanctum and Back";
         case AA_G_COMBAT_AGILITY:   return "Combat Agility";
         case AA_G_CHANNELING_FOCUS: return "Channeling Focus";
         // General — Utility
@@ -1742,6 +1745,13 @@ public:
         uint32 guid = player->GetGUID().GetCounter();
         SanctumAA_ClearActivateState(guid);
         RemoveAaData(guid);
+    }
+
+    // Sanctum and Back — any map change that isn't the AA's own return teleport
+    // severs the link (porting elsewhere, entering an instance, hearthing away).
+    void OnPlayerMapChanged(Player* player) override
+    {
+        SanctumAA_OnMapChanged(player);
     }
 
     void OnPlayerEnterCombat(Player* player, Unit* /*enemy*/) override
