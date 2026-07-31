@@ -119,3 +119,7 @@ local.properties
 #  !modules/yourmodule
 #
 # ==================
+
+# Sanctum tools — python cache & run logs
+tools/__pycache__/
+tools/*.log
